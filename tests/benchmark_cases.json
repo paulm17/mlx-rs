@@ -1,0 +1,6 @@
+{
+  "name": "single_prompt_rust_question",
+  "prompt": "What is the language Rust?",
+  "max_tokens": 256,
+  "temperature": 0.0
+}

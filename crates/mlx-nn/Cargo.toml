@@ -1,0 +1,9 @@
+[package]
+name = "mlx-nn"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mlx-core = { path = "../mlx-core" }
+anyhow = { workspace = true }
+serde = { workspace = true }

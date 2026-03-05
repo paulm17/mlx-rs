@@ -1,0 +1,8 @@
+[package]
+name = "mlx-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+mlx-sys = { path = "../mlx-sys" }
+thiserror = { workspace = true }

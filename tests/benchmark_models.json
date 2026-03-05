@@ -1,0 +1,22 @@
+[
+  {
+    "key": "llama3",
+    "name": "Llama-3.2-1B-Instruct-4bit",
+    "model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--mlx-community--Llama-3.2-1B-Instruct-4bit/snapshots/08231374eeacb049a0eade7922910865b8fce912"
+  },
+  {
+    "key": "qwen3",
+    "name": "Qwen3-1.7B-MLX-4bit",
+    "model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B-MLX-4bit/snapshots/21457c6f51ed54a7c16e988c0844db973815c137"
+  },
+  {
+    "key": "qwen_moe",
+    "name": "Qwen1.5-MoE-A2.7B-4bit",
+    "model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--mlx-community--Qwen1.5-MoE-A2.7B-4bit/snapshots/11aaad5b454a361ae33f19fb47b72bc74b3c3b55"
+  },
+  {
+    "key": "lfm2_moe",
+    "name": "LFM2-24B-A2B-MLX-4bit",
+    "model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--LiquidAI--LFM2-24B-A2B-MLX-4bit/snapshots/fb67c8c23d38cd4d7a9a6415ab80eefe83feecae"
+  }
+]

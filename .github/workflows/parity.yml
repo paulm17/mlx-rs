@@ -1,0 +1,50 @@
+name: Parity
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "crates/**"
+      - "scripts/**"
+      - "tests/parity_cases.json"
+      - ".github/workflows/parity.yml"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "scripts/**"
+      - "tests/parity_cases.json"
+      - ".github/workflows/parity.yml"
+
+jobs:
+  parity:
+    runs-on: macos-latest
+    env:
+      MODEL_PATH: ${{ vars.MODEL_PATH }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo check
+        run: cargo check -q -p mlx-lm-rs --example parity_check
+
+      - name: Run parity (if MODEL_PATH configured)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${MODEL_PATH:-}" ]]; then
+            echo "MODEL_PATH is not configured; skipping parity run."
+            exit 0
+          fi
+          if [[ ! -d "$MODEL_PATH" ]]; then
+            echo "MODEL_PATH does not exist on runner: $MODEL_PATH"
+            exit 1
+          fi
+          ./scripts/check_parity.sh "$MODEL_PATH"

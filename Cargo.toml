@@ -1,0 +1,44 @@
+[workspace]
+members = [
+    "crates/mlx-sys",
+    "crates/mlx-core",
+    "crates/mlx-nn",
+    "crates/mlx-models",
+    "crates/mlx-lm",
+]
+resolver = "2"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokenizers = "0.20"
+minijinja = { version = "2", features = ["loader"] }
+clap = { version = "4", features = ["derive"] }
+bindgen = "0.69"
+rand = "0.8"
+
+[package]
+name = "mlx-rs"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "generate"
+path = "src/bin/generate.rs"
+
+[[bin]]
+name = "mlx-server"
+path = "src/bin/mlx-server.rs"
+
+[dependencies]
+mlx-lm = { path = "crates/mlx-lm" }
+mlx-models = { path = "crates/mlx-models" }
+mlx-nn = { path = "crates/mlx-nn" }
+mlx-core = { path = "crates/mlx-core" }
+anyhow.workspace = true
+clap.workspace = true
+tokenizers.workspace = true
+serde.workspace = true
+serde_json.workspace = true
