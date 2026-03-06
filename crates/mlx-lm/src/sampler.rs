@@ -12,6 +12,7 @@ pub struct Sampler {
     repetition_penalty: f32,
     repeat_last_n: usize,
     greedy_tie_epsilon: Option<f32>,
+    greedy_tie_break_after: Option<usize>,
 }
 
 impl Default for Sampler {
@@ -22,6 +23,7 @@ impl Default for Sampler {
             repetition_penalty: 1.15,
             repeat_last_n: 256,
             greedy_tie_epsilon: None,
+            greedy_tie_break_after: None,
         }
     }
 }
@@ -33,6 +35,11 @@ impl Sampler {
 
     pub fn with_greedy_tie_break(mut self, epsilon: f32) -> Self {
         self.greedy_tie_epsilon = Some(epsilon.max(0.0));
+        self
+    }
+
+    pub fn with_greedy_tie_break_after(mut self, step: usize) -> Self {
+        self.greedy_tie_break_after = Some(step);
         self
     }
 
@@ -75,9 +82,14 @@ impl Sampler {
         Ok(Self::squeeze_all_singletons(logits)?)
     }
 
-    fn greedy_token_with_tie_break(logits: &Array, epsilon: Option<f32>) -> Result<u32> {
+    fn greedy_token_with_tie_break(
+        logits: &Array,
+        epsilon: Option<f32>,
+        generated: usize,
+        activate_after: Option<usize>,
+    ) -> Result<u32> {
         let logits = Self::flatten_last_token_logits(logits)?;
-        if epsilon.is_none() {
+        if epsilon.is_none() || generated < activate_after.unwrap_or(0) {
             let idx = logits.argmax(0)?;
             return match idx.item_u32() {
                 Ok(v) => Ok(v),
@@ -138,20 +150,32 @@ impl Sampler {
             let idx = logits.argmax(axis)?;
             return Self::squeeze_all_singletons(idx);
         }
-        let token = Self::greedy_token_with_tie_break(logits, self.greedy_tie_epsilon)?;
+        self.sample_raw_last_token_logits_array_at_step(logits, 0)
+    }
+
+    pub fn sample_raw_last_token_logits_array_at_step(&self, logits: &Array, generated: usize) -> Result<Array> {
+        if self.greedy_tie_epsilon.is_none() || generated < self.greedy_tie_break_after.unwrap_or(0) {
+            let axis = logits.ndim().saturating_sub(1) as i32;
+            let idx = logits.argmax(axis)?;
+            let idx = Self::squeeze_all_singletons(idx)?;
+            return Ok(idx);
+        }
+        let token = Self::greedy_token_with_tie_break(
+            logits,
+            self.greedy_tie_epsilon,
+            generated,
+            self.greedy_tie_break_after,
+        )?;
         Ok(Array::from_int(token as i32)?)
     }
 
     pub fn sample_raw_last_token_logits(&self, logits: &Array, history: &[u32]) -> Result<u32> {
         if self.is_greedy() {
-            if self.greedy_tie_epsilon.is_none() {
-                let idx = self.sample_raw_last_token_logits_array(logits)?;
-                return match idx.item_u32() {
-                    Ok(v) => Ok(v),
-                    Err(_) => Ok(idx.item_i32()? as u32),
-                };
-            }
-            return Self::greedy_token_with_tie_break(logits, self.greedy_tie_epsilon);
+            let idx = self.sample_raw_last_token_logits_array_at_step(logits, history.len())?;
+            return match idx.item_u32() {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(idx.item_i32()? as u32),
+            };
         }
         let logits = match logits.ndim() {
             3 => logits.squeeze(0)?.squeeze(0)?.contiguous()?,
@@ -166,14 +190,19 @@ impl Sampler {
         if self.is_greedy() {
             // Greedy decoding should be pure argmax (no repetition penalty),
             // and should not apply repetition penalties.
-            if self.greedy_tie_epsilon.is_none() {
+            if self.greedy_tie_epsilon.is_none() || history.len() < self.greedy_tie_break_after.unwrap_or(0) {
                 let idx = logits.argmax(0)?;
                 return match idx.item_u32() {
                     Ok(v) => Ok(v),
                     Err(_) => Ok(idx.item_i32()? as u32),
                 };
             }
-            return Self::greedy_token_with_tie_break(logits, self.greedy_tie_epsilon);
+            return Self::greedy_token_with_tie_break(
+                logits,
+                self.greedy_tie_epsilon,
+                history.len(),
+                self.greedy_tie_break_after,
+            );
         }
 
         let mut logits_vec = logits.to_vec_f32()?;

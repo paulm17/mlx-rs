@@ -15,7 +15,9 @@ fn sampler_for_model(model_dir: &std::path::Path, temperature: f32, top_p: f32) 
                     mlx_lm::loader::ModelArch::QwenMoe
                         | mlx_lm::loader::ModelArch::QwenMoePythonPort
                 ) {
-                    sampler = sampler.with_greedy_tie_break(0.05);
+                    sampler = sampler
+                        .with_greedy_tie_break(0.05)
+                        .with_greedy_tie_break_after(180);
                 }
             }
         }

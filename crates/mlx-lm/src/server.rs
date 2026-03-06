@@ -28,7 +28,9 @@ fn sampler_for_model(model_dir: &Path, temperature: f32, top_p: f32) -> Sampler 
                     arch,
                     crate::loader::ModelArch::QwenMoe | crate::loader::ModelArch::QwenMoePythonPort
                 ) {
-                    sampler = sampler.with_greedy_tie_break(0.05);
+                    sampler = sampler
+                        .with_greedy_tie_break(0.05)
+                        .with_greedy_tie_break_after(180);
                 }
             }
         }

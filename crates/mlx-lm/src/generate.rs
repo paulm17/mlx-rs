@@ -348,7 +348,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
         let mut last_token_id: Option<u32>;
         if self.sampler.is_greedy() {
             let stage_t0 = Instant::now();
-            let mut token_arr = self.sampler.sample_raw_last_token_logits_array(&logits)?;
+            let mut token_arr = self.sampler.sample_raw_last_token_logits_array_at_step(&logits, 0)?;
             async_eval(&[&token_arr])?;
             if let Some(p) = profile.as_mut() {
                 p.first_sample_s += stage_t0.elapsed().as_secs_f64();
@@ -368,7 +368,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
                     }
 
                     let stage_t0 = Instant::now();
-                    let next = self.sampler.sample_raw_last_token_logits_array(&logits)?;
+                    let next = self.sampler.sample_raw_last_token_logits_array_at_step(&logits, generated + 1)?;
                     async_eval(&[&next])?;
                     if let Some(p) = profile.as_mut() {
                         p.sample_s += stage_t0.elapsed().as_secs_f64();

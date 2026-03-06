@@ -17,6 +17,12 @@ fn use_qwen_tie_break(model_dir: &std::path::Path) -> bool {
     )
 }
 
+fn qwen_tie_break_sampler() -> mlx_lm::Sampler {
+    mlx_lm::Sampler::new(0.0, 1.0)
+        .with_greedy_tie_break(0.05)
+        .with_greedy_tie_break_after(180)
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "generate_diag", about = "Generate text with per-step top-k diagnostics")]
 struct Args {
@@ -133,8 +139,7 @@ fn main() -> Result<()> {
         }
 
         let token = if use_qwen_tie_break(&args.model_dir) {
-            let sampler = mlx_lm::Sampler::new(0.0, 1.0).with_greedy_tie_break(0.05);
-            sampler.sample_raw_last_token_logits(&logits, &[])?
+            qwen_tie_break_sampler().sample_raw_last_token_logits(&logits, &generated_ids)?
         } else {
             let token_arr = logits.argmax(logits.ndim().saturating_sub(1) as i32)?;
             let token_arr = squeeze_all_singletons(token_arr)?;
