@@ -11,6 +11,23 @@ It is structured as layered crates that mirror the same separation of concerns y
 
 The project currently supports dense and MoE decoder models through the new `/crates` implementation (non-deprecated path).
 
+## Current Status
+
+The current runtime is at or near Python `mlx_lm` parity on the benchmark set in `tests/benchmark_models.json`.
+
+Latest aligned streaming benchmark snapshot (`logs/python_vs_rust_benchmark_20260306_201924.json`):
+- `Llama-3.2-1B-Instruct-4bit`: `94.05%` of Python decode throughput
+- `Qwen3-1.7B-MLX-4bit`: `114.54%`
+- `Qwen1.5-MoE-A2.7B-4bit`: `98.24%`, with stop-parity fixed
+- `LFM2-24B-A2B-MLX-4bit`: `101.26%`
+
+The two MoE implementations reached parity after moving the stable runtime to the same execution shape used by Python MLX:
+- device-side router `softmax`
+- device-side `argpartition`
+- device-side `take_along_axis`
+- `SwitchGLU`-style expert execution
+- on-device weighted reduction
+
 ## Project Structure
 
 ### Workspace Layout
@@ -203,15 +220,20 @@ Mapped runtime enums:
 - Dense FFN.
 
 ### Qwen MoE
-- Host-driven deterministic routing over experts.
-- Top-k expert dispatch per token.
-- Weighted merge back to token stream.
+- Uses Python-style MoE execution in the stable path:
+  - device router softmax/top-k selection
+  - `SwitchGLU` expert execution
+  - weighted reduce on device
+- Greedy decode includes a narrow late-step tie-break path for near-equal top-2 logits in Qwen MoE, which keeps stop parity aligned with Python on the benchmarked prompt.
 
 ### LFM2 MoE
 - Hybrid per-layer operator:
   - `conv` layers use short convolution block.
   - `full_attention` layers use attention block.
-- MoE feed-forward with `switch_mlp` + router gate.
+- MoE feed-forward uses the stable Python-style `switch_mlp` path:
+  - device router softmax/top-k selection
+  - `SwitchGLU` expert execution
+  - weighted reduce on device
 - Uses `embedding_norm` head path where checkpoint uses tied embeddings.
 - Supports checkpoints where chat template is only in `chat_template.jinja`.
 
@@ -381,7 +403,16 @@ Benchmark inputs:
 
 Output:
 - JSON logs under `logs/`
-- terminal table with TTFT, tokens/sec, tokens, total time
+- terminal table with TTFT, tokens/sec, decode TPS, tokens, total time, and comparability flags
+
+Aligned benchmark notes:
+- Python and Rust are both exercised through the streaming path.
+- The harness records stop reason and comparability metadata, so token-count or stop-condition mismatches are explicit in the output.
+- For model-specific debugging, use:
+  - `src/bin/generate.rs` with `--dump-json-out`
+  - `src/bin/generate_diag.rs`
+  - `scripts/generate_python.py`
+  - `scripts/compare_generation_dumps.py`
 
 ## Engineering Principles in This Repo
 
