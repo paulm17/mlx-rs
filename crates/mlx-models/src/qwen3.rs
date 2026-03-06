@@ -6,7 +6,6 @@
 use mlx_core::{Array, Module, Result};
 use mlx_nn::{
     Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, RopeScaling, VarBuilder,
-    repeat_kv,
 };
 
 // ------------------------------------------------------------------
@@ -156,10 +155,7 @@ impl Qwen3Attention {
 
         let (k, v) = self.kv_cache.update(&k, &v)?;
 
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(&k, n_rep)?;
-        let v = repeat_kv(&v, n_rep)?;
-
+        // GQA: MLX's SDPA handles grouped query attention natively.
         let mask_mode = if seq_len > 1 { "causal" } else { "" };
         let attn = q.fast_scaled_dot_product_attention(&k, &v, self.scale, mask_mode, None)?;
 

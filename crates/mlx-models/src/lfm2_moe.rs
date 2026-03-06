@@ -1,7 +1,11 @@
 use mlx_core::{Array, Module, Result};
 use mlx_nn::{
-    Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, VarBuilder, repeat_kv,
+    Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, VarBuilder,
 };
+use std::sync::{Mutex, OnceLock};
+use std::time::Instant;
+
+use crate::qwen3_moe::MoeProfileStats;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Lfm2MoeConfig {
@@ -35,6 +39,41 @@ fn default_norm_eps() -> f32 { 1e-5 }
 fn default_rope_theta() -> f32 { 10_000.0 }
 fn default_max_pos() -> usize { 131072 }
 fn default_conv_l_cache() -> usize { 3 }
+
+static LFM2_MOE_PROFILE_STATS: OnceLock<Mutex<MoeProfileStats>> = OnceLock::new();
+
+fn lfm2_moe_profile_stats_store() -> &'static Mutex<MoeProfileStats> {
+    LFM2_MOE_PROFILE_STATS.get_or_init(|| Mutex::new(MoeProfileStats::default()))
+}
+
+fn trace_generation_enabled() -> bool {
+    matches!(
+        std::env::var("MLX_TRACE_GENERATION").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+    )
+}
+
+fn with_lfm2_moe_profile_stats_mut<F: FnOnce(&mut MoeProfileStats)>(f: F) {
+    if !trace_generation_enabled() {
+        return;
+    }
+    if let Ok(mut stats) = lfm2_moe_profile_stats_store().lock() {
+        f(&mut stats);
+    }
+}
+
+pub(crate) fn reset_lfm2_moe_profile_stats() {
+    if let Ok(mut stats) = lfm2_moe_profile_stats_store().lock() {
+        *stats = MoeProfileStats::default();
+    }
+}
+
+pub(crate) fn lfm2_moe_profile_stats() -> MoeProfileStats {
+    lfm2_moe_profile_stats_store()
+        .lock()
+        .map(|stats| stats.clone())
+        .unwrap_or_default()
+}
 
 impl Lfm2MoeConfig {
     fn num_kv_heads(&self) -> usize {
@@ -164,10 +203,7 @@ impl FullAttention {
         let k = self.rope.forward(&k, offset)?;
         let (k, v) = self.kv_cache.update(&k, &v)?;
 
-        let n_rep = self.num_heads / self.num_kv_heads;
-        let k = repeat_kv(&k, n_rep)?;
-        let v = repeat_kv(&v, n_rep)?;
-
+        // MLX's SDPA handles grouped-query attention without explicit KV expansion.
         let mask_mode = if seq_len > 1 { "causal" } else { "" };
         let attn = q.fast_scaled_dot_product_attention(&k, &v, self.scale, mask_mode, None)?;
 
@@ -391,15 +427,70 @@ impl MoeFeedForward {
             router_logits = router_logits.add(expert_bias)?;
         }
 
-        let router_probs = router_logits.softmax(-1)?.to_vec_f32()?;
         let num_tokens = flat.shape_raw()[0] as usize;
         let num_experts = self.num_experts;
         let k = self.top_k.min(num_experts).max(1);
+
+        if num_tokens == 1 {
+            with_lfm2_moe_profile_stats_mut(|stats| {
+                stats.single_token_fast_path_hits += 1;
+            });
+            let stage_t0 = Instant::now();
+            let row_logits = router_logits.to_vec_f32()?;
+            with_lfm2_moe_profile_stats_mut(|stats| {
+                stats.router_host_s += stage_t0.elapsed().as_secs_f64();
+            });
+            let row_logits = &row_logits[..num_experts];
+            let top = select_top_k(row_logits, k);
+            let log_denom = logsumexp_row(row_logits);
+            let norm = if self.norm_topk_prob {
+                top.iter().map(|&(_, logit)| (logit - log_denom).exp()).sum::<f32>()
+            } else {
+                1.0
+            };
+            let denom = if norm > 0.0 { norm } else { 1.0 };
+            if top.is_empty() {
+                return Err(mlx_core::Error::Message(
+                    "MoE router produced no assignments".into(),
+                ));
+            }
+            let selected_ids: Vec<i32> = top.iter().map(|(expert_idx, _)| *expert_idx as i32).collect();
+            let weights: Vec<f32> = top
+                .iter()
+                .map(|&(_, logit)| {
+                    let prob = (logit - log_denom).exp();
+                    if self.norm_topk_prob { prob / denom } else { prob }
+                })
+                .collect();
+            let flat_refs: Vec<&Array> = std::iter::repeat_n(&flat, top.len()).collect();
+            let flat_batch = Array::concatenate(&flat_refs, 0)?;
+            let eidx = Array::from_slice_i32(&selected_ids)?;
+            let stage_t0 = Instant::now();
+            let gate = self.gate.forward_selected(&flat_batch, &eidx)?;
+            let up = self.up.forward_selected(&flat_batch, &eidx)?;
+            let hidden_act = gate.multiply(&gate.sigmoid()?)?.multiply(&up)?;
+            let expert_out = self.down.forward_selected(&hidden_act, &eidx)?;
+            with_lfm2_moe_profile_stats_mut(|stats| {
+                stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
+            });
+            let weight_arr = Array::from_slice_f32(&weights)?
+                .reshape(&[weights.len() as i32, 1])?
+                .as_type(expert_out.dtype())?;
+            let out = expert_out.multiply(&weight_arr)?.sum_axis(0, false)?.reshape(&[1, hidden])?;
+            return out.reshape(&orig_shape);
+        }
+
+        let stage_t0 = Instant::now();
+        let router_probs = router_logits.softmax(-1)?.to_vec_f32()?;
+        with_lfm2_moe_profile_stats_mut(|stats| {
+            stats.router_host_s += stage_t0.elapsed().as_secs_f64();
+        });
 
         let mut routed_by_expert: Vec<Vec<(usize, f32)>> =
             (0..num_experts).map(|_| Vec::new()).collect();
         let mut expert_ids: Vec<usize> = (0..num_experts).collect();
 
+        let stage_t0 = Instant::now();
         for tok in 0..num_tokens {
             let row = &router_probs[tok * num_experts..(tok + 1) * num_experts];
             expert_ids.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
@@ -420,6 +511,9 @@ impl MoeFeedForward {
                 routed_by_expert[expert_idx].push((tok, weight));
             }
         }
+        with_lfm2_moe_profile_stats_mut(|stats| {
+            stats.routing_build_s += stage_t0.elapsed().as_secs_f64();
+        });
 
         let mut token_accum: Vec<Option<Array>> = (0..num_tokens).map(|_| None).collect();
         for (expert_idx, assignments) in routed_by_expert.iter().enumerate() {
@@ -431,10 +525,14 @@ impl MoeFeedForward {
             let tok_x = flat.take(&token_idx, 0)?;
             let eidx = Array::from_slice_i32(&vec![expert_idx as i32; assignments.len()])?;
 
+            let stage_t0 = Instant::now();
             let gate = self.gate.forward_selected(&tok_x, &eidx)?;
             let up = self.up.forward_selected(&tok_x, &eidx)?;
             let hidden = gate.multiply(&gate.sigmoid()?)?.multiply(&up)?;
             let expert_out = self.down.forward_selected(&hidden, &eidx)?;
+            with_lfm2_moe_profile_stats_mut(|stats| {
+                stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
+            });
 
             let out_hidden = expert_out.shape_raw()[1];
             let weights: Vec<f32> = assignments.iter().map(|(_, w)| *w).collect();
@@ -442,7 +540,6 @@ impl MoeFeedForward {
                 .reshape(&[assignments.len() as i32, 1])?
                 .as_type(expert_out.dtype())?;
             let weighted = expert_out.multiply(&weight_arr)?;
-
             for (i, (tok, _)) in assignments.iter().enumerate() {
                 let contrib = weighted
                     .slice(&[i as i32, 0], &[(i + 1) as i32, out_hidden])?
@@ -470,6 +567,45 @@ impl MoeFeedForward {
         let out = Array::concatenate(&refs, 0)?;
         out.reshape(&orig_shape)
     }
+}
+
+fn select_top_k(row: &[f32], k: usize) -> Vec<(usize, f32)> {
+    debug_assert!(k > 0);
+    let mut top: Vec<(usize, f32)> = Vec::with_capacity(k);
+    for (idx, &value) in row.iter().enumerate() {
+        let pos = top.iter().position(|&(cur_idx, cur_value)| {
+            value > cur_value || (value == cur_value && idx < cur_idx)
+        });
+        match pos {
+            Some(insert_at) => {
+                top.insert(insert_at, (idx, value));
+                if top.len() > k {
+                    top.pop();
+                }
+            }
+            None if top.len() < k => top.push((idx, value)),
+            None => {}
+        }
+    }
+    top
+}
+
+fn logsumexp_row(logits: &[f32]) -> f32 {
+    if logits.is_empty() {
+        return f32::NEG_INFINITY;
+    }
+    let max_v = logits
+        .iter()
+        .copied()
+        .fold(f32::NEG_INFINITY, f32::max);
+    let mut sum = 0.0f32;
+    for &v in logits {
+        sum += (v - max_v).exp();
+    }
+    if sum <= 0.0 {
+        return max_v;
+    }
+    max_v + sum.ln()
 }
 
 struct DenseMlp {
@@ -623,7 +759,6 @@ impl Lfm2Moe {
         let mut h = self.embed_tokens.forward(input_ids)?;
         for layer in &mut self.layers {
             h = layer.forward(&h)?;
-            h.eval()?;
         }
         h = self.norm.forward(&h)?;
 

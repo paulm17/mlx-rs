@@ -286,7 +286,6 @@ impl Llama {
 
         for layer in &mut self.layers {
             h = layer.forward(&h)?;
-            h.eval()?;
         }
 
         h = self.norm.forward(&h)?;

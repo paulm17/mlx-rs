@@ -29,6 +29,7 @@ class ModelSpec:
 @dataclass
 class BenchmarkResult:
     backend: str
+    mode: str
     model_key: str
     model_name: str
     model_dir: str
@@ -36,9 +37,26 @@ class BenchmarkResult:
     total_s: float
     tokens: int
     tokens_per_s: float
+    decode_tokens_per_s: float
+    stop_reason: str
     output_preview: str
+    debug_profile: dict[str, Any] | None = None
+    comparable: bool = True
+    comparability_note: str = ""
     ok: bool = True
     error: str = ""
+
+
+@dataclass
+class ChatMetrics:
+    ttft_s: float
+    total_s: float
+    tokens: int
+    tokens_per_s: float
+    decode_tokens_per_s: float
+    stop_reason: str
+    content: str
+    debug_profile: dict[str, Any] | None = None
 
 
 class ServerProcess:
@@ -167,7 +185,12 @@ def count_tokens(model_dir: str, text: str) -> int:
         return max(1, len(text.split())) if text.strip() else 0
 
 
-def stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float) -> tuple[float, float, str]:
+def decode_tps(tokens: int, total_s: float, ttft_s: float) -> float:
+    decode_s = max(total_s - ttft_s, 1e-9)
+    return float(tokens) / decode_s if tokens > 0 else 0.0
+
+
+def stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float) -> ChatMetrics:
     payload = {
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": int(max_tokens),
@@ -184,31 +207,65 @@ def stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float)
     t0 = time.perf_counter()
     ttft = None
     parts: list[str] = []
+    final_event: dict[str, Any] | None = None
+    usage_event: dict[str, Any] | None = None
+    finish_reason = ""
 
-    with urllib.request.urlopen(req, timeout=600.0) as resp:
-        if resp.status != 200:
-            raise RuntimeError(f"chat status {resp.status}")
-        for raw in resp:
-            line = raw.decode("utf-8", errors="replace").strip()
-            if not line.startswith("data: "):
-                continue
-            data = line[6:]
-            if data == "[DONE]":
-                break
-            obj = json.loads(data)
-            delta = obj.get("choices", [{}])[0].get("delta", {}).get("content", "")
-            if delta:
-                if ttft is None:
-                    ttft = time.perf_counter() - t0
-                parts.append(delta)
+    try:
+        with urllib.request.urlopen(req, timeout=600.0) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"chat status {resp.status}")
+            for raw in resp:
+                line = raw.decode("utf-8", errors="replace").strip()
+                if not line.startswith("data: "):
+                    continue
+                data = line[6:]
+                if data == "[DONE]":
+                    break
+                obj = json.loads(data)
+                if obj.get("usage"):
+                    usage_event = obj
+                choices = obj.get("choices") or []
+                if not choices:
+                    continue
+                choice = choices[0]
+                maybe_finish_reason = choice.get("finish_reason")
+                if maybe_finish_reason:
+                    finish_reason = str(maybe_finish_reason)
+                    final_event = obj
+                delta = choice.get("delta", {}).get("content", "")
+                if delta:
+                    if ttft is None:
+                        ttft = time.perf_counter() - t0
+                    parts.append(delta)
+    except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"stream chat status={e.code} body={body}") from e
 
     total = time.perf_counter() - t0
     if ttft is None:
         raise RuntimeError("no streamed tokens were produced")
-    return ttft, total, "".join(parts)
+    content = "".join(parts)
+    usage = (usage_event or final_event or {}).get("usage", {})
+    dbg = (final_event or {}).get("debug", {})
+    tokens = int(usage.get("completion_tokens") or dbg.get("tokens") or 0)
+    stop_reason = str(dbg.get("stop_reason") or finish_reason or "unknown")
+    total_s = float(dbg.get("total_s") or total)
+    ttft_s = float(dbg.get("ttft_s") or ttft)
+    tps = float(dbg.get("tokens_per_s") or (tokens / max(total_s, 1e-9))) if tokens > 0 else 0.0
+    return ChatMetrics(
+        ttft_s=ttft_s,
+        total_s=total_s,
+        tokens=tokens,
+        tokens_per_s=tps,
+        decode_tokens_per_s=decode_tps(tokens, total_s, ttft_s),
+        stop_reason=stop_reason,
+        content=content,
+        debug_profile=dbg.get("profile") if isinstance(dbg.get("profile"), dict) else None,
+    )
 
 
-def non_stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float) -> tuple[float, float, int, float, str]:
+def non_stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float) -> ChatMetrics:
     payload = {
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": int(max_tokens),
@@ -231,11 +288,22 @@ def non_stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: fl
     dbg = body.get("debug", {})
     ttft = float(dbg.get("ttft_s", 0.0))
     total = float(dbg.get("total_s", 0.0))
-    tokens = int(dbg.get("tokens", 0))
-    tps = float(dbg.get("tokens_per_s", 0.0))
+    usage = body.get("usage", {})
+    tokens = int(dbg.get("tokens") or usage.get("completion_tokens") or 0)
+    tps = float(dbg.get("tokens_per_s") or (tokens / max(total, 1e-9)))
+    stop_reason = str(dbg.get("stop_reason") or body.get("choices", [{}])[0].get("finish_reason") or "unknown")
     if not content:
         raise RuntimeError("non-stream response returned empty content")
-    return ttft, total, tokens, tps, content
+    return ChatMetrics(
+        ttft_s=ttft,
+        total_s=total,
+        tokens=tokens,
+        tokens_per_s=tps,
+        decode_tokens_per_s=decode_tps(tokens, total, ttft),
+        stop_reason=stop_reason,
+        content=content,
+        debug_profile=dbg.get("profile") if isinstance(dbg.get("profile"), dict) else None,
+    )
 
 
 def rust_load_model(base_url: str, model_dir: str) -> None:
@@ -248,7 +316,15 @@ def rust_unload_model(base_url: str) -> None:
     _http_json("POST", f"{base_url.rstrip('/')}/llm/unload", {}, timeout_s=120.0)
 
 
-def benchmark_python(models: list[ModelSpec], case: dict[str, Any], host: str, port: int, server_template: str, startup_timeout_s: float) -> list[BenchmarkResult]:
+def benchmark_python(
+    models: list[ModelSpec],
+    case: dict[str, Any],
+    host: str,
+    port: int,
+    server_template: str,
+    startup_timeout_s: float,
+    mode: str,
+) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
     prompt = case["prompt"]
     max_tokens = int(case.get("max_tokens", 256))
@@ -259,27 +335,67 @@ def benchmark_python(models: list[ModelSpec], case: dict[str, Any], host: str, p
             server_template.format(model_dir=model.model_dir, host=host, port=port)
         )
         print(f"[python] starting server for {model.name}")
-        with ServerProcess(cmd, host, port, ready_path="/v1/models", timeout_s=startup_timeout_s):
-            ttft, total, output = stream_chat(f"http://{host}:{port}", prompt, max_tokens, temperature)
-            tokens = count_tokens(model.model_dir, output)
-            tps = (tokens / max(total, 1e-9))
+        try:
+            with ServerProcess(cmd, host, port, ready_path="/v1/models", timeout_s=startup_timeout_s):
+                if mode == "stream":
+                    metrics = stream_chat(f"http://{host}:{port}", prompt, max_tokens, temperature)
+                else:
+                    metrics = non_stream_chat(f"http://{host}:{port}", prompt, max_tokens, temperature)
+                tokens = metrics.tokens
+                tokens_per_s = metrics.tokens_per_s
+                decode_tokens_per_s = metrics.decode_tokens_per_s
+                if tokens <= 0:
+                    tokens = count_tokens(model.model_dir, metrics.content)
+                    tokens_per_s = tokens / max(metrics.total_s, 1e-9)
+                    decode_tokens_per_s = decode_tps(tokens, metrics.total_s, metrics.ttft_s)
+                results.append(
+                    BenchmarkResult(
+                        backend="python",
+                        mode=mode,
+                        model_key=model.key,
+                        model_name=model.name,
+                        model_dir=model.model_dir,
+                        ttft_s=metrics.ttft_s,
+                        total_s=metrics.total_s,
+                        tokens=tokens,
+                        tokens_per_s=tokens_per_s,
+                        decode_tokens_per_s=decode_tokens_per_s,
+                        stop_reason=metrics.stop_reason,
+                        output_preview=metrics.content[:240],
+                        debug_profile=metrics.debug_profile,
+                    )
+                )
+        except Exception as e:
             results.append(
                 BenchmarkResult(
                     backend="python",
+                    mode=mode,
                     model_key=model.key,
                     model_name=model.name,
                     model_dir=model.model_dir,
-                    ttft_s=ttft,
-                    total_s=total,
-                    tokens=tokens,
-                    tokens_per_s=tps,
-                    output_preview=output[:240],
+                    ttft_s=0.0,
+                    total_s=0.0,
+                    tokens=0,
+                    tokens_per_s=0.0,
+                    decode_tokens_per_s=0.0,
+                    stop_reason="error",
+                    output_preview="",
+                    ok=False,
+                    error=str(e),
                 )
             )
     return results
 
 
-def benchmark_rust(models: list[ModelSpec], case: dict[str, Any], host: str, port: int, rust_server_cmd: str, startup_timeout_s: float) -> list[BenchmarkResult]:
+def benchmark_rust(
+    models: list[ModelSpec],
+    case: dict[str, Any],
+    host: str,
+    port: int,
+    rust_server_cmd: str,
+    startup_timeout_s: float,
+    mode: str,
+) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
     prompt = case["prompt"]
     max_tokens = int(case.get("max_tokens", 256))
@@ -293,27 +409,39 @@ def benchmark_rust(models: list[ModelSpec], case: dict[str, Any], host: str, por
             print(f"[rust] loading {model.name}")
             try:
                 rust_load_model(base_url, model.model_dir)
-                ttft, total, tokens, tps, output = non_stream_chat(base_url, prompt, max_tokens, temperature)
+                if mode == "stream":
+                    metrics = stream_chat(base_url, prompt, max_tokens, temperature)
+                else:
+                    metrics = non_stream_chat(base_url, prompt, max_tokens, temperature)
+                tokens = metrics.tokens
+                tokens_per_s = metrics.tokens_per_s
+                decode_tokens_per_s = metrics.decode_tokens_per_s
                 if tokens <= 0:
-                    tokens = count_tokens(model.model_dir, output)
-                    tps = (tokens / max(total, 1e-9))
+                    tokens = count_tokens(model.model_dir, metrics.content)
+                    tokens_per_s = tokens / max(metrics.total_s, 1e-9)
+                    decode_tokens_per_s = decode_tps(tokens, metrics.total_s, metrics.ttft_s)
                 results.append(
                     BenchmarkResult(
                         backend="rust",
+                        mode=mode,
                         model_key=model.key,
                         model_name=model.name,
                         model_dir=model.model_dir,
-                        ttft_s=ttft,
-                        total_s=total,
+                        ttft_s=metrics.ttft_s,
+                        total_s=metrics.total_s,
                         tokens=tokens,
-                        tokens_per_s=tps,
-                        output_preview=output[:240],
+                        tokens_per_s=tokens_per_s,
+                        decode_tokens_per_s=decode_tokens_per_s,
+                        stop_reason=metrics.stop_reason,
+                        output_preview=metrics.content[:240],
+                        debug_profile=metrics.debug_profile,
                     )
                 )
             except Exception as e:
                 results.append(
                     BenchmarkResult(
                         backend="rust",
+                        mode=mode,
                         model_key=model.key,
                         model_name=model.name,
                         model_dir=model.model_dir,
@@ -321,13 +449,18 @@ def benchmark_rust(models: list[ModelSpec], case: dict[str, Any], host: str, por
                         total_s=0.0,
                         tokens=0,
                         tokens_per_s=0.0,
+                        decode_tokens_per_s=0.0,
+                        stop_reason="error",
                         output_preview="",
                         ok=False,
                         error=str(e),
                     )
                 )
             finally:
-                rust_unload_model(base_url)
+                try:
+                    rust_unload_model(base_url)
+                except Exception:
+                    pass
     return results
 
 
@@ -339,11 +472,16 @@ def print_table(results: list[BenchmarkResult]) -> None:
     headers = [
         "model",
         "backend",
+        "mode",
         "ok",
         "ttft_s",
         "tokens_per_s",
+        "decode_tps",
         "tokens",
         "total_s",
+        "stop_reason",
+        "comparable",
+        "note",
         "error",
     ]
     print("\n" + " | ".join(headers))
@@ -356,7 +494,15 @@ def print_table(results: list[BenchmarkResult]) -> None:
             if not r:
                 continue
             print(
-                f"{r.model_name} | {backend} | {str(r.ok).lower()} | {r.ttft_s:.3f} | {r.tokens_per_s:.2f} | {r.tokens} | {r.total_s:.3f} | {r.error[:120]}"
+                f"{r.model_name} | {backend} | {r.mode} | {str(r.ok).lower()} | {r.ttft_s:.3f} | {r.tokens_per_s:.2f} | {r.decode_tokens_per_s:.2f} | {r.tokens} | {r.total_s:.3f} | {r.stop_reason} | {str(r.comparable).lower()} | {r.comparability_note[:80]} | {r.error[:120]}"
+            )
+
+        py = row.get("python")
+        rs = row.get("rust")
+        if py and rs and py.ok and rs.ok and py.tokens_per_s > 0.0 and py.decode_tokens_per_s > 0.0:
+            note = py.comparability_note or rs.comparability_note
+            print(
+                f"{py.model_name} | ratio | {py.mode} | true | {rs.ttft_s / py.ttft_s:.2f}x_ttft | {rs.tokens_per_s / py.tokens_per_s:.2%} | {rs.decode_tokens_per_s / py.decode_tokens_per_s:.2%} | - | - | - | {str(py.comparable and rs.comparable).lower()} | {note[:80]} | "
             )
 
 
@@ -364,19 +510,52 @@ def to_json(results: list[BenchmarkResult]) -> list[dict[str, Any]]:
     return [
         {
             "backend": r.backend,
+            "mode": r.mode,
             "model_key": r.model_key,
             "model_name": r.model_name,
             "model_dir": r.model_dir,
             "ttft_s": r.ttft_s,
             "tokens_per_s": r.tokens_per_s,
+            "decode_tokens_per_s": r.decode_tokens_per_s,
             "tokens": r.tokens,
             "total_s": r.total_s,
+            "stop_reason": r.stop_reason,
+            "comparable": r.comparable,
+            "comparability_note": r.comparability_note,
             "output_preview": r.output_preview,
+            "debug_profile": r.debug_profile,
             "ok": r.ok,
             "error": r.error,
         }
         for r in results
     ]
+
+
+def annotate_comparability(results: list[BenchmarkResult]) -> None:
+    grouped: dict[str, dict[str, BenchmarkResult]] = {}
+    for r in results:
+        grouped.setdefault(r.model_key, {})[r.backend] = r
+
+    for row in grouped.values():
+        py = row.get("python")
+        rs = row.get("rust")
+        if not py or not rs or not py.ok or not rs.ok:
+            continue
+
+        notes: list[str] = []
+        if py.stop_reason != rs.stop_reason:
+            notes.append(f"stop_reason differs: python={py.stop_reason}, rust={rs.stop_reason}")
+        if py.tokens != rs.tokens:
+            notes.append(f"token_count differs: python={py.tokens}, rust={rs.tokens}")
+        if py.mode != rs.mode:
+            notes.append(f"mode differs: python={py.mode}, rust={rs.mode}")
+
+        if notes:
+            note = "; ".join(notes)
+            py.comparable = False
+            rs.comparable = False
+            py.comparability_note = note
+            rs.comparability_note = note
 
 
 def main() -> int:
@@ -397,6 +576,12 @@ def main() -> int:
     p.add_argument("--rust-host", default="127.0.0.1")
     p.add_argument("--rust-port", type=int, default=3000)
     p.add_argument("--rust-server-cmd", default="target/debug/mlx-server")
+    p.add_argument(
+        "--mode",
+        choices=("aligned_stream", "stream", "non_stream"),
+        default="aligned_stream",
+        help="Benchmark mode. 'aligned_stream' and 'stream' use streaming for both backends.",
+    )
 
     p.add_argument("--startup-timeout-s", type=float, default=180.0)
     p.add_argument("--output-json", default=None)
@@ -408,6 +593,8 @@ def main() -> int:
     if len(models) == 0:
         raise RuntimeError("no models provided")
 
+    request_mode = "stream" if args.mode in {"aligned_stream", "stream"} else "non_stream"
+
     py_results = benchmark_python(
         models,
         case,
@@ -415,6 +602,7 @@ def main() -> int:
         port=args.python_port,
         server_template=args.python_server_template,
         startup_timeout_s=args.startup_timeout_s,
+        mode=request_mode,
     )
 
     rust_results = benchmark_rust(
@@ -424,9 +612,11 @@ def main() -> int:
         port=args.rust_port,
         rust_server_cmd=args.rust_server_cmd,
         startup_timeout_s=args.startup_timeout_s,
+        mode=request_mode,
     )
 
     all_results = py_results + rust_results
+    annotate_comparability(all_results)
     print_table(all_results)
 
     out_path = args.output_json

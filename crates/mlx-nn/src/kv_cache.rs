@@ -1,4 +1,26 @@
 use mlx_core::{Array, Error, Result};
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+static KV_CACHE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static KV_CACHE_GROWTHS: AtomicUsize = AtomicUsize::new(0);
+
+#[derive(Debug, Clone, Copy)]
+pub struct KvCacheStats {
+    pub allocations: usize,
+    pub growths: usize,
+}
+
+pub fn reset_kv_cache_stats() {
+    KV_CACHE_ALLOCATIONS.store(0, Ordering::Relaxed);
+    KV_CACHE_GROWTHS.store(0, Ordering::Relaxed);
+}
+
+pub fn kv_cache_stats() -> KvCacheStats {
+    KvCacheStats {
+        allocations: KV_CACHE_ALLOCATIONS.load(Ordering::Relaxed),
+        growths: KV_CACHE_GROWTHS.load(Ordering::Relaxed),
+    }
+}
 
 /// Key-Value cache for autoregressive decoding.
 ///
@@ -13,11 +35,16 @@ pub struct KvCache {
 impl KvCache {
     /// Create an empty cache.
     pub fn new() -> Self {
+        let step = std::env::var("MLX_KV_CACHE_STEP")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|&v| v > 0)
+            .unwrap_or(512);
         Self {
             k: None,
             v: None,
             offset: 0,
-            step: 256,
+            step,
         }
     }
 
@@ -115,10 +142,12 @@ impl KvCache {
         let current_capacity = self.k.as_ref().map(|k| k.dim(2) as usize).unwrap_or(0);
         if self.k.is_none() || self.v.is_none() {
             let capacity = self.round_up_steps(needed);
+            KV_CACHE_ALLOCATIONS.fetch_add(1, Ordering::Relaxed);
             self.k = Some(Self::alloc_like(new_k, capacity)?);
             self.v = Some(Self::alloc_like(new_v, capacity)?);
         } else if needed > current_capacity {
             let capacity = self.round_up_steps(needed);
+            KV_CACHE_GROWTHS.fetch_add(1, Ordering::Relaxed);
             let old_k = self.k.as_ref().unwrap();
             let old_v = self.v.as_ref().unwrap();
             let mut new_k_buf = Self::alloc_like(new_k, capacity)?;

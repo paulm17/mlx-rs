@@ -5,6 +5,7 @@ use crate::{
 use anyhow::Result;
 use serde::Deserialize;
 use serde_json::json;
+use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
@@ -329,6 +330,66 @@ fn error_json(code_name: &str, message: impl ToString) -> serde_json::Value {
     })
 }
 
+fn generation_debug_json(
+    metrics: &crate::GenerationMetrics,
+    prompt_token_count: usize,
+    prompt_render_s: f64,
+    prompt_tokenize_s: f64,
+    stream_write_s: f64,
+) -> Value {
+    let mut debug = Map::new();
+    debug.insert("ttft_s".into(), json!(metrics.ttft_s));
+    debug.insert("total_s".into(), json!(metrics.total_s));
+    debug.insert("tokens".into(), json!(metrics.tokens));
+    debug.insert(
+        "tokens_per_s".into(),
+        json!(if metrics.total_s > 0.0 {
+            metrics.tokens as f64 / metrics.total_s
+        } else {
+            0.0
+        }),
+    );
+    debug.insert("stop_reason".into(), json!(metrics.stop_reason));
+    debug.insert("last_token_id".into(), json!(metrics.last_token_id));
+
+    if let Some(profile) = &metrics.profile {
+        debug.insert(
+            "profile".into(),
+            json!({
+                "prompt_render_s": prompt_render_s,
+                "prompt_tokenize_s": prompt_tokenize_s,
+                "stream_write_s": stream_write_s,
+                "clear_cache_s": profile.clear_cache_s,
+                "tokenize_s": profile.tokenize_s,
+                "prefill_forward_s": profile.prefill_forward_s,
+                "prefill_eval_s": profile.prefill_eval_s,
+                "prefill_normalize_s": profile.prefill_normalize_s,
+                "first_sample_s": profile.first_sample_s,
+                "first_decode_s": profile.first_decode_s,
+                "decode_forward_s": profile.decode_forward_s,
+                "decode_eval_s": profile.decode_eval_s,
+                "decode_normalize_s": profile.decode_normalize_s,
+                "sample_s": profile.sample_s,
+                "decode_text_s": profile.decode_text_s,
+                "eval_calls": profile.eval_calls,
+                "sample_calls": profile.sample_calls,
+                "cpu_logits_extractions": profile.cpu_logits_extractions,
+                "decoded_pieces": profile.decoded_pieces,
+                "kv_cache_allocations": profile.kv_cache_allocations,
+                "kv_cache_growths": profile.kv_cache_growths,
+                "moe_router_host_s": profile.moe_router_host_s,
+                "moe_routing_build_s": profile.moe_routing_build_s,
+                "moe_expert_forward_s": profile.moe_expert_forward_s,
+                "moe_shared_expert_s": profile.moe_shared_expert_s,
+                "moe_single_token_fast_path_hits": profile.moe_single_token_fast_path_hits,
+                "prompt_tokens": prompt_token_count
+            }),
+        );
+    }
+
+    Value::Object(debug)
+}
+
 fn apply_chat_template(model_dir: &PathBuf, req: &ChatRequest, thinking: bool) -> Result<String> {
     let mut msgs = Vec::with_capacity(req.messages.len());
     for m in &req.messages {
@@ -470,15 +531,19 @@ fn handle_request(
                     ))
                 }
             };
+            let prompt_render_t0 = Instant::now();
             let prompt = match apply_chat_template(&lm.model_dir, &parsed, thinking) {
                 Ok(p) => p,
                 Err(e) => return Some((400, error_json("template_error", e.to_string()))),
             };
+            let prompt_render_s = prompt_render_t0.elapsed().as_secs_f64();
             let max_tokens = parsed.max_tokens;
             let temperature = parsed.temperature.unwrap_or(0.0);
             let top_p = parsed.top_p.unwrap_or(1.0);
             let sampler = Sampler::new(temperature, top_p);
+            let prompt_tokenize_t0 = Instant::now();
             let prompt_token_count = lm.tokenizer.encode(&prompt).map(|v| v.len()).unwrap_or(0);
+            let prompt_tokenize_s = prompt_tokenize_t0.elapsed().as_secs_f64();
 
             let mut pipeline = GenerationPipeline::new(&mut lm.model, lm.tokenizer.clone(), sampler);
             if parsed.stream.unwrap_or(false) {
@@ -491,6 +556,7 @@ fn handle_request(
                     .map(|d| d.as_secs())
                     .unwrap_or(0);
                 let id = "chatcmpl-local";
+                let mut stream_write_s = 0.0f64;
 
                 match pipeline.generate_with_metrics(&prompt, max_tokens, |_token, piece| {
                     if stream_error.is_some() {
@@ -506,14 +572,22 @@ fn handle_request(
                             "finish_reason": serde_json::Value::Null
                         }]
                     });
+                    let write_t0 = Instant::now();
                     if let Err(e) = write_sse_event(stream, event) {
                         stream_error = Some(anyhow::anyhow!(e.to_string()));
+                    } else {
+                        stream_write_s += write_t0.elapsed().as_secs_f64();
                     }
                 }) {
                     Ok((_text, metrics)) => {
                         if let Some(e) = stream_error {
                             return Some((500, error_json("stream_write_error", e.to_string())));
                         }
+                        let finish_reason = if metrics.stop_reason == "length" {
+                            "length"
+                        } else {
+                            "stop"
+                        };
                         let final_event = json!({
                             "id": id,
                             "object": "chat.completion.chunk",
@@ -521,19 +595,14 @@ fn handle_request(
                             "choices": [{
                                 "index": 0,
                                 "delta": {},
-                                "finish_reason": "stop"
+                                "finish_reason": finish_reason
                             }],
                             "usage": {
                                 "prompt_tokens": prompt_token_count,
                                 "completion_tokens": metrics.tokens,
                                 "total_tokens": prompt_token_count + metrics.tokens
                             },
-                            "debug": {
-                                "ttft_s": metrics.ttft_s,
-                                "total_s": metrics.total_s,
-                                "tokens": metrics.tokens,
-                                "tokens_per_s": if metrics.total_s > 0.0 { metrics.tokens as f64 / metrics.total_s } else { 0.0 }
-                            }
+                            "debug": generation_debug_json(&metrics, prompt_token_count, prompt_render_s, prompt_tokenize_s, stream_write_s)
                         });
                         if let Err(e) = write_sse_event(stream, final_event) {
                             return Some((500, error_json("stream_write_error", e.to_string())));
@@ -560,10 +629,10 @@ fn handle_request(
 
             match pipeline.generate_with_metrics(&prompt, max_tokens, |_token, _piece| {}) {
                 Ok((text, metrics)) => {
-                    let tps = if metrics.total_s > 0.0 {
-                        metrics.tokens as f64 / metrics.total_s
+                    let finish_reason = if metrics.stop_reason == "length" {
+                        "length"
                     } else {
-                        0.0
+                        "stop"
                     };
                     Some((
                         200,
@@ -573,19 +642,14 @@ fn handle_request(
                             "choices": [{
                                 "index": 0,
                                 "message": {"role": "assistant", "content": text},
-                                "finish_reason": "stop"
+                                "finish_reason": finish_reason
                             }],
                             "usage": {
                                 "prompt_tokens": prompt_token_count,
                                 "completion_tokens": metrics.tokens,
                                 "total_tokens": prompt_token_count + metrics.tokens
                             },
-                            "debug": {
-                                "ttft_s": metrics.ttft_s,
-                                "total_s": metrics.total_s,
-                                "tokens": metrics.tokens,
-                                "tokens_per_s": tps
-                            }
+                            "debug": generation_debug_json(&metrics, prompt_token_count, prompt_render_s, prompt_tokenize_s, 0.0)
                         }),
                     ))
                 }

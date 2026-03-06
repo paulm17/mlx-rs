@@ -27,14 +27,65 @@ impl Sampler {
         Self { temperature, top_p, ..Self::default() }
     }
 
+    pub fn uses_host_sampling(&self) -> bool {
+        self.temperature > 0.0
+    }
+
+    pub fn is_greedy(&self) -> bool {
+        self.temperature <= 0.0
+    }
+
     /// Sample a token from logits.
     pub fn sample(&self, logits: &Array) -> Result<u32> {
         self.sample_with_history(logits, &[])
     }
 
+    fn squeeze_all_singletons(mut arr: Array) -> Result<Array> {
+        loop {
+            let shape = arr.shape_raw();
+            let mut squeezed = false;
+            for axis in (0..shape.len()).rev() {
+                if shape[axis] == 1 {
+                    arr = arr.squeeze(axis as i32)?;
+                    squeezed = true;
+                    break;
+                }
+            }
+            if !squeezed {
+                return Ok(arr);
+            }
+        }
+    }
+
+    pub fn sample_raw_last_token_logits_array(&self, logits: &Array) -> Result<Array> {
+        anyhow::ensure!(
+            self.is_greedy(),
+            "sample_raw_last_token_logits_array only supports greedy decoding"
+        );
+        let axis = logits.ndim().saturating_sub(1) as i32;
+        let idx = logits.argmax(axis)?;
+        Self::squeeze_all_singletons(idx)
+    }
+
+    pub fn sample_raw_last_token_logits(&self, logits: &Array, history: &[u32]) -> Result<u32> {
+        if self.is_greedy() {
+            let idx = self.sample_raw_last_token_logits_array(logits)?;
+            return match idx.item_u32() {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(idx.item_i32()? as u32),
+            };
+        }
+        let logits = match logits.ndim() {
+            3 => logits.squeeze(0)?.squeeze(0)?.contiguous()?,
+            2 => logits.squeeze(0)?.contiguous()?,
+            _ => logits.contiguous()?,
+        };
+        self.sample_with_history(&logits, history)
+    }
+
     /// Sample a token from logits with optional repetition penalty history.
     pub fn sample_with_history(&self, logits: &Array, history: &[u32]) -> Result<u32> {
-        if self.temperature <= 0.0 {
+        if self.is_greedy() {
             // Greedy decoding should be pure argmax (no repetition penalty),
             // and should stay on-device to avoid per-token host allocations.
             let idx = logits.argmax(0)?;

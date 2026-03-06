@@ -1,6 +1,6 @@
-# gpt-mlx-rs
+# mlx-rs
 
-`gpt-mlx-rs` is a Rust-first MLX runtime for local LLM inference on Apple Silicon.
+`mlx-rs` is a Rust-first MLX runtime for local LLM inference on Apple Silicon.
 
 It is structured as layered crates that mirror the same separation of concerns you would expect from candle-style design:
 - FFI bindings and raw MLX C ABI
@@ -311,7 +311,7 @@ From another Cargo project:
 
 ```toml
 [dependencies]
-mlx-lm = { path = "/absolute/path/to/gpt-mlx-rs/crates/mlx-lm" }
+mlx-lm = { path = "/absolute/path/to/mlx-rs/crates/mlx-lm" }
 anyhow = "1"
 ```
 

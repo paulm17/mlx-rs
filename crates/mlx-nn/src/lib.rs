@@ -22,7 +22,7 @@ pub mod var_builder;
 pub use activation::Activation;
 pub use attention::{causal_attention, repeat_kv, scaled_dot_product_attention};
 pub use embedding::Embedding;
-pub use kv_cache::KvCache;
+pub use kv_cache::{kv_cache_stats, reset_kv_cache_stats, KvCache, KvCacheStats};
 pub use linear::{Linear, QuantConfig};
 pub use rms_norm::RmsNorm;
 pub use rope::{RoPE, RopeScaling};
