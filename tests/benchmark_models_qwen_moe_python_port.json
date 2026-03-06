@@ -1,0 +1,9 @@
+[
+  {
+    "key": "qwen_moe_python_port",
+    "name": "Qwen1.5-MoE-A2.7B-4bit (Python Port)",
+    "model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--mlx-community--Qwen1.5-MoE-A2.7B-4bit/snapshots/11aaad5b454a361ae33f19fb47b72bc74b3c3b55",
+    "python_model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--mlx-community--Qwen1.5-MoE-A2.7B-4bit/snapshots/11aaad5b454a361ae33f19fb47b72bc74b3c3b55",
+    "rust_model_dir": "/Volumes/Data/Users/paul/development/src/github/mlx-rs/tmp_models/Qwen1.5-MoE-A2.7B-4bit-python-port"
+  }
+]

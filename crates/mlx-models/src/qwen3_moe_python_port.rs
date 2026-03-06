@@ -12,7 +12,7 @@ use std::time::Instant;
 // ------------------------------------------------------------------
 
 #[derive(Debug, Clone, serde::Deserialize)]
-pub struct Qwen3MoeConfig {
+pub struct Qwen3MoePythonPortConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub moe_intermediate_size: Option<usize>,
@@ -59,11 +59,11 @@ pub struct MoeProfileStats {
 
 static MOE_PROFILE_STATS: OnceLock<Mutex<MoeProfileStats>> = OnceLock::new();
 
-fn moe_profile_stats_store() -> &'static Mutex<MoeProfileStats> {
+fn qwen3_moe_python_port_profile_stats_store() -> &'static Mutex<MoeProfileStats> {
     MOE_PROFILE_STATS.get_or_init(|| Mutex::new(MoeProfileStats::default()))
 }
 
-fn trace_generation_enabled() -> bool {
+fn trace_qwen3_moe_python_port_generation_enabled() -> bool {
     matches!(
         std::env::var("MLX_TRACE_GENERATION").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
@@ -94,7 +94,7 @@ fn top_pairs_match(lhs: &[(usize, f32)], rhs: &[(usize, f32)], tol: f32) -> bool
     })
 }
 
-fn validate_shadow_top_k(
+fn validate_qwen3_moe_python_port_shadow_top_k(
     target: &str,
     router_probs: &Array,
     num_experts: usize,
@@ -119,7 +119,7 @@ fn validate_shadow_top_k(
         .collect();
     sort_top_pairs(&mut device_top);
 
-    with_moe_profile_stats_mut(|stats| {
+    with_qwen3_moe_python_port_profile_stats_mut(|stats| {
         stats.device_router_shadow_checks += 1;
         if !top_pairs_match(host_top, &device_top, 1e-4) {
             stats.device_router_shadow_mismatches += 1;
@@ -128,29 +128,29 @@ fn validate_shadow_top_k(
     Ok(())
 }
 
-fn with_moe_profile_stats_mut<F: FnOnce(&mut MoeProfileStats)>(f: F) {
-    if !trace_generation_enabled() {
+fn with_qwen3_moe_python_port_profile_stats_mut<F: FnOnce(&mut MoeProfileStats)>(f: F) {
+    if !trace_qwen3_moe_python_port_generation_enabled() {
         return;
     }
-    if let Ok(mut stats) = moe_profile_stats_store().lock() {
+    if let Ok(mut stats) = qwen3_moe_python_port_profile_stats_store().lock() {
         f(&mut stats);
     }
 }
 
-pub fn reset_moe_profile_stats() {
-    if let Ok(mut stats) = moe_profile_stats_store().lock() {
+pub fn reset_qwen3_moe_python_port_profile_stats() {
+    if let Ok(mut stats) = qwen3_moe_python_port_profile_stats_store().lock() {
         *stats = MoeProfileStats::default();
     }
 }
 
-pub fn moe_profile_stats() -> MoeProfileStats {
-    moe_profile_stats_store()
+pub fn qwen3_moe_python_port_profile_stats() -> MoeProfileStats {
+    qwen3_moe_python_port_profile_stats_store()
         .lock()
         .map(|stats| stats.clone())
         .unwrap_or_default()
 }
 
-impl Qwen3MoeConfig {
+impl Qwen3MoePythonPortConfig {
     pub fn num_kv_heads(&self) -> usize {
         self.num_key_value_heads.unwrap_or(self.num_attention_heads)
     }
@@ -197,7 +197,7 @@ struct MoeGate {
 }
 
 impl MoeGate {
-    fn load(vb: &VarBuilder, cfg: &Qwen3MoeConfig) -> anyhow::Result<Self> {
+    fn load(vb: &VarBuilder, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
         Ok(Self {
             gate: Linear::new(vb, &qc)?,
@@ -244,7 +244,7 @@ fn stack_arrays(arrays: &[Array]) -> Result<Array> {
 }
 
 impl SwitchLinear {
-    fn load(vb: &VarBuilder, proj: &str, cfg: &Qwen3MoeConfig) -> anyhow::Result<Self> {
+    fn load(vb: &VarBuilder, proj: &str, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
         let mut weights = Vec::with_capacity(cfg.num_experts());
         let mut scales_vec = Vec::new();
         let mut biases_vec = Vec::new();
@@ -330,7 +330,7 @@ struct SwitchGlu {
 }
 
 impl SwitchGlu {
-    fn load(vb: &VarBuilder, cfg: &Qwen3MoeConfig) -> anyhow::Result<Self> {
+    fn load(vb: &VarBuilder, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
         Ok(Self {
             gate_proj: SwitchLinear::load(&vb.pp("experts"), "gate_proj", cfg)?,
             up_proj: SwitchLinear::load(&vb.pp("experts"), "up_proj", cfg)?,
@@ -362,7 +362,7 @@ struct SharedExpert {
 }
 
 impl SharedExpert {
-    fn load(vb: &VarBuilder, cfg: &Qwen3MoeConfig) -> anyhow::Result<Self> {
+    fn load(vb: &VarBuilder, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
         Ok(Self {
             gate_proj: Linear::new(&vb.pp("gate_proj"), &qc)?,
@@ -380,7 +380,7 @@ impl SharedExpert {
 }
 
 impl SparseMoeBlock {
-    fn load(vb: &VarBuilder, cfg: &Qwen3MoeConfig) -> anyhow::Result<Self> {
+    fn load(vb: &VarBuilder, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
         let gate = MoeGate::load(&vb.pp("gate"), cfg)?;
         let switch_mlp = SwitchGlu::load(vb, cfg)?;
         let shared_expert = if cfg.shared_expert_intermediate_size.is_some() {
@@ -413,7 +413,7 @@ impl SparseMoeBlock {
         let k = self.gate.num_experts_per_tok.min(num_experts).max(1);
 
         if num_tokens == 1 {
-            with_moe_profile_stats_mut(|stats| {
+            with_qwen3_moe_python_port_profile_stats_mut(|stats| {
                 stats.single_token_fast_path_hits += 1;
             });
         }
@@ -429,7 +429,7 @@ impl SparseMoeBlock {
             let denom = top_probs.sum_axis(-1, true)?;
             top_probs = top_probs.divide(&denom)?;
         }
-        with_moe_profile_stats_mut(|stats| {
+        with_qwen3_moe_python_port_profile_stats_mut(|stats| {
             stats.router_host_s += stage_t0.elapsed().as_secs_f64();
         });
         if validate_device_router_enabled("qwen") {
@@ -440,12 +440,12 @@ impl SparseMoeBlock {
                 .into_iter()
                 .map(|(idx, _)| (idx, row_probs[idx]))
                 .collect();
-            validate_shadow_top_k("qwen", &router_probs, num_experts, k, &top)?;
+            validate_qwen3_moe_python_port_shadow_top_k("qwen", &router_probs, num_experts, k, &top)?;
         }
 
         let stage_t0 = Instant::now();
         let expert_out = self.switch_mlp.forward(&flat, &top_idx)?;
-        with_moe_profile_stats_mut(|stats| {
+        with_qwen3_moe_python_port_profile_stats_mut(|stats| {
             stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
         });
         let score_arr = top_probs.expand_dims(-1)?.as_type(expert_out.dtype())?;
@@ -458,7 +458,7 @@ impl SparseMoeBlock {
                 let gate = shared_gate.forward(&flat)?.sigmoid()?;
                 shared_out = shared_out.multiply(&gate)?;
             }
-            with_moe_profile_stats_mut(|stats| {
+            with_qwen3_moe_python_port_profile_stats_mut(|stats| {
                 stats.shared_expert_s += stage_t0.elapsed().as_secs_f64();
             });
             out = out.add(&shared_out)?;
@@ -521,7 +521,7 @@ struct DenseMlp {
 }
 
 impl DenseMlp {
-    fn load(vb: &VarBuilder, cfg: &Qwen3MoeConfig) -> anyhow::Result<Self> {
+    fn load(vb: &VarBuilder, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
         Ok(Self {
             gate_proj: Linear::new(&vb.pp("gate_proj"), &qc)?,
@@ -576,7 +576,7 @@ struct MoeAttention {
 }
 
 impl MoeAttention {
-    fn load(vb: &VarBuilder, cfg: &Qwen3MoeConfig) -> anyhow::Result<Self> {
+    fn load(vb: &VarBuilder, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
         let q_proj = Linear::new(&vb.pp("q_proj"), &qc)?;
         let k_proj = Linear::new(&vb.pp("k_proj"), &qc)?;
@@ -655,7 +655,7 @@ struct MoeBlock {
 }
 
 impl MoeBlock {
-    fn load(layer_idx: usize, vb: &VarBuilder, cfg: &Qwen3MoeConfig) -> anyhow::Result<Self> {
+    fn load(layer_idx: usize, vb: &VarBuilder, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
         let ff = if cfg.is_moe_layer(layer_idx) {
             FeedForward::Moe(SparseMoeBlock::load(&vb.pp("mlp"), cfg)?)
         } else {
@@ -686,19 +686,19 @@ impl MoeBlock {
 }
 
 // ------------------------------------------------------------------
-// Qwen3Moe Model
+// Qwen3MoePythonPort Model
 // ------------------------------------------------------------------
 
 /// Qwen3-MoE language model.
-pub struct Qwen3Moe {
+pub struct Qwen3MoePythonPort {
     embed_tokens: Embedding,
     layers: Vec<MoeBlock>,
     norm: RmsNorm,
     lm_head: Linear,
 }
 
-impl Qwen3Moe {
-    pub fn new(cfg: &Qwen3MoeConfig, vb: &VarBuilder) -> anyhow::Result<Self> {
+impl Qwen3MoePythonPort {
+    pub fn new(cfg: &Qwen3MoePythonPortConfig, vb: &VarBuilder) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
         let model_vb = vb.pp("model");
 

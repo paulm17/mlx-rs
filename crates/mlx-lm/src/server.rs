@@ -18,6 +18,24 @@ struct LoadedModel {
     tokenizer: Tokenizer,
 }
 
+fn sampler_for_model(model_dir: &Path, temperature: f32, top_p: f32) -> Sampler {
+    let mut sampler = Sampler::new(temperature, top_p);
+    let config_path = model_dir.join("config.json");
+    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+        if let Ok(config) = serde_json::from_str::<Value>(&config_str) {
+            if let Ok(arch) = crate::loader::detect_architecture(&config) {
+                if matches!(
+                    arch,
+                    crate::loader::ModelArch::QwenMoe | crate::loader::ModelArch::QwenMoePythonPort
+                ) {
+                    sampler = sampler.with_greedy_tie_break(0.05);
+                }
+            }
+        }
+    }
+    sampler
+}
+
 fn release_loaded_model(loaded: &mut Option<LoadedModel>) {
     let _ = mlx_core::Stream::new_gpu_default().synchronize();
     let _ = mlx_core::Stream::new_cpu_default().synchronize();
@@ -351,6 +369,9 @@ fn generation_debug_json(
     );
     debug.insert("stop_reason".into(), json!(metrics.stop_reason));
     debug.insert("last_token_id".into(), json!(metrics.last_token_id));
+    debug.insert("generated_token_ids".into(), json!(metrics.generated_token_ids));
+    debug.insert("tail_token_ids".into(), json!(metrics.tail_token_ids));
+    debug.insert("stop_token_ids".into(), json!(metrics.stop_token_ids));
 
     if let Some(profile) = &metrics.profile {
         debug.insert(
@@ -542,7 +563,7 @@ fn handle_request(
             let max_tokens = parsed.max_tokens;
             let temperature = parsed.temperature.unwrap_or(0.0);
             let top_p = parsed.top_p.unwrap_or(1.0);
-            let sampler = Sampler::new(temperature, top_p);
+            let sampler = sampler_for_model(&lm.model_dir, temperature, top_p);
             let prompt_tokenize_t0 = Instant::now();
             let prompt_token_count = lm.tokenizer.encode(&prompt).map(|v| v.len()).unwrap_or(0);
             let prompt_tokenize_s = prompt_tokenize_t0.elapsed().as_secs_f64();

@@ -3,12 +3,15 @@ use mlx_core::Array;
 use rand::Rng;
 use std::collections::HashSet;
 
+const GREEDY_TIE_EPSILON: f32 = 0.05;
+
 /// Token sampling strategies.
 pub struct Sampler {
     temperature: f32,
     top_p: f32,
     repetition_penalty: f32,
     repeat_last_n: usize,
+    greedy_tie_epsilon: Option<f32>,
 }
 
 impl Default for Sampler {
@@ -18,6 +21,7 @@ impl Default for Sampler {
             top_p: 0.9,
             repetition_penalty: 1.15,
             repeat_last_n: 256,
+            greedy_tie_epsilon: None,
         }
     }
 }
@@ -25,6 +29,11 @@ impl Default for Sampler {
 impl Sampler {
     pub fn new(temperature: f32, top_p: f32) -> Self {
         Self { temperature, top_p, ..Self::default() }
+    }
+
+    pub fn with_greedy_tie_break(mut self, epsilon: f32) -> Self {
+        self.greedy_tie_epsilon = Some(epsilon.max(0.0));
+        self
     }
 
     pub fn uses_host_sampling(&self) -> bool {
@@ -57,23 +66,92 @@ impl Sampler {
         }
     }
 
+    fn flatten_last_token_logits(logits: &Array) -> Result<Array> {
+        let logits = match logits.ndim() {
+            3 => logits.squeeze(0)?.squeeze(0)?.contiguous()?,
+            2 => logits.squeeze(0)?.contiguous()?,
+            _ => logits.contiguous()?,
+        };
+        Ok(Self::squeeze_all_singletons(logits)?)
+    }
+
+    fn greedy_token_with_tie_break(logits: &Array, epsilon: Option<f32>) -> Result<u32> {
+        let logits = Self::flatten_last_token_logits(logits)?;
+        if epsilon.is_none() {
+            let idx = logits.argmax(0)?;
+            return match idx.item_u32() {
+                Ok(v) => Ok(v),
+                Err(_) => Ok(idx.item_i32()? as u32),
+            };
+        }
+        let epsilon = epsilon.unwrap_or(GREEDY_TIE_EPSILON);
+        let vocab = logits.dim(0);
+        anyhow::ensure!(vocab > 0, "cannot sample from empty logits");
+        if vocab == 1 {
+            return Ok(0);
+        }
+
+        let neg = logits.negative()?;
+        let partition = neg.argpartition(1, 0)?;
+        let top2_idx = partition.slice(&[0], &[2])?;
+        let top2_vals = logits.take_along_axis(&top2_idx, 0)?;
+        let idxs = top2_idx.to_vec_i32()?;
+        let vals = top2_vals.to_vec_f32()?;
+        anyhow::ensure!(
+            idxs.len() == vals.len() && !idxs.is_empty(),
+            "failed to retrieve top-2 logits"
+        );
+
+        let mut pairs: Vec<(u32, f32)> = idxs
+            .into_iter()
+            .zip(vals)
+            .map(|(idx, val)| (idx as u32, val))
+            .collect();
+        pairs.sort_by(|(idx_a, val_a), (idx_b, val_b)| {
+            val_b
+                .partial_cmp(val_a)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| idx_a.cmp(idx_b))
+        });
+
+        let (best_idx, best_val) = pairs[0];
+        let (second_idx, second_val) = if pairs.len() > 1 {
+            pairs[1]
+        } else {
+            (best_idx, f32::NEG_INFINITY)
+        };
+
+        if (best_val - second_val).abs() <= epsilon && second_idx < best_idx {
+            Ok(second_idx)
+        } else {
+            Ok(best_idx)
+        }
+    }
+
     pub fn sample_raw_last_token_logits_array(&self, logits: &Array) -> Result<Array> {
         anyhow::ensure!(
             self.is_greedy(),
             "sample_raw_last_token_logits_array only supports greedy decoding"
         );
-        let axis = logits.ndim().saturating_sub(1) as i32;
-        let idx = logits.argmax(axis)?;
-        Self::squeeze_all_singletons(idx)
+        if self.greedy_tie_epsilon.is_none() {
+            let axis = logits.ndim().saturating_sub(1) as i32;
+            let idx = logits.argmax(axis)?;
+            return Self::squeeze_all_singletons(idx);
+        }
+        let token = Self::greedy_token_with_tie_break(logits, self.greedy_tie_epsilon)?;
+        Ok(Array::from_int(token as i32)?)
     }
 
     pub fn sample_raw_last_token_logits(&self, logits: &Array, history: &[u32]) -> Result<u32> {
         if self.is_greedy() {
-            let idx = self.sample_raw_last_token_logits_array(logits)?;
-            return match idx.item_u32() {
-                Ok(v) => Ok(v),
-                Err(_) => Ok(idx.item_i32()? as u32),
-            };
+            if self.greedy_tie_epsilon.is_none() {
+                let idx = self.sample_raw_last_token_logits_array(logits)?;
+                return match idx.item_u32() {
+                    Ok(v) => Ok(v),
+                    Err(_) => Ok(idx.item_i32()? as u32),
+                };
+            }
+            return Self::greedy_token_with_tie_break(logits, self.greedy_tie_epsilon);
         }
         let logits = match logits.ndim() {
             3 => logits.squeeze(0)?.squeeze(0)?.contiguous()?,
@@ -87,12 +165,15 @@ impl Sampler {
     pub fn sample_with_history(&self, logits: &Array, history: &[u32]) -> Result<u32> {
         if self.is_greedy() {
             // Greedy decoding should be pure argmax (no repetition penalty),
-            // and should stay on-device to avoid per-token host allocations.
-            let idx = logits.argmax(0)?;
-            return match idx.item_u32() {
-                Ok(v) => Ok(v),
-                Err(_) => Ok(idx.item_i32()? as u32),
-            };
+            // and should not apply repetition penalties.
+            if self.greedy_tie_epsilon.is_none() {
+                let idx = logits.argmax(0)?;
+                return match idx.item_u32() {
+                    Ok(v) => Ok(v),
+                    Err(_) => Ok(idx.item_i32()? as u32),
+                };
+            }
+            return Self::greedy_token_with_tie_break(logits, self.greedy_tie_epsilon);
         }
 
         let mut logits_vec = logits.to_vec_f32()?;

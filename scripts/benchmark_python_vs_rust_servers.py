@@ -45,6 +45,7 @@ class BenchmarkResult:
     stop_reason: str
     output_preview: str
     debug_profile: dict[str, Any] | None = None
+    debug_extra: dict[str, Any] | None = None
     comparable: bool = True
     comparability_note: str = ""
     ok: bool = True
@@ -61,6 +62,7 @@ class ChatMetrics:
     stop_reason: str
     content: str
     debug_profile: dict[str, Any] | None = None
+    debug_extra: dict[str, Any] | None = None
 
 
 class ServerProcess:
@@ -238,6 +240,17 @@ def count_tokens(model_dir: str, text: str) -> int:
         return max(1, len(text.split())) if text.strip() else 0
 
 
+def tail_token_ids(model_dir: str, text: str, n: int = 16) -> list[int]:
+    try:
+        from tokenizers import Tokenizer  # type: ignore
+
+        tok = Tokenizer.from_file(str(Path(model_dir) / "tokenizer.json"))
+        enc = tok.encode(text)
+        return enc.ids[-n:]
+    except Exception:
+        return []
+
+
 def decode_tps(tokens: int, total_s: float, ttft_s: float) -> float:
     decode_s = max(total_s - ttft_s, 1e-9)
     return float(tokens) / decode_s if tokens > 0 else 0.0
@@ -327,6 +340,12 @@ def stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float)
         stop_reason=stop_reason,
         content=content,
         debug_profile=dbg.get("profile") if isinstance(dbg.get("profile"), dict) else None,
+        debug_extra={
+            "last_token_id": dbg.get("last_token_id"),
+            "generated_token_ids": dbg.get("generated_token_ids"),
+            "tail_token_ids": dbg.get("tail_token_ids"),
+            "stop_token_ids": dbg.get("stop_token_ids"),
+        },
     )
 
 
@@ -368,6 +387,12 @@ def non_stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: fl
         stop_reason=stop_reason,
         content=content,
         debug_profile=dbg.get("profile") if isinstance(dbg.get("profile"), dict) else None,
+        debug_extra={
+            "last_token_id": dbg.get("last_token_id"),
+            "generated_token_ids": dbg.get("generated_token_ids"),
+            "tail_token_ids": dbg.get("tail_token_ids"),
+            "stop_token_ids": dbg.get("stop_token_ids"),
+        },
     )
 
 
@@ -428,6 +453,11 @@ def benchmark_python(
                         stop_reason=metrics.stop_reason,
                         output_preview=metrics.content[:240],
                         debug_profile=metrics.debug_profile,
+                        debug_extra={
+                            **(metrics.debug_extra or {}),
+                            "output_tail": metrics.content[-240:],
+                            "content_tail_token_ids": tail_token_ids(model.python_model_dir, metrics.content),
+                        },
                     )
                 )
         except Exception as e:
@@ -500,6 +530,11 @@ def benchmark_rust(
                         stop_reason=metrics.stop_reason,
                         output_preview=metrics.content[:240],
                         debug_profile=metrics.debug_profile,
+                        debug_extra={
+                            **(metrics.debug_extra or {}),
+                            "output_tail": metrics.content[-240:],
+                            "content_tail_token_ids": tail_token_ids(model.rust_model_dir, metrics.content),
+                        },
                     )
                 )
             except Exception as e:
@@ -596,6 +631,7 @@ def to_json(results: list[BenchmarkResult]) -> list[dict[str, Any]]:
             "comparability_note": r.comparability_note,
             "output_preview": r.output_preview,
             "debug_profile": r.debug_profile,
+            "debug_extra": r.debug_extra,
             "ok": r.ok,
             "error": r.error,
         }

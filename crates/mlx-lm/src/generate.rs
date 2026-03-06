@@ -118,6 +118,9 @@ pub struct GenerationMetrics {
     pub tokens: usize,
     pub stop_reason: &'static str,
     pub last_token_id: Option<u32>,
+    pub generated_token_ids: Vec<u32>,
+    pub tail_token_ids: Vec<u32>,
+    pub stop_token_ids: Vec<u32>,
     pub profile: Option<GenerationProfile>,
 }
 
@@ -150,6 +153,15 @@ impl CausalLM for mlx_models::Qwen35 {
 }
 
 impl CausalLM for mlx_models::Qwen3Moe {
+    fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
+        self.forward(input_ids)
+    }
+    fn clear_cache(&mut self) {
+        self.clear_cache();
+    }
+}
+
+impl CausalLM for mlx_models::Qwen3MoePythonPort {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         self.forward(input_ids)
     }
@@ -535,6 +547,17 @@ impl<M: CausalLM> GenerationPipeline<M> {
             tokens: token_count,
             stop_reason,
             last_token_id,
+            generated_token_ids: generated_tokens.clone(),
+            tail_token_ids: generated_tokens
+                .iter()
+                .rev()
+                .take(8)
+                .copied()
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect(),
+            stop_token_ids: self.tokenizer.stop_token_ids().to_vec(),
             profile,
         };
         Ok((output, metrics))

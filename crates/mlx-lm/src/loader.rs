@@ -1,6 +1,7 @@
 use anyhow::Result;
 use mlx_core::DType;
 use mlx_nn::VarBuilder;
+use serde_json::Value;
 use std::path::Path;
 
 use crate::generate::CausalLM;
@@ -44,12 +45,13 @@ pub enum ModelArch {
     Qwen3,
     Qwen35,
     QwenMoe,
+    QwenMoePythonPort,
     Lfm2Moe,
     Lfm2MoePythonPort,
 }
 
 /// Detect model architecture from config.json.
-fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
+pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
     // Check model_type field
     if let Some(model_type) = config.get("model_type").and_then(|v| v.as_str()) {
         match model_type.to_lowercase().as_str() {
@@ -64,6 +66,9 @@ fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 return Ok(ModelArch::Qwen3);
             }
             "qwen2_moe" | "qwen1.5_moe" => return Ok(ModelArch::QwenMoe),
+            "qwen2_moe_python_port" | "qwen1.5_moe_python_port" | "qwen_moe_python_port" => {
+                return Ok(ModelArch::QwenMoePythonPort);
+            }
             "lfm2_moe" | "lfm2" => return Ok(ModelArch::Lfm2Moe),
             "lfm2_moe_python_port" | "lfm2_python_port" => {
                 return Ok(ModelArch::Lfm2MoePythonPort);
@@ -94,6 +99,13 @@ fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 if lower.contains("qwen2moe") || lower.contains("qwen2_moe") {
                     return Ok(ModelArch::QwenMoe);
                 }
+                if lower.contains("qwen2moepythonport")
+                    || lower.contains("qwen2_moe_python_port")
+                    || lower.contains("qwen1.5_moe_python_port")
+                    || lower.contains("qwen_moe_python_port")
+                {
+                    return Ok(ModelArch::QwenMoePythonPort);
+                }
                 if lower.contains("lfm2moepythonport")
                     || lower.contains("lfm2_moe_python_port")
                     || lower.contains("lfm2_python_port")
@@ -108,6 +120,76 @@ fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
     }
 
     Err(anyhow::anyhow!("could not detect model architecture"))
+}
+
+fn push_token_id(tokenizer: &crate::tokenizer::Tokenizer, stops: &mut Vec<u32>, token: &str) {
+    if let Some(id) = tokenizer.inner().token_to_id(token) {
+        stops.push(id);
+    }
+}
+
+fn extend_stop_tokens_from_value(
+    tokenizer: &crate::tokenizer::Tokenizer,
+    stops: &mut Vec<u32>,
+    value: &Value,
+) {
+    match value {
+        Value::Number(n) => {
+            if let Some(id) = n.as_u64().map(|v| v as u32) {
+                stops.push(id);
+            }
+        }
+        Value::String(s) => push_token_id(tokenizer, stops, s),
+        Value::Object(map) => {
+            if let Some(Value::String(s)) = map.get("content") {
+                push_token_id(tokenizer, stops, s);
+            }
+        }
+        Value::Array(arr) => {
+            for item in arr {
+                extend_stop_tokens_from_value(tokenizer, stops, item);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn load_stop_tokens(
+    model_dir: &Path,
+    tokenizer: crate::tokenizer::Tokenizer,
+    config: &Value,
+) -> crate::tokenizer::Tokenizer {
+    let mut stops: Vec<u32> = Vec::new();
+
+    if let Some(eos_id) = config
+        .get("eos_token_id")
+        .or_else(|| config.get("text_config").and_then(|tc| tc.get("eos_token_id")))
+    {
+        extend_stop_tokens_from_value(&tokenizer, &mut stops, eos_id);
+    }
+
+    for filename in ["tokenizer_config.json", "special_tokens_map.json"] {
+        let path = model_dir.join(filename);
+        if let Ok(raw) = std::fs::read_to_string(&path) {
+            if let Ok(obj) = serde_json::from_str::<Value>(&raw) {
+                if let Some(v) = obj.get("eos_token") {
+                    extend_stop_tokens_from_value(&tokenizer, &mut stops, v);
+                }
+                if let Some(v) = obj.get("eos_token_id") {
+                    extend_stop_tokens_from_value(&tokenizer, &mut stops, v);
+                }
+                if let Some(v) = obj.get("additional_special_tokens") {
+                    extend_stop_tokens_from_value(&tokenizer, &mut stops, v);
+                }
+            }
+        }
+    }
+
+    for tok in ["<|im_end|>", "<|eot_id|>", "<|im_start|>"] {
+        push_token_id(&tokenizer, &mut stops, tok);
+    }
+
+    tokenizer.with_stop_tokens(stops)
 }
 
 /// Load a model from a directory containing config.json and .safetensors files.
@@ -143,6 +225,10 @@ pub fn load_model(model_dir: &Path) -> Result<(Box<dyn CausalLM>, crate::tokeniz
             let cfg: mlx_models::Qwen3MoeConfig = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Qwen3Moe::new(&cfg, &vb)?)
         }
+        ModelArch::QwenMoePythonPort => {
+            let cfg: mlx_models::Qwen3MoePythonPortConfig = serde_json::from_value(config.clone())?;
+            Box::new(mlx_models::Qwen3MoePythonPort::new(&cfg, &vb)?)
+        }
         ModelArch::Lfm2Moe => {
             let cfg: mlx_models::Lfm2MoeConfig = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Lfm2Moe::new(&cfg, &vb)?)
@@ -159,43 +245,7 @@ pub fn load_model(model_dir: &Path) -> Result<(Box<dyn CausalLM>, crate::tokeniz
     let tokenizer_path = model_dir.join("tokenizer.json");
     let mut tokenizer = crate::tokenizer::Tokenizer::from_file(&tokenizer_path)?;
 
-    // Try to read eos_token_id from config (top-level or nested text_config for Qwen3.5).
-    let eos_id = config
-        .get("eos_token_id")
-        .or_else(|| config.get("text_config").and_then(|tc| tc.get("eos_token_id")));
-    if let Some(eos_id) = eos_id {
-        match eos_id {
-            serde_json::Value::Number(n) => {
-                if let Some(eos) = n.as_u64().map(|v| v as u32) {
-                    // Keep known chat terminators in stop set as well.
-                    let mut stops = vec![eos];
-                    for tok in ["<|im_end|>", "<|eot_id|>"] {
-                        if let Some(id) = tokenizer.inner().token_to_id(tok) {
-                            stops.push(id);
-                        }
-                    }
-                    tokenizer = tokenizer.with_stop_tokens(stops);
-                }
-            }
-            serde_json::Value::Array(arr) => {
-                let stop_ids: Vec<u32> = arr
-                    .iter()
-                    .filter_map(|v| v.as_u64())
-                    .map(|v| v as u32)
-                    .collect();
-                if !stop_ids.is_empty() {
-                    let mut stops = stop_ids;
-                    for tok in ["<|im_end|>", "<|eot_id|>"] {
-                        if let Some(id) = tokenizer.inner().token_to_id(tok) {
-                            stops.push(id);
-                        }
-                    }
-                    tokenizer = tokenizer.with_stop_tokens(stops);
-                }
-            }
-            _ => {}
-        }
-    }
+    tokenizer = load_stop_tokens(model_dir, tokenizer, &config);
 
     Ok((model, tokenizer))
 }

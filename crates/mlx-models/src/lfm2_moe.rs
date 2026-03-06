@@ -353,10 +353,9 @@ impl ExpertLinear {
         })
     }
 
-    fn forward_selected(&self, x: &Array, expert_indices: &Array) -> Result<Array> {
+    fn forward_switch(&self, x: &Array, expert_indices: &Array, sorted_indices: bool) -> Result<Array> {
         if let Some(scales) = &self.scales {
-            let x3 = x.reshape(&[x.shape_raw()[0], 1, x.shape_raw()[1]])?;
-            let out = x3.gather_qmm(
+            return x.gather_qmm(
                 &self.weight,
                 scales,
                 self.biases.as_ref(),
@@ -365,33 +364,45 @@ impl ExpertLinear {
                 true,
                 self.group_size,
                 self.bits,
-                false,
-            )?;
-            return out.squeeze(1);
+                sorted_indices,
+            );
         }
 
-        let n = x.shape_raw()[0] as usize;
-        let ids = expert_indices.to_vec_i32()?;
-        let mut rows = Vec::with_capacity(n);
-        for (row, &eid) in ids.iter().enumerate().take(n) {
-            let idx = Array::from_slice_i32(&[eid])?;
-            let w = self.weight.take(&idx, 0)?.squeeze(0)?;
-            let w_t = w.transpose()?;
-            let x_row = x
-                .slice(&[row as i32, 0], &[(row + 1) as i32, x.shape_raw()[1]])?;
-            rows.push(x_row.matmul(&w_t)?);
-        }
-        let refs: Vec<&Array> = rows.iter().collect();
-        Array::concatenate(&refs, 0)
+        let wt = self.weight.transpose_axes(&[0, 2, 1])?;
+        x.gather_mm(&wt, None, Some(expert_indices), sorted_indices)
     }
 
 }
 
+struct SwitchGlu {
+    gate_proj: ExpertLinear,
+    up_proj: ExpertLinear,
+    down_proj: ExpertLinear,
+}
+
+impl SwitchGlu {
+    fn load(vb: &VarBuilder, cfg: &Lfm2MoeConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            gate_proj: ExpertLinear::load(&vb.pp("gate_proj"), cfg)?,
+            up_proj: ExpertLinear::load(&vb.pp("up_proj"), cfg)?,
+            down_proj: ExpertLinear::load(&vb.pp("down_proj"), cfg)?,
+        })
+    }
+
+    fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+        let x = x.expand_dims(-2)?.expand_dims(-2)?;
+        let do_sort = false;
+        let x_up = self.up_proj.forward_switch(&x, indices, do_sort)?;
+        let x_gate = self.gate_proj.forward_switch(&x, indices, do_sort)?;
+        let x = x_gate.multiply(&x_gate.sigmoid()?)?.multiply(&x_up)?;
+        let x = self.down_proj.forward_switch(&x, indices, do_sort)?;
+        x.squeeze(2)
+    }
+}
+
 struct MoeFeedForward {
     router: Linear,
-    gate: ExpertLinear,
-    up: ExpertLinear,
-    down: ExpertLinear,
+    switch_mlp: SwitchGlu,
     expert_bias: Option<Array>,
     num_experts: usize,
     top_k: usize,
@@ -403,9 +414,7 @@ impl MoeFeedForward {
         let qc = cfg.quant_config();
         Ok(Self {
             router: Linear::new(&vb.pp("gate"), &qc)?,
-            gate: ExpertLinear::load(&vb.pp("switch_mlp").pp("gate_proj"), cfg)?,
-            up: ExpertLinear::load(&vb.pp("switch_mlp").pp("up_proj"), cfg)?,
-            down: ExpertLinear::load(&vb.pp("switch_mlp").pp("down_proj"), cfg)?,
+            switch_mlp: SwitchGlu::load(&vb.pp("switch_mlp"), cfg)?,
             expert_bias: if vb.contains("expert_bias") {
                 Some(vb.get("expert_bias")?)
             } else {
@@ -431,132 +440,55 @@ impl MoeFeedForward {
         let num_tokens = flat.shape_raw()[0] as usize;
         let num_experts = self.num_experts;
         let k = self.top_k.min(num_experts).max(1);
-
-        let stage_t0 = Instant::now();
-        let router_probs = router_logits.softmax(-1)?.to_vec_f32()?;
-        with_lfm2_moe_profile_stats_mut(|stats| {
-            stats.router_host_s += stage_t0.elapsed().as_secs_f64();
-        });
+        let router_probs = router_logits.softmax(-1)?;
+        let start = num_experts as i32 - k as i32;
 
         if num_tokens == 1 {
+            let stage_t0 = Instant::now();
             with_lfm2_moe_profile_stats_mut(|stats| {
                 stats.single_token_fast_path_hits += 1;
             });
-            let row = &router_probs[..num_experts];
-            let mut expert_ids: Vec<usize> = (0..num_experts).collect();
-            expert_ids.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
-            let top = &expert_ids[..k];
-            let norm = if self.norm_topk_prob {
-                top.iter().map(|&idx| row[idx]).sum::<f32>()
-            } else {
-                1.0
-            };
-            let denom = if norm > 0.0 { norm } else { 1.0 };
-            let selected_ids: Vec<i32> = top.iter().map(|&expert_idx| expert_idx as i32).collect();
-            let weights: Vec<f32> = top
-                .iter()
-                .map(|&expert_idx| {
-                    let prob = row[expert_idx];
-                    if self.norm_topk_prob { prob / denom } else { prob }
-                })
-                .collect();
-            if selected_ids.is_empty() {
-                return Err(mlx_core::Error::Message(
-                    "MoE router produced no assignments".into(),
-                ));
+            let partition = router_probs.argpartition((num_experts - k) as i32, -1)?;
+            let expert_idx = partition.slice(&[0, start], &[1, num_experts as i32])?;
+            let mut top_scores = router_probs.take_along_axis(&expert_idx, -1)?;
+            if self.norm_topk_prob {
+                let denom = top_scores.sum_axis(-1, true)?;
+                top_scores = top_scores.divide(&denom)?;
             }
-            let flat_refs: Vec<&Array> = std::iter::repeat_n(&flat, selected_ids.len()).collect();
-            let flat_batch = Array::concatenate(&flat_refs, 0)?;
-            let eidx = Array::from_slice_i32(&selected_ids)?;
+            with_lfm2_moe_profile_stats_mut(|stats| {
+                stats.routing_build_s += stage_t0.elapsed().as_secs_f64();
+            });
+
             let stage_t0 = Instant::now();
-            let gate = self.gate.forward_selected(&flat_batch, &eidx)?;
-            let up = self.up.forward_selected(&flat_batch, &eidx)?;
-            let hidden_act = gate.multiply(&gate.sigmoid()?)?.multiply(&up)?;
-            let expert_out = self.down.forward_selected(&hidden_act, &eidx)?;
+            let x_switch = flat.reshape(&[1, hidden])?;
+            let expert_out = self.switch_mlp.forward(&x_switch, &expert_idx)?;
             with_lfm2_moe_profile_stats_mut(|stats| {
                 stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
             });
-            let weight_arr = Array::from_slice_f32(&weights)?
-                .reshape(&[weights.len() as i32, 1])?
-                .as_type(expert_out.dtype())?;
-            let out = expert_out.multiply(&weight_arr)?.sum_axis(0, false)?.reshape(&[1, hidden])?;
+            let score_arr = top_scores.expand_dims(-1)?.as_type(expert_out.dtype())?;
+            let out = expert_out.multiply(&score_arr)?.sum_axis(1, false)?.reshape(&[1, hidden])?;
             return out.reshape(&orig_shape);
         }
 
-        let mut routed_by_expert: Vec<Vec<(usize, f32)>> =
-            (0..num_experts).map(|_| Vec::new()).collect();
-        let mut expert_ids: Vec<usize> = (0..num_experts).collect();
         let stage_t0 = Instant::now();
-        for tok in 0..num_tokens {
-            let row = &router_probs[tok * num_experts..(tok + 1) * num_experts];
-            expert_ids.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
-            let top = &expert_ids[..k];
-            let norm = if self.norm_topk_prob {
-                top.iter().map(|&idx| row[idx]).sum::<f32>()
-            } else {
-                1.0
-            };
-            let denom = if norm > 0.0 { norm } else { 1.0 };
-            for &expert_idx in top {
-                let prob = row[expert_idx];
-                let weight = if self.norm_topk_prob { prob / denom } else { prob };
-                routed_by_expert[expert_idx].push((tok, weight));
-            }
+        let partition = router_probs.argpartition((num_experts - k) as i32, -1)?;
+        let expert_idx = partition.slice(&[0, start], &[num_tokens as i32, num_experts as i32])?;
+        let mut top_scores = router_probs.take_along_axis(&expert_idx, -1)?;
+        if self.norm_topk_prob {
+            let denom = top_scores.sum_axis(-1, true)?;
+            top_scores = top_scores.divide(&denom)?;
         }
         with_lfm2_moe_profile_stats_mut(|stats| {
             stats.routing_build_s += stage_t0.elapsed().as_secs_f64();
         });
 
-        let mut token_accum: Vec<Option<Array>> = (0..num_tokens).map(|_| None).collect();
-        for (expert_idx, assignments) in routed_by_expert.iter().enumerate() {
-            if assignments.is_empty() {
-                continue;
-            }
-            let token_ids: Vec<i32> = assignments.iter().map(|(tok, _)| *tok as i32).collect();
-            let token_idx = Array::from_slice_i32(&token_ids)?;
-            let tok_x = flat.take(&token_idx, 0)?;
-            let eidx = Array::from_slice_i32(&vec![expert_idx as i32; assignments.len()])?;
-
-            let stage_t0 = Instant::now();
-            let gate = self.gate.forward_selected(&tok_x, &eidx)?;
-            let up = self.up.forward_selected(&tok_x, &eidx)?;
-            let hidden = gate.multiply(&gate.sigmoid()?)?.multiply(&up)?;
-            let expert_out = self.down.forward_selected(&hidden, &eidx)?;
-            with_lfm2_moe_profile_stats_mut(|stats| {
-                stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
-            });
-
-            let out_hidden = expert_out.shape_raw()[1];
-            let weights: Vec<f32> = assignments.iter().map(|(_, w)| *w).collect();
-            let weight_arr = Array::from_slice_f32(&weights)?
-                .reshape(&[assignments.len() as i32, 1])?
-                .as_type(expert_out.dtype())?;
-            let weighted = expert_out.multiply(&weight_arr)?;
-            for (i, (tok, _)) in assignments.iter().enumerate() {
-                let contrib = weighted
-                    .slice(&[i as i32, 0], &[(i + 1) as i32, out_hidden])?
-                    .reshape(&[1, out_hidden])?;
-                if let Some(prev) = token_accum[*tok].as_ref() {
-                    token_accum[*tok] = Some(prev.add(&contrib)?);
-                } else {
-                    token_accum[*tok] = Some(contrib);
-                }
-            }
-        }
-
-        let mut rows = Vec::with_capacity(num_tokens);
-        for token_contrib in token_accum {
-            match token_contrib {
-                Some(v) => rows.push(v),
-                None => {
-                    return Err(mlx_core::Error::Message(
-                        "MoE router produced no assignments".into(),
-                    ));
-                }
-            }
-        }
-        let refs: Vec<&Array> = rows.iter().collect();
-        let out = Array::concatenate(&refs, 0)?;
+        let stage_t0 = Instant::now();
+        let expert_out = self.switch_mlp.forward(&flat, &expert_idx)?;
+        with_lfm2_moe_profile_stats_mut(|stats| {
+            stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
+        });
+        let score_arr = top_scores.expand_dims(-1)?.as_type(expert_out.dtype())?;
+        let out = expert_out.multiply(&score_arr)?.sum_axis(1, false)?;
         out.reshape(&orig_shape)
     }
 }
