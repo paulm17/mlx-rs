@@ -45,6 +45,7 @@ pub enum ModelArch {
     Qwen35,
     QwenMoe,
     Lfm2Moe,
+    Lfm2MoePythonPort,
 }
 
 /// Detect model architecture from config.json.
@@ -64,6 +65,9 @@ fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
             }
             "qwen2_moe" | "qwen1.5_moe" => return Ok(ModelArch::QwenMoe),
             "lfm2_moe" | "lfm2" => return Ok(ModelArch::Lfm2Moe),
+            "lfm2_moe_python_port" | "lfm2_python_port" => {
+                return Ok(ModelArch::Lfm2MoePythonPort);
+            }
             _ => {}
         }
     }
@@ -89,6 +93,12 @@ fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 }
                 if lower.contains("qwen2moe") || lower.contains("qwen2_moe") {
                     return Ok(ModelArch::QwenMoe);
+                }
+                if lower.contains("lfm2moepythonport")
+                    || lower.contains("lfm2_moe_python_port")
+                    || lower.contains("lfm2_python_port")
+                {
+                    return Ok(ModelArch::Lfm2MoePythonPort);
                 }
                 if lower.contains("lfm2moe") || lower.contains("lfm2_moe") || lower.contains("lfm2") {
                     return Ok(ModelArch::Lfm2Moe);
@@ -136,6 +146,10 @@ pub fn load_model(model_dir: &Path) -> Result<(Box<dyn CausalLM>, crate::tokeniz
         ModelArch::Lfm2Moe => {
             let cfg: mlx_models::Lfm2MoeConfig = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Lfm2Moe::new(&cfg, &vb)?)
+        }
+        ModelArch::Lfm2MoePythonPort => {
+            let cfg: mlx_models::Lfm2MoePythonPortConfig = serde_json::from_value(config.clone())?;
+            Box::new(mlx_models::Lfm2MoePythonPort::new(&cfg, &vb)?)
         }
     };
 

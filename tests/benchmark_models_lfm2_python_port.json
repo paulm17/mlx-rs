@@ -1,0 +1,9 @@
+[
+  {
+    "key": "lfm2_moe_python_port",
+    "name": "LFM2-24B-A2B-MLX-4bit (Python Port)",
+    "model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--LiquidAI--LFM2-24B-A2B-MLX-4bit/snapshots/fb67c8c23d38cd4d7a9a6415ab80eefe83feecae",
+    "python_model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--LiquidAI--LFM2-24B-A2B-MLX-4bit/snapshots/fb67c8c23d38cd4d7a9a6415ab80eefe83feecae",
+    "rust_model_dir": "/Volumes/Data/Users/paul/development/src/github/mlx-rs/tmp_models/LFM2-24B-A2B-MLX-4bit-python-port"
+  }
+]

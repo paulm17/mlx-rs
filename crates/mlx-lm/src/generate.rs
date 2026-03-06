@@ -62,6 +62,8 @@ pub struct GenerationProfile {
     pub moe_expert_forward_s: f64,
     pub moe_shared_expert_s: f64,
     pub moe_single_token_fast_path_hits: usize,
+    pub moe_device_router_shadow_checks: usize,
+    pub moe_device_router_shadow_mismatches: usize,
 }
 
 impl GenerationProfile {
@@ -90,6 +92,8 @@ impl GenerationProfile {
             moe_expert_forward_s: 0.0,
             moe_shared_expert_s: 0.0,
             moe_single_token_fast_path_hits: 0,
+            moe_device_router_shadow_checks: 0,
+            moe_device_router_shadow_mismatches: 0,
         }
     }
 
@@ -155,6 +159,15 @@ impl CausalLM for mlx_models::Qwen3Moe {
 }
 
 impl CausalLM for mlx_models::Lfm2Moe {
+    fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
+        self.forward(input_ids)
+    }
+    fn clear_cache(&mut self) {
+        self.clear_cache();
+    }
+}
+
+impl CausalLM for mlx_models::Lfm2MoePythonPort {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         self.forward(input_ids)
     }
@@ -513,6 +526,8 @@ impl<M: CausalLM> GenerationPipeline<M> {
             p.moe_expert_forward_s = moe.expert_forward_s;
             p.moe_shared_expert_s = moe.shared_expert_s;
             p.moe_single_token_fast_path_hits = moe.single_token_fast_path_hits;
+            p.moe_device_router_shadow_checks = moe.device_router_shadow_checks;
+            p.moe_device_router_shadow_mismatches = moe.device_router_shadow_mismatches;
         }
         let metrics = GenerationMetrics {
             ttft_s: ttft_s.unwrap_or(0.0),

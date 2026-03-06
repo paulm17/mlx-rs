@@ -382,6 +382,8 @@ fn generation_debug_json(
                 "moe_expert_forward_s": profile.moe_expert_forward_s,
                 "moe_shared_expert_s": profile.moe_shared_expert_s,
                 "moe_single_token_fast_path_hits": profile.moe_single_token_fast_path_hits,
+                "moe_device_router_shadow_checks": profile.moe_device_router_shadow_checks,
+                "moe_device_router_shadow_mismatches": profile.moe_device_router_shadow_mismatches,
                 "prompt_tokens": prompt_token_count
             }),
         );

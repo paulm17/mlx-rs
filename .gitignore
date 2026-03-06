@@ -3,3 +3,5 @@
 /moe_harness_artifacts
 /parity_artifacts
 /clone
+/logs
+tmp_models/

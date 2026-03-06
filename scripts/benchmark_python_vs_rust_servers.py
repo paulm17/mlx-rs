@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import argparse
+import collections
 import datetime as dt
 import json
 import os
@@ -7,6 +8,7 @@ import shlex
 import socket
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -24,6 +26,8 @@ class ModelSpec:
     key: str
     name: str
     model_dir: str
+    python_model_dir: str
+    rust_model_dir: str
 
 
 @dataclass
@@ -67,30 +71,65 @@ class ServerProcess:
         self.ready_path = ready_path
         self.timeout_s = timeout_s
         self.proc: subprocess.Popen[str] | None = None
+        self._output_tail: collections.deque[str] = collections.deque(maxlen=400)
+        self._output_lock = threading.Lock()
+        self._reader_thread: threading.Thread | None = None
+        self._log_handle = None
+        ts = dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.log_path = Path(f"logs/server_{self.port}_{ts}.log")
 
     def __enter__(self) -> "ServerProcess":
+        self.log_path.parent.mkdir(parents=True, exist_ok=True)
+        self._log_handle = self.log_path.open("w", encoding="utf-8")
         self.proc = subprocess.Popen(
             self.cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
+            bufsize=1,
         )
+        self._reader_thread = threading.Thread(target=self._drain_output, daemon=True)
+        self._reader_thread.start()
         self._wait_ready()
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        if self.proc is None:
-            return
-        if self.proc.poll() is not None:
+        try:
+            if self.proc is None:
+                return
+            if self.proc.poll() is None:
+                try:
+                    self.proc.terminate()
+                    self.proc.wait(timeout=8)
+                except Exception:
+                    try:
+                        self.proc.kill()
+                    except Exception:
+                        pass
+        finally:
+            if self._reader_thread is not None:
+                self._reader_thread.join(timeout=1.0)
+            if self._log_handle is not None:
+                self._log_handle.flush()
+                self._log_handle.close()
+                self._log_handle = None
+
+    def read_remaining_output(self) -> str:
+        with self._output_lock:
+            return "".join(self._output_tail)
+
+    def _drain_output(self) -> None:
+        if self.proc is None or self.proc.stdout is None:
             return
         try:
-            self.proc.terminate()
-            self.proc.wait(timeout=8)
+            for chunk in self.proc.stdout:
+                if self._log_handle is not None:
+                    self._log_handle.write(chunk)
+                    self._log_handle.flush()
+                with self._output_lock:
+                    self._output_tail.append(chunk)
         except Exception:
-            try:
-                self.proc.kill()
-            except Exception:
-                pass
+            pass
 
     def _socket_ready(self) -> bool:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -112,17 +151,26 @@ class ServerProcess:
         start = time.perf_counter()
         while time.perf_counter() - start < self.timeout_s:
             if self.proc is not None and self.proc.poll() is not None:
-                out = ""
-                if self.proc.stdout is not None:
-                    try:
-                        out = self.proc.stdout.read() or ""
-                    except Exception:
-                        pass
-                raise RuntimeError(f"server exited early: {' '.join(self.cmd)}\n{out}")
+                out = self.read_remaining_output()
+                raise RuntimeError(
+                    f"server exited early: {' '.join(self.cmd)}\n{out}\nlog: {self.log_path}"
+                )
             if self._socket_ready() and self._http_ready():
                 return
             time.sleep(0.2)
         raise RuntimeError(f"server did not become ready within {self.timeout_s}s: {' '.join(self.cmd)}")
+
+
+def run_local_command(cmd: str) -> None:
+    proc = subprocess.run(
+        shlex.split(cmd),
+        text=True,
+        capture_output=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"command failed: {cmd}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
 
 
 def _http_json(method: str, url: str, payload: dict[str, Any] | None = None, timeout_s: float = 240.0) -> tuple[int, dict[str, Any]]:
@@ -156,11 +204,16 @@ def load_models(path: str) -> list[ModelSpec]:
     raw = json.loads(Path(path).read_text(encoding="utf-8"))
     out: list[ModelSpec] = []
     for item in raw:
+        model_dir = resolve_snapshot_path(item["model_dir"])
+        python_model_dir = resolve_snapshot_path(item.get("python_model_dir", model_dir))
+        rust_model_dir = resolve_snapshot_path(item.get("rust_model_dir", model_dir))
         out.append(
             ModelSpec(
                 key=item["key"],
                 name=item["name"],
-                model_dir=resolve_snapshot_path(item["model_dir"]),
+                model_dir=model_dir,
+                python_model_dir=python_model_dir,
+                rust_model_dir=rust_model_dir,
             )
         )
     return out
@@ -210,6 +263,7 @@ def stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float)
     final_event: dict[str, Any] | None = None
     usage_event: dict[str, Any] | None = None
     finish_reason = ""
+    stream_error: dict[str, Any] | None = None
 
     try:
         with urllib.request.urlopen(req, timeout=600.0) as resp:
@@ -223,6 +277,9 @@ def stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float)
                 if data == "[DONE]":
                     break
                 obj = json.loads(data)
+                if isinstance(obj.get("error"), dict):
+                    stream_error = obj["error"]
+                    continue
                 if obj.get("usage"):
                     usage_event = obj
                 choices = obj.get("choices") or []
@@ -244,6 +301,14 @@ def stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float)
 
     total = time.perf_counter() - t0
     if ttft is None:
+        if stream_error is not None:
+            code = stream_error.get("code") or "unknown"
+            message = stream_error.get("message") or "unknown stream error"
+            raise RuntimeError(f"stream generation error code={code} message={message}")
+        try:
+            non_stream_chat(base_url, prompt, max_tokens, temperature)
+        except Exception as e:
+            raise RuntimeError(f"no streamed tokens were produced; non-stream fallback: {e}") from e
         raise RuntimeError("no streamed tokens were produced")
     content = "".join(parts)
     usage = (usage_event or final_event or {}).get("usage", {})
@@ -332,7 +397,7 @@ def benchmark_python(
 
     for model in models:
         cmd = shlex.split(
-            server_template.format(model_dir=model.model_dir, host=host, port=port)
+            server_template.format(model_dir=model.python_model_dir, host=host, port=port)
         )
         print(f"[python] starting server for {model.name}")
         try:
@@ -345,7 +410,7 @@ def benchmark_python(
                 tokens_per_s = metrics.tokens_per_s
                 decode_tokens_per_s = metrics.decode_tokens_per_s
                 if tokens <= 0:
-                    tokens = count_tokens(model.model_dir, metrics.content)
+                    tokens = count_tokens(model.python_model_dir, metrics.content)
                     tokens_per_s = tokens / max(metrics.total_s, 1e-9)
                     decode_tokens_per_s = decode_tps(tokens, metrics.total_s, metrics.ttft_s)
                 results.append(
@@ -354,7 +419,7 @@ def benchmark_python(
                         mode=mode,
                         model_key=model.key,
                         model_name=model.name,
-                        model_dir=model.model_dir,
+                        model_dir=model.python_model_dir,
                         ttft_s=metrics.ttft_s,
                         total_s=metrics.total_s,
                         tokens=tokens,
@@ -372,7 +437,7 @@ def benchmark_python(
                     mode=mode,
                     model_key=model.key,
                     model_name=model.name,
-                    model_dir=model.model_dir,
+                    model_dir=model.python_model_dir,
                     ttft_s=0.0,
                     total_s=0.0,
                     tokens=0,
@@ -403,12 +468,12 @@ def benchmark_rust(
     cmd = shlex.split(rust_server_cmd)
 
     print("[rust] starting server")
-    with ServerProcess(cmd, host, port, ready_path="/health", timeout_s=startup_timeout_s):
+    with ServerProcess(cmd, host, port, ready_path="/health", timeout_s=startup_timeout_s) as server:
         base_url = f"http://{host}:{port}"
         for model in models:
             print(f"[rust] loading {model.name}")
             try:
-                rust_load_model(base_url, model.model_dir)
+                rust_load_model(base_url, model.rust_model_dir)
                 if mode == "stream":
                     metrics = stream_chat(base_url, prompt, max_tokens, temperature)
                 else:
@@ -417,7 +482,7 @@ def benchmark_rust(
                 tokens_per_s = metrics.tokens_per_s
                 decode_tokens_per_s = metrics.decode_tokens_per_s
                 if tokens <= 0:
-                    tokens = count_tokens(model.model_dir, metrics.content)
+                    tokens = count_tokens(model.rust_model_dir, metrics.content)
                     tokens_per_s = tokens / max(metrics.total_s, 1e-9)
                     decode_tokens_per_s = decode_tps(tokens, metrics.total_s, metrics.ttft_s)
                 results.append(
@@ -426,7 +491,7 @@ def benchmark_rust(
                         mode=mode,
                         model_key=model.key,
                         model_name=model.name,
-                        model_dir=model.model_dir,
+                        model_dir=model.rust_model_dir,
                         ttft_s=metrics.ttft_s,
                         total_s=metrics.total_s,
                         tokens=tokens,
@@ -438,13 +503,20 @@ def benchmark_rust(
                     )
                 )
             except Exception as e:
+                error = str(e)
+                if server.proc is not None and server.proc.poll() is not None:
+                    crash_out = server.read_remaining_output().strip()
+                    if crash_out:
+                        error = f"{error}\nserver output:\n{crash_out}\nserver log: {server.log_path}"
+                    else:
+                        error = f"{error}\nserver log: {server.log_path}"
                 results.append(
                     BenchmarkResult(
-                        backend="rust",
-                        mode=mode,
-                        model_key=model.key,
-                        model_name=model.name,
-                        model_dir=model.model_dir,
+                    backend="rust",
+                    mode=mode,
+                    model_key=model.key,
+                    model_name=model.name,
+                    model_dir=model.rust_model_dir,
                         ttft_s=0.0,
                         total_s=0.0,
                         tokens=0,
@@ -453,7 +525,7 @@ def benchmark_rust(
                         stop_reason="error",
                         output_preview="",
                         ok=False,
-                        error=str(e),
+                        error=error,
                     )
                 )
             finally:
@@ -577,6 +649,11 @@ def main() -> int:
     p.add_argument("--rust-port", type=int, default=3000)
     p.add_argument("--rust-server-cmd", default="target/debug/mlx-server")
     p.add_argument(
+        "--rust-build-cmd",
+        default="cargo build --bin mlx-server",
+        help="Command to build the Rust server binary before benchmarking. Use empty string to skip.",
+    )
+    p.add_argument(
         "--mode",
         choices=("aligned_stream", "stream", "non_stream"),
         default="aligned_stream",
@@ -604,6 +681,10 @@ def main() -> int:
         startup_timeout_s=args.startup_timeout_s,
         mode=request_mode,
     )
+
+    rust_build_cmd = args.rust_build_cmd.strip()
+    if rust_build_cmd:
+        run_local_command(rust_build_cmd)
 
     rust_results = benchmark_rust(
         models,

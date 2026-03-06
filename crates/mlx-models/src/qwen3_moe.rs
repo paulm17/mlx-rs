@@ -53,6 +53,8 @@ pub struct MoeProfileStats {
     pub expert_forward_s: f64,
     pub shared_expert_s: f64,
     pub single_token_fast_path_hits: usize,
+    pub device_router_shadow_checks: usize,
+    pub device_router_shadow_mismatches: usize,
 }
 
 static MOE_PROFILE_STATS: OnceLock<Mutex<MoeProfileStats>> = OnceLock::new();
@@ -66,6 +68,64 @@ fn trace_generation_enabled() -> bool {
         std::env::var("MLX_TRACE_GENERATION").as_deref(),
         Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
     )
+}
+
+fn validate_device_router_enabled(target: &str) -> bool {
+    match std::env::var("MLX_VALIDATE_MOE_DEVICE_ROUTER").ok().as_deref() {
+        Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") => true,
+        Some("all") | Some("ALL") => true,
+        Some(v) if v.eq_ignore_ascii_case(target) => true,
+        _ => false,
+    }
+}
+
+fn sort_top_pairs(pairs: &mut [(usize, f32)]) {
+    pairs.sort_unstable_by(|(a_idx, a_prob), (b_idx, b_prob)| {
+        b_prob.total_cmp(a_prob).then_with(|| a_idx.cmp(b_idx))
+    });
+}
+
+fn top_pairs_match(lhs: &[(usize, f32)], rhs: &[(usize, f32)], tol: f32) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    lhs.iter().zip(rhs.iter()).all(|((l_idx, l_prob), (r_idx, r_prob))| {
+        l_idx == r_idx && (l_prob - r_prob).abs() <= tol
+    })
+}
+
+fn validate_shadow_top_k(
+    target: &str,
+    router_probs: &Array,
+    num_experts: usize,
+    k: usize,
+    host_top: &[(usize, f32)],
+) -> Result<()> {
+    if !validate_device_router_enabled(target) {
+        return Ok(());
+    }
+
+    let partition = router_probs.argpartition((num_experts - k) as i32, -1)?;
+    let start = num_experts as i32 - k as i32;
+    let top_idx = partition.slice(&[0, start], &[1, num_experts as i32])?;
+    let top_probs = router_probs.take_along_axis(&top_idx, -1)?;
+
+    let idxs = top_idx.to_vec_i32()?;
+    let probs = top_probs.to_vec_f32()?;
+    let mut device_top: Vec<(usize, f32)> = idxs
+        .into_iter()
+        .zip(probs.into_iter())
+        .map(|(idx, prob)| (idx as usize, prob))
+        .collect();
+    sort_top_pairs(&mut device_top);
+
+    with_moe_profile_stats_mut(|stats| {
+        stats.device_router_shadow_checks += 1;
+        if !top_pairs_match(host_top, &device_top, 1e-4) {
+            stats.device_router_shadow_mismatches += 1;
+        }
+    });
+    Ok(())
 }
 
 fn with_moe_profile_stats_mut<F: FnOnce(&mut MoeProfileStats)>(f: F) {
@@ -247,22 +307,27 @@ impl SparseMoeBlock {
                 stats.single_token_fast_path_hits += 1;
             });
             let stage_t0 = Instant::now();
-            let row_logits = self.gate.gate.forward(&flat)?.to_vec_f32()?;
+            let router_logits = self.gate.gate.forward(&flat)?;
+            let row_logits = router_logits.to_vec_f32()?;
             with_moe_profile_stats_mut(|stats| {
                 stats.router_host_s += stage_t0.elapsed().as_secs_f64();
             });
             let row_logits = &row_logits[..num_experts];
             let row_probs = softmax_row(row_logits);
-            let top = select_top_k(row_logits, k);
+            let top: Vec<(usize, f32)> = select_top_k(row_logits, k)
+                .into_iter()
+                .map(|(idx, _)| (idx, row_probs[idx]))
+                .collect();
+            let router_probs = router_logits.softmax(-1)?;
+            validate_shadow_top_k("qwen", &router_probs, num_experts, k, &top)?;
             let norm = if self.gate.norm_topk_prob {
-                top.iter().map(|&(idx, _)| row_probs[idx]).sum::<f32>()
+                top.iter().map(|&(_, prob)| prob).sum::<f32>()
             } else {
                 1.0
             };
             let denom = if norm > 0.0 { norm } else { 1.0 };
             let mut out: Option<Array> = None;
-            for (expert_idx, _) in top {
-                let prob = row_probs[expert_idx];
+            for (expert_idx, prob) in top {
                 let weight = if self.gate.norm_topk_prob { prob / denom } else { prob };
                 let stage_t0 = Instant::now();
                 let expert_out = self.experts[expert_idx].forward(&flat)?;

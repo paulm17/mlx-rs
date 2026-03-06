@@ -2,7 +2,10 @@ use mlx_core::{Array, Module, Result};
 use mlx_nn::{
     Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, VarBuilder,
 };
+use std::fs::{create_dir_all, OpenOptions};
+use std::io::Write;
 use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::qwen3_moe::MoeProfileStats;
@@ -41,16 +44,72 @@ fn default_max_pos() -> usize { 131072 }
 fn default_conv_l_cache() -> usize { 3 }
 
 static LFM2_MOE_PROFILE_STATS: OnceLock<Mutex<MoeProfileStats>> = OnceLock::new();
+static TRACE_GENERATION_ENABLED: OnceLock<bool> = OnceLock::new();
+static TRACE_PORT_ENABLED: OnceLock<bool> = OnceLock::new();
+static TRACE_LINE_COUNT: AtomicUsize = AtomicUsize::new(0);
+static TRACE_LIMIT_REACHED: AtomicBool = AtomicBool::new(false);
+const TRACE_LINE_LIMIT: usize = 2000;
 
 fn lfm2_moe_profile_stats_store() -> &'static Mutex<MoeProfileStats> {
     LFM2_MOE_PROFILE_STATS.get_or_init(|| Mutex::new(MoeProfileStats::default()))
 }
 
 fn trace_generation_enabled() -> bool {
-    matches!(
-        std::env::var("MLX_TRACE_GENERATION").as_deref(),
-        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
-    )
+    *TRACE_GENERATION_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("MLX_TRACE_GENERATION").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        )
+    })
+}
+
+fn trace_port_enabled() -> bool {
+    *TRACE_PORT_ENABLED.get_or_init(|| {
+        matches!(
+            std::env::var("MLX_TRACE_LFM2_PYTHON_PORT").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+        )
+    })
+}
+
+fn trace_port(stage: &str, detail: impl AsRef<str>) {
+    if !trace_port_enabled() {
+        return;
+    }
+    let prev = TRACE_LINE_COUNT.fetch_add(1, Ordering::Relaxed);
+    if prev >= TRACE_LINE_LIMIT {
+        if !TRACE_LIMIT_REACHED.swap(true, Ordering::Relaxed) {
+            let line = format!(
+                "[lfm2-python-port] stage=trace_limit_reached limit={TRACE_LINE_LIMIT}\n"
+            );
+            eprint!("{line}");
+            let _ = std::io::stderr().flush();
+            let _ = create_dir_all("logs");
+            let path = format!("logs/lfm2_python_port_{}.log", std::process::id());
+            if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = file.write_all(line.as_bytes());
+                let _ = file.flush();
+            }
+        }
+        return;
+    }
+    let line = format!("[lfm2-python-port] stage={stage} {}\n", detail.as_ref());
+    eprint!("{line}");
+    let _ = std::io::stderr().flush();
+    let _ = create_dir_all("logs");
+    let path = format!("logs/lfm2_python_port_{}.log", std::process::id());
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = file.write_all(line.as_bytes());
+        let _ = file.flush();
+    }
+}
+
+macro_rules! trace_portf {
+    ($stage:expr, $($arg:tt)*) => {
+        if trace_port_enabled() {
+            trace_port($stage, format!($($arg)*));
+        }
+    };
 }
 
 fn with_lfm2_moe_profile_stats_mut<F: FnOnce(&mut MoeProfileStats)>(f: F) {
@@ -62,17 +121,40 @@ fn with_lfm2_moe_profile_stats_mut<F: FnOnce(&mut MoeProfileStats)>(f: F) {
     }
 }
 
-pub(crate) fn reset_lfm2_moe_profile_stats() {
+pub(crate) fn reset_lfm2_moe_python_port_profile_stats() {
     if let Ok(mut stats) = lfm2_moe_profile_stats_store().lock() {
         *stats = MoeProfileStats::default();
     }
 }
 
-pub(crate) fn lfm2_moe_profile_stats() -> MoeProfileStats {
+pub(crate) fn lfm2_moe_python_port_profile_stats() -> MoeProfileStats {
     lfm2_moe_profile_stats_store()
         .lock()
         .map(|stats| stats.clone())
         .unwrap_or_default()
+}
+
+fn sort_top_pairs(pairs: &mut [(usize, f32)]) {
+    pairs.sort_unstable_by(|(a_idx, a_prob), (b_idx, b_prob)| {
+        b_prob.total_cmp(a_prob).then_with(|| a_idx.cmp(b_idx))
+    });
+}
+
+fn top_pairs_match(lhs: &[(usize, f32)], rhs: &[(usize, f32)], tol: f32) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    lhs.iter().zip(rhs.iter()).all(|((l_idx, l_prob), (r_idx, r_prob))| {
+        l_idx == r_idx && (l_prob - r_prob).abs() <= tol
+    })
+}
+
+fn validate_device_router_enabled() -> bool {
+    matches!(
+        std::env::var("MLX_VALIDATE_MOE_DEVICE_ROUTER").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes") | Ok("YES")
+            | Ok("lfm2") | Ok("LFM2") | Ok("all") | Ok("ALL")
+    )
 }
 
 impl Lfm2MoeConfig {
@@ -353,10 +435,9 @@ impl ExpertLinear {
         })
     }
 
-    fn forward_selected(&self, x: &Array, expert_indices: &Array) -> Result<Array> {
+    fn forward_switch(&self, x: &Array, expert_indices: &Array, sorted_indices: bool) -> Result<Array> {
         if let Some(scales) = &self.scales {
-            let x3 = x.reshape(&[x.shape_raw()[0], 1, x.shape_raw()[1]])?;
-            let out = x3.gather_qmm(
+            return x.gather_qmm(
                 &self.weight,
                 scales,
                 self.biases.as_ref(),
@@ -365,33 +446,46 @@ impl ExpertLinear {
                 true,
                 self.group_size,
                 self.bits,
-                false,
-            )?;
-            return out.squeeze(1);
+                sorted_indices,
+            );
         }
 
-        let n = x.shape_raw()[0] as usize;
-        let ids = expert_indices.to_vec_i32()?;
-        let mut rows = Vec::with_capacity(n);
-        for (row, &eid) in ids.iter().enumerate().take(n) {
-            let idx = Array::from_slice_i32(&[eid])?;
-            let w = self.weight.take(&idx, 0)?.squeeze(0)?;
-            let w_t = w.transpose()?;
-            let x_row = x
-                .slice(&[row as i32, 0], &[(row + 1) as i32, x.shape_raw()[1]])?;
-            rows.push(x_row.matmul(&w_t)?);
-        }
-        let refs: Vec<&Array> = rows.iter().collect();
-        Array::concatenate(&refs, 0)
+        let wt = self.weight.transpose_axes(&[0, 2, 1])?;
+        x.gather_mm(&wt, None, Some(expert_indices), sorted_indices)
     }
 
 }
 
+struct SwitchGlu {
+    gate_proj: ExpertLinear,
+    up_proj: ExpertLinear,
+    down_proj: ExpertLinear,
+}
+
+impl SwitchGlu {
+    fn load(vb: &VarBuilder, cfg: &Lfm2MoeConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            gate_proj: ExpertLinear::load(&vb.pp("gate_proj"), cfg)?,
+            up_proj: ExpertLinear::load(&vb.pp("up_proj"), cfg)?,
+            down_proj: ExpertLinear::load(&vb.pp("down_proj"), cfg)?,
+        })
+    }
+
+    fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+        let x = x.expand_dims(-2)?.expand_dims(-2)?;
+        let do_sort = false;
+        let x_up = self.up_proj.forward_switch(&x, indices, do_sort)?;
+        let x_gate = self.gate_proj.forward_switch(&x, indices, do_sort)?;
+        let x = x_gate.multiply(&x_gate.sigmoid()?)?.multiply(&x_up)?;
+        let x = self.down_proj.forward_switch(&x, indices, do_sort)?;
+        x.squeeze(2)
+    }
+}
+
 struct MoeFeedForward {
+    layer_idx: usize,
     router: Linear,
-    gate: ExpertLinear,
-    up: ExpertLinear,
-    down: ExpertLinear,
+    switch_mlp: SwitchGlu,
     expert_bias: Option<Array>,
     num_experts: usize,
     top_k: usize,
@@ -399,13 +493,12 @@ struct MoeFeedForward {
 }
 
 impl MoeFeedForward {
-    fn load(vb: &VarBuilder, cfg: &Lfm2MoeConfig) -> anyhow::Result<Self> {
+    fn load(layer_idx: usize, vb: &VarBuilder, cfg: &Lfm2MoeConfig) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
         Ok(Self {
+            layer_idx,
             router: Linear::new(&vb.pp("gate"), &qc)?,
-            gate: ExpertLinear::load(&vb.pp("switch_mlp").pp("gate_proj"), cfg)?,
-            up: ExpertLinear::load(&vb.pp("switch_mlp").pp("up_proj"), cfg)?,
-            down: ExpertLinear::load(&vb.pp("switch_mlp").pp("down_proj"), cfg)?,
+            switch_mlp: SwitchGlu::load(&vb.pp("switch_mlp"), cfg)?,
             expert_bias: if vb.contains("expert_bias") {
                 Some(vb.get("expert_bias")?)
             } else {
@@ -421,142 +514,118 @@ impl MoeFeedForward {
         let shape = x.shape_raw();
         let hidden = shape[shape.len() - 1];
         let orig_shape = shape.clone();
+        trace_portf!("moe.enter", "layer={} input_shape={:?}", self.layer_idx, orig_shape);
         let flat = x.reshape(&[-1, hidden])?;
+        trace_portf!("moe.flat", "layer={} flat_shape={:?}", self.layer_idx, flat.shape_raw());
 
         let mut router_logits = self.router.forward(&flat)?;
         if let Some(expert_bias) = &self.expert_bias {
             router_logits = router_logits.add(expert_bias)?;
         }
+        trace_portf!("moe.router_logits", "layer={} router_logits_shape={:?}", self.layer_idx, router_logits.shape_raw());
 
         let num_tokens = flat.shape_raw()[0] as usize;
         let num_experts = self.num_experts;
         let k = self.top_k.min(num_experts).max(1);
 
+        let router_probs = router_logits.softmax(-1)?;
+
         let stage_t0 = Instant::now();
-        let router_probs = router_logits.softmax(-1)?.to_vec_f32()?;
-        with_lfm2_moe_profile_stats_mut(|stats| {
-            stats.router_host_s += stage_t0.elapsed().as_secs_f64();
-        });
+        let mut shadow_checks = 0usize;
+        let mut shadow_mismatches = 0usize;
+        let start = num_experts as i32 - k as i32;
 
         if num_tokens == 1 {
-            with_lfm2_moe_profile_stats_mut(|stats| {
-                stats.single_token_fast_path_hits += 1;
-            });
-            let row = &router_probs[..num_experts];
-            let mut expert_ids: Vec<usize> = (0..num_experts).collect();
-            expert_ids.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
-            let top = &expert_ids[..k];
-            let norm = if self.norm_topk_prob {
-                top.iter().map(|&idx| row[idx]).sum::<f32>()
-            } else {
-                1.0
-            };
-            let denom = if norm > 0.0 { norm } else { 1.0 };
-            let selected_ids: Vec<i32> = top.iter().map(|&expert_idx| expert_idx as i32).collect();
-            let weights: Vec<f32> = top
-                .iter()
-                .map(|&expert_idx| {
-                    let prob = row[expert_idx];
-                    if self.norm_topk_prob { prob / denom } else { prob }
-                })
-                .collect();
-            if selected_ids.is_empty() {
-                return Err(mlx_core::Error::Message(
-                    "MoE router produced no assignments".into(),
-                ));
+            let partition = router_probs.argpartition((num_experts - k) as i32, -1)?;
+            let expert_idx = partition.slice(&[0, start], &[1, num_experts as i32])?;
+            let mut top_scores = router_probs.take_along_axis(&expert_idx, -1)?;
+            if self.norm_topk_prob {
+                let denom = top_scores.sum_axis(-1, true)?;
+                top_scores = top_scores.divide(&denom)?;
             }
-            let flat_refs: Vec<&Array> = std::iter::repeat_n(&flat, selected_ids.len()).collect();
-            let flat_batch = Array::concatenate(&flat_refs, 0)?;
-            let eidx = Array::from_slice_i32(&selected_ids)?;
+
+            if validate_device_router_enabled() {
+                let stage_t0 = Instant::now();
+                let row = router_probs.to_vec_f32()?;
+                let row = &row[..num_experts];
+                let mut expert_ids: Vec<usize> = (0..num_experts).collect();
+                expert_ids.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
+                let top = &expert_ids[..k];
+                let mut host_top: Vec<(usize, f32)> =
+                    top.iter().copied().map(|idx| (idx, row[idx])).collect();
+                sort_top_pairs(&mut host_top);
+                let idxs = expert_idx.to_vec_i32()?;
+                let probs = top_scores.to_vec_f32()?;
+                let mut device_top: Vec<(usize, f32)> = idxs
+                    .into_iter()
+                    .zip(probs.into_iter())
+                    .map(|(idx, prob)| (idx as usize, prob))
+                    .collect();
+                sort_top_pairs(&mut device_top);
+                shadow_checks += 1;
+                if !top_pairs_match(&host_top, &device_top, 1e-4) {
+                    shadow_mismatches += 1;
+                    trace_portf!("moe.shadow_mismatch", "layer={} host_top={:?} device_top={:?}", self.layer_idx, host_top, device_top);
+                }
+                with_lfm2_moe_profile_stats_mut(|stats| {
+                    stats.router_host_s += stage_t0.elapsed().as_secs_f64();
+                });
+            }
+
+            trace_portf!("moe.routing_built", "layer={} num_tokens=1 top_k={}", self.layer_idx, k);
+            with_lfm2_moe_profile_stats_mut(|stats| {
+                stats.routing_build_s += stage_t0.elapsed().as_secs_f64();
+                stats.single_token_fast_path_hits += 1;
+                stats.device_router_shadow_checks += shadow_checks;
+                stats.device_router_shadow_mismatches += shadow_mismatches;
+            });
+
             let stage_t0 = Instant::now();
-            let gate = self.gate.forward_selected(&flat_batch, &eidx)?;
-            let up = self.up.forward_selected(&flat_batch, &eidx)?;
-            let hidden_act = gate.multiply(&gate.sigmoid()?)?.multiply(&up)?;
-            let expert_out = self.down.forward_selected(&hidden_act, &eidx)?;
+            let x_switch = flat.reshape(&[1, hidden])?;
+            trace_portf!("moe.expert_idx", "layer={} expert_idx_shape={:?}", self.layer_idx, expert_idx.shape_raw());
+            let expert_out = self.switch_mlp.forward(&x_switch, &expert_idx)?;
+            trace_portf!("moe.down_done", "layer={} expert_out_shape={:?}", self.layer_idx, expert_out.shape_raw());
             with_lfm2_moe_profile_stats_mut(|stats| {
                 stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
             });
-            let weight_arr = Array::from_slice_f32(&weights)?
-                .reshape(&[weights.len() as i32, 1])?
-                .as_type(expert_out.dtype())?;
-            let out = expert_out.multiply(&weight_arr)?.sum_axis(0, false)?.reshape(&[1, hidden])?;
+
+            let score_arr = top_scores.expand_dims(-1)?.as_type(expert_out.dtype())?;
+            trace_portf!("moe.score_arr", "layer={} score_arr_shape={:?}", self.layer_idx, score_arr.shape_raw());
+            let weighted = expert_out.multiply(&score_arr)?;
+            trace_portf!("moe.weighted", "layer={} weighted_shape={:?}", self.layer_idx, weighted.shape_raw());
+            let out = weighted.sum_axis(1, false)?.reshape(&[1, hidden])?;
+            trace_portf!("moe.exit", "layer={} out_shape={:?}", self.layer_idx, out.shape_raw());
             return out.reshape(&orig_shape);
         }
 
-        let mut routed_by_expert: Vec<Vec<(usize, f32)>> =
-            (0..num_experts).map(|_| Vec::new()).collect();
-        let mut expert_ids: Vec<usize> = (0..num_experts).collect();
-        let stage_t0 = Instant::now();
-        for tok in 0..num_tokens {
-            let row = &router_probs[tok * num_experts..(tok + 1) * num_experts];
-            expert_ids.sort_unstable_by(|&a, &b| row[b].total_cmp(&row[a]).then(a.cmp(&b)));
-            let top = &expert_ids[..k];
-            let norm = if self.norm_topk_prob {
-                top.iter().map(|&idx| row[idx]).sum::<f32>()
-            } else {
-                1.0
-            };
-            let denom = if norm > 0.0 { norm } else { 1.0 };
-            for &expert_idx in top {
-                let prob = row[expert_idx];
-                let weight = if self.norm_topk_prob { prob / denom } else { prob };
-                routed_by_expert[expert_idx].push((tok, weight));
-            }
+        let partition = router_probs.argpartition((num_experts - k) as i32, -1)?;
+        let expert_idx = partition.slice(&[0, start], &[num_tokens as i32, num_experts as i32])?;
+        let mut top_scores = router_probs.take_along_axis(&expert_idx, -1)?;
+        if self.norm_topk_prob {
+            let denom = top_scores.sum_axis(-1, true)?;
+            top_scores = top_scores.divide(&denom)?;
         }
+        trace_portf!("moe.routing_built", "layer={} num_tokens={} top_k={}", self.layer_idx, num_tokens, k);
         with_lfm2_moe_profile_stats_mut(|stats| {
             stats.routing_build_s += stage_t0.elapsed().as_secs_f64();
+            stats.device_router_shadow_checks += shadow_checks;
+            stats.device_router_shadow_mismatches += shadow_mismatches;
         });
 
-        let mut token_accum: Vec<Option<Array>> = (0..num_tokens).map(|_| None).collect();
-        for (expert_idx, assignments) in routed_by_expert.iter().enumerate() {
-            if assignments.is_empty() {
-                continue;
-            }
-            let token_ids: Vec<i32> = assignments.iter().map(|(tok, _)| *tok as i32).collect();
-            let token_idx = Array::from_slice_i32(&token_ids)?;
-            let tok_x = flat.take(&token_idx, 0)?;
-            let eidx = Array::from_slice_i32(&vec![expert_idx as i32; assignments.len()])?;
+        let stage_t0 = Instant::now();
+        trace_portf!("moe.expert_idx", "layer={} expert_idx_shape={:?}", self.layer_idx, expert_idx.shape_raw());
+        let expert_out = self.switch_mlp.forward(&flat, &expert_idx)?;
+        trace_portf!("moe.down_done", "layer={} expert_out_shape={:?}", self.layer_idx, expert_out.shape_raw());
+        with_lfm2_moe_profile_stats_mut(|stats| {
+            stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
+        });
 
-            let stage_t0 = Instant::now();
-            let gate = self.gate.forward_selected(&tok_x, &eidx)?;
-            let up = self.up.forward_selected(&tok_x, &eidx)?;
-            let hidden = gate.multiply(&gate.sigmoid()?)?.multiply(&up)?;
-            let expert_out = self.down.forward_selected(&hidden, &eidx)?;
-            with_lfm2_moe_profile_stats_mut(|stats| {
-                stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
-            });
-
-            let out_hidden = expert_out.shape_raw()[1];
-            let weights: Vec<f32> = assignments.iter().map(|(_, w)| *w).collect();
-            let weight_arr = Array::from_slice_f32(&weights)?
-                .reshape(&[assignments.len() as i32, 1])?
-                .as_type(expert_out.dtype())?;
-            let weighted = expert_out.multiply(&weight_arr)?;
-            for (i, (tok, _)) in assignments.iter().enumerate() {
-                let contrib = weighted
-                    .slice(&[i as i32, 0], &[(i + 1) as i32, out_hidden])?
-                    .reshape(&[1, out_hidden])?;
-                if let Some(prev) = token_accum[*tok].as_ref() {
-                    token_accum[*tok] = Some(prev.add(&contrib)?);
-                } else {
-                    token_accum[*tok] = Some(contrib);
-                }
-            }
-        }
-
-        let mut rows = Vec::with_capacity(num_tokens);
-        for token_contrib in token_accum {
-            match token_contrib {
-                Some(v) => rows.push(v),
-                None => {
-                    return Err(mlx_core::Error::Message(
-                        "MoE router produced no assignments".into(),
-                    ));
-                }
-            }
-        }
-        let refs: Vec<&Array> = rows.iter().collect();
-        let out = Array::concatenate(&refs, 0)?;
+        let score_arr = top_scores.expand_dims(-1)?.as_type(expert_out.dtype())?;
+        trace_portf!("moe.score_arr", "layer={} score_arr_shape={:?}", self.layer_idx, score_arr.shape_raw());
+        let weighted = expert_out.multiply(&score_arr)?;
+        trace_portf!("moe.weighted", "layer={} weighted_shape={:?}", self.layer_idx, weighted.shape_raw());
+        let out = weighted.sum_axis(1, false)?;
+        trace_portf!("moe.exit", "layer={} out_shape={:?}", self.layer_idx, out.shape_raw());
         out.reshape(&orig_shape)
     }
 }
@@ -621,6 +690,7 @@ impl LayerFfn {
 }
 
 struct Lfm2Layer {
+    layer_idx: usize,
     operator_norm: RmsNorm,
     ffn_norm: RmsNorm,
     operator: LayerOperator,
@@ -637,12 +707,13 @@ impl Lfm2Layer {
 
         let is_moe = vb.pp("feed_forward").pp("switch_mlp").pp("gate_proj").contains("weight");
         let ffn = if is_moe {
-            LayerFfn::Moe(MoeFeedForward::load(&vb.pp("feed_forward"), cfg)?)
+            LayerFfn::Moe(MoeFeedForward::load(idx, &vb.pp("feed_forward"), cfg)?)
         } else {
             LayerFfn::Dense(DenseMlp::load(&vb.pp("feed_forward"), cfg)?)
         };
 
         Ok(Self {
+            layer_idx: idx,
             operator_norm: RmsNorm::new(cfg.norm_eps, &vb.pp("operator_norm"))?,
             ffn_norm: RmsNorm::new(cfg.norm_eps, &vb.pp("ffn_norm"))?,
             operator,
@@ -651,15 +722,20 @@ impl Lfm2Layer {
     }
 
     fn forward(&mut self, x: &Array) -> Result<Array> {
+        trace_portf!("layer.enter", "layer={} x_shape={:?}", self.layer_idx, x.shape_raw());
         let residual = x.clone();
         let h = self.operator_norm.forward(x)?;
         let h = self.operator.forward(&h)?;
         let x = residual.add(&h)?;
+        trace_portf!("layer.after_operator", "layer={} x_shape={:?}", self.layer_idx, x.shape_raw());
 
         let residual = x.clone();
         let h = self.ffn_norm.forward(&x)?;
         let h = self.ffn.forward(&h)?;
-        residual.add(&h)
+        trace_portf!("layer.after_ffn", "layer={} h_shape={:?}", self.layer_idx, h.shape_raw());
+        let out = residual.add(&h)?;
+        trace_portf!("layer.exit", "layer={} out_shape={:?}", self.layer_idx, out.shape_raw());
+        Ok(out)
     }
 
     fn clear_cache(&mut self) {
@@ -708,12 +784,17 @@ impl Lfm2Moe {
     pub fn forward(&mut self, input_ids: &Array) -> Result<Array> {
         let shape = input_ids.shape_raw();
         let seq_len = shape[shape.len() - 1];
+        trace_portf!("model.enter", "input_shape={:?} seq_len={}", shape, seq_len);
 
         let mut h = self.embed_tokens.forward(input_ids)?;
-        for layer in &mut self.layers {
+        trace_portf!("model.embed", "embed_shape={:?}", h.shape_raw());
+        for (idx, layer) in self.layers.iter_mut().enumerate() {
+            trace_portf!("model.layer_start", "layer={idx}");
             h = layer.forward(&h)?;
+            trace_portf!("model.layer_done", "layer={idx} h_shape={:?}", h.shape_raw());
         }
         h = self.norm.forward(&h)?;
+        trace_portf!("model.norm", "norm_shape={:?}", h.shape_raw());
 
         if seq_len > 1 {
             let h_shape = h.shape_raw();
@@ -722,9 +803,12 @@ impl Lfm2Moe {
             start[h_shape.len() - 2] = seq_len - 1;
             stop[h_shape.len() - 2] = seq_len;
             h = h.slice(&start, &stop)?;
+            trace_portf!("model.last_token", "slice_shape={:?}", h.shape_raw());
         }
 
-        self.lm_head.forward(&h)
+        let logits = self.lm_head.forward(&h)?;
+        trace_portf!("model.exit", "logits_shape={:?}", logits.shape_raw());
+        Ok(logits)
     }
 
     pub fn clear_cache(&mut self) {
@@ -733,3 +817,6 @@ impl Lfm2Moe {
         }
     }
 }
+
+pub type Lfm2MoePythonPort = Lfm2Moe;
+pub type Lfm2MoePythonPortConfig = Lfm2MoeConfig;
