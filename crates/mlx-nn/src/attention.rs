@@ -19,12 +19,7 @@ pub fn scaled_dot_product_attention(
 }
 
 /// Apply scaled dot-product attention with a causal mask.
-pub fn causal_attention(
-    q: &Array,
-    k: &Array,
-    v: &Array,
-    scale: f32,
-) -> Result<Array> {
+pub fn causal_attention(q: &Array, k: &Array, v: &Array, scale: f32) -> Result<Array> {
     q.fast_scaled_dot_product_attention(k, v, scale, "causal", None)
 }
 

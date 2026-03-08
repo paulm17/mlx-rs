@@ -31,6 +31,10 @@ struct Args {
     /// Enable/disable thinking mode in chat templates
     #[arg(long)]
     thinking: Option<bool>,
+
+    /// Maximum number of same-length embedding inputs to batch per forward pass
+    #[arg(long)]
+    embeddings_batch_size: Option<usize>,
 }
 
 fn main() -> Result<()> {
@@ -55,6 +59,9 @@ fn main() -> Result<()> {
     }
     if let Some(v) = args.thinking {
         cfg.thinking = Some(v);
+    }
+    if let Some(v) = args.embeddings_batch_size {
+        cfg.embeddings_batch_size = Some(v);
     }
 
     mlx_lm::run_server(cfg)

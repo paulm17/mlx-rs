@@ -111,6 +111,41 @@ pub trait CausalLM {
     fn clear_cache(&mut self);
 }
 
+/// Trait for models that can expose hidden states for embedding extraction.
+pub trait EmbeddingModel {
+    /// Forward pass. Returns hidden states for all input tokens.
+    fn forward_hidden_states(&mut self, _input_ids: &Array) -> Result<Array> {
+        anyhow::bail!("embeddings are not supported by the loaded model")
+    }
+
+    /// Forward pass with an optional attention mask for padded embedding batches.
+    fn forward_hidden_states_masked(
+        &mut self,
+        input_ids: &Array,
+        _attention_mask: Option<&Array>,
+    ) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+    }
+
+    fn embedding_pooling(&self) -> EmbeddingPooling {
+        EmbeddingPooling::LastToken
+    }
+
+    fn supports_padded_embedding_batching(&self) -> bool {
+        false
+    }
+}
+
+pub trait ModelRuntime: CausalLM + EmbeddingModel {}
+
+impl<T: CausalLM + EmbeddingModel> ModelRuntime for T {}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingPooling {
+    LastToken,
+    Mean,
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerationMetrics {
     pub ttft_s: f64,
@@ -134,12 +169,26 @@ impl CausalLM for mlx_models::Llama {
     }
 }
 
+impl EmbeddingModel for mlx_models::Llama {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+}
+
 impl CausalLM for mlx_models::Qwen3 {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         self.forward(input_ids)
     }
     fn clear_cache(&mut self) {
         self.clear_cache();
+    }
+}
+
+impl EmbeddingModel for mlx_models::Qwen3 {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 }
 
@@ -152,12 +201,26 @@ impl CausalLM for mlx_models::Qwen35 {
     }
 }
 
+impl EmbeddingModel for mlx_models::Qwen35 {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+}
+
 impl CausalLM for mlx_models::Qwen3Moe {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         self.forward(input_ids)
     }
     fn clear_cache(&mut self) {
         self.clear_cache();
+    }
+}
+
+impl EmbeddingModel for mlx_models::Qwen3Moe {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
     }
 }
 
@@ -170,6 +233,13 @@ impl CausalLM for mlx_models::Qwen3MoePythonPort {
     }
 }
 
+impl EmbeddingModel for mlx_models::Qwen3MoePythonPort {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+}
+
 impl CausalLM for mlx_models::Lfm2Moe {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         self.forward(input_ids)
@@ -179,12 +249,62 @@ impl CausalLM for mlx_models::Lfm2Moe {
     }
 }
 
+impl EmbeddingModel for mlx_models::Lfm2Moe {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+}
+
 impl CausalLM for mlx_models::Lfm2MoePythonPort {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         self.forward(input_ids)
     }
     fn clear_cache(&mut self) {
         self.clear_cache();
+    }
+}
+
+impl EmbeddingModel for mlx_models::Lfm2MoePythonPort {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+}
+
+impl CausalLM for mlx_models::Bert {
+    fn forward_last_token_logits(&mut self, _input_ids: &Array) -> mlx_core::Result<Array> {
+        Err(mlx_core::Error::Message(
+            "text generation is not supported by encoder-only models".to_string(),
+        ))
+    }
+
+    fn clear_cache(&mut self) {
+        self.reset_state();
+    }
+}
+
+impl EmbeddingModel for mlx_models::Bert {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.encode(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    fn forward_hidden_states_masked(
+        &mut self,
+        input_ids: &Array,
+        attention_mask: Option<&Array>,
+    ) -> Result<Array> {
+        self.encode_masked(input_ids, attention_mask)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+
+    fn embedding_pooling(&self) -> EmbeddingPooling {
+        EmbeddingPooling::Mean
+    }
+
+    fn supports_padded_embedding_batching(&self) -> bool {
+        true
     }
 }
 
@@ -198,12 +318,61 @@ impl CausalLM for Box<dyn CausalLM> {
     }
 }
 
+impl CausalLM for Box<dyn ModelRuntime> {
+    fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
+        (**self).forward_last_token_logits(input_ids)
+    }
+    fn clear_cache(&mut self) {
+        (**self).clear_cache();
+    }
+}
+
+impl EmbeddingModel for Box<dyn ModelRuntime> {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        (**self).forward_hidden_states(input_ids)
+    }
+
+    fn forward_hidden_states_masked(
+        &mut self,
+        input_ids: &Array,
+        attention_mask: Option<&Array>,
+    ) -> Result<Array> {
+        (**self).forward_hidden_states_masked(input_ids, attention_mask)
+    }
+
+    fn embedding_pooling(&self) -> EmbeddingPooling {
+        (**self).embedding_pooling()
+    }
+
+    fn supports_padded_embedding_batching(&self) -> bool {
+        (**self).supports_padded_embedding_batching()
+    }
+}
+
 impl<T: CausalLM + ?Sized> CausalLM for &mut T {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         (**self).forward_last_token_logits(input_ids)
     }
     fn clear_cache(&mut self) {
         (**self).clear_cache();
+    }
+}
+
+impl<T: EmbeddingModel + ?Sized> EmbeddingModel for &mut T {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        (**self).forward_hidden_states(input_ids)
+    }
+
+    fn forward_hidden_states_masked(
+        &mut self,
+        input_ids: &Array,
+        attention_mask: Option<&Array>,
+    ) -> Result<Array> {
+        (**self).forward_hidden_states_masked(input_ids, attention_mask)
+    }
+
+    fn supports_padded_embedding_batching(&self) -> bool {
+        (**self).supports_padded_embedding_batching()
     }
 }
 
@@ -322,12 +491,13 @@ impl<M: CausalLM> GenerationPipeline<M> {
 
         // Create input array [1, seq_len]
         let prompt_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
-        let input = Array::from_slice_i32(&prompt_i32)?
-            .reshape(&[1, prompt_i32.len() as i32])?;
+        let input = Array::from_slice_i32(&prompt_i32)?.reshape(&[1, prompt_i32.len() as i32])?;
 
         // Prefill: run the full prompt through the model
         let stage_t0 = Instant::now();
-        let logits = self.model.forward_last_token_logits(&input)
+        let logits = self
+            .model
+            .forward_last_token_logits(&input)
             .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
         if let Some(p) = profile.as_mut() {
             p.prefill_forward_s += stage_t0.elapsed().as_secs_f64();
@@ -348,7 +518,9 @@ impl<M: CausalLM> GenerationPipeline<M> {
         let mut last_token_id: Option<u32>;
         if self.sampler.is_greedy() {
             let stage_t0 = Instant::now();
-            let mut token_arr = self.sampler.sample_raw_last_token_logits_array_at_step(&logits, 0)?;
+            let mut token_arr = self
+                .sampler
+                .sample_raw_last_token_logits_array_at_step(&logits, 0)?;
             async_eval(&[&token_arr])?;
             if let Some(p) = profile.as_mut() {
                 p.first_sample_s += stage_t0.elapsed().as_secs_f64();
@@ -361,14 +533,18 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 let next_token_arr = if can_schedule_next {
                     let input = sampled_token_array_to_input(&token_arr)?;
                     let stage_t0 = Instant::now();
-                    let logits = self.model.forward_last_token_logits(&input)
+                    let logits = self
+                        .model
+                        .forward_last_token_logits(&input)
                         .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
                     if let Some(p) = profile.as_mut() {
                         p.decode_forward_s += stage_t0.elapsed().as_secs_f64();
                     }
 
                     let stage_t0 = Instant::now();
-                    let next = self.sampler.sample_raw_last_token_logits_array_at_step(&logits, generated + 1)?;
+                    let next = self
+                        .sampler
+                        .sample_raw_last_token_logits_array_at_step(&logits, generated + 1)?;
                     async_eval(&[&next])?;
                     if let Some(p) = profile.as_mut() {
                         p.sample_s += stage_t0.elapsed().as_secs_f64();
@@ -442,7 +618,9 @@ impl<M: CausalLM> GenerationPipeline<M> {
             trace_memory("after_first_token", 1);
         } else {
             let stage_t0 = Instant::now();
-            let mut token = self.sampler.sample_raw_last_token_logits(&logits, &history_tokens)?;
+            let mut token = self
+                .sampler
+                .sample_raw_last_token_logits(&logits, &history_tokens)?;
             last_token_id = Some(token);
             if let Some(p) = profile.as_mut() {
                 p.first_sample_s += stage_t0.elapsed().as_secs_f64();
@@ -482,18 +660,21 @@ impl<M: CausalLM> GenerationPipeline<M> {
                     stop_reason = "stop";
                     break;
                 }
-                let input = Array::from_int(token as i32)?
-                    .reshape(&[1, 1])?;
+                let input = Array::from_int(token as i32)?.reshape(&[1, 1])?;
 
                 let stage_t0 = Instant::now();
-                let logits = self.model.forward_last_token_logits(&input)
+                let logits = self
+                    .model
+                    .forward_last_token_logits(&input)
                     .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
                 if let Some(p) = profile.as_mut() {
                     p.decode_forward_s += stage_t0.elapsed().as_secs_f64();
                 }
 
                 let stage_t0 = Instant::now();
-                token = self.sampler.sample_raw_last_token_logits(&logits, &history_tokens)?;
+                token = self
+                    .sampler
+                    .sample_raw_last_token_logits(&logits, &history_tokens)?;
                 last_token_id = Some(token);
                 if let Some(p) = profile.as_mut() {
                     p.sample_s += stage_t0.elapsed().as_secs_f64();

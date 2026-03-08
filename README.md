@@ -1,6 +1,6 @@
 # mlx-rs
 
-`mlx-rs` is a Rust-first MLX runtime for local LLM inference on Apple Silicon.
+`mlx-rs` is a Rust-first MLX runtime for local LLM inference and embedding extraction on Apple Silicon.
 
 It is structured as layered crates that mirror the same separation of concerns you would expect from candle-style design:
 - FFI bindings and raw MLX C ABI
@@ -9,7 +9,7 @@ It is structured as layered crates that mirror the same separation of concerns y
 - model architecture implementations
 - LLM runtime features (loader, tokenizer, sampling, generation, server)
 
-The project currently supports dense and MoE decoder models through the new `/crates` implementation (non-deprecated path).
+The project currently supports dense and MoE decoder models plus encoder-style embedding models through the new `/crates` implementation (non-deprecated path).
 
 ## Current Status
 
@@ -86,10 +86,11 @@ Key idea:
 Architecture-specific model implementations.
 
 What it does:
-- Implements decoder model families with clear config-layer-block-model composition.
-- Handles per-family details such as naming, norms, attention variants, and MoE routing.
+- Implements decoder and encoder model families with clear config-layer-block-model composition.
+- Handles per-family details such as naming, norms, attention variants, embedding inputs, and MoE routing.
 
 Current modules:
+- `bert.rs`
 - `llama.rs`
 - `qwen3.rs`
 - `qwen3_moe.rs` (used for Qwen1.5/Qwen2 MoE style)
@@ -107,7 +108,7 @@ What it does:
 - Chat template rendering (`chat_template.rs`) with fallback support for `chat_template.jinja`.
 - Sampling and repetition handling (`sampler.rs`).
 - Generation pipeline with metrics (TTFT/total/tokens) (`generate.rs`).
-- Embedded HTTP server runtime (`server.rs`) with optional API key and RPM limiter.
+- Embedded HTTP server runtime (`server.rs`) with optional API key, embeddings route, and RPM limiter.
 
 Key idea:
 - “How inference is run in practice,” not just model math.
@@ -185,6 +186,8 @@ cargo run --bin mlx-server -- \
 
 ### Working families
 
+- Bert encoder / embedding models
+  - Example tested: `mlx-community/mxbai-embed-large-v1`
 - Llama
   - Example tested: `mlx-community/Llama-3.2-1B-Instruct-4bit`
 - Qwen3 dense
@@ -203,6 +206,7 @@ Architecture is inferred from `config.json` using:
 - fallback `architectures[]`
 
 Mapped runtime enums:
+- `Bert`
 - `Llama`
 - `Qwen3`
 - `Qwen35`
@@ -210,6 +214,11 @@ Mapped runtime enums:
 - `Lfm2Moe`
 
 ## Model-Specific Notes
+
+### Bert
+- Encoder-style architecture used for embedding models.
+- The server embedding path uses tokenizer-provided embedding inputs and model hidden states rather than text generation.
+- Pooling behavior for embeddings is model/runtime driven and the `/v1/embeddings` response is L2-normalized.
 
 ### Llama
 - Standard decoder-only attention + MLP path.
@@ -257,7 +266,7 @@ model_path = "/absolute/path/to/model/snapshot"
 - `port`: optional alternative if `bind` is not set.
 - `model_path` or `model`: preload this model at startup.
 - `api_key`: if set, all endpoints except `/health` require key.
-- `rate_limit_rpm`: fixed-window limiter for `/v1/chat/completions`.
+- `rate_limit_rpm`: fixed-window limiter for `/v1/chat/completions` and `/v1/embeddings`.
 - `thinking`: if `true`, enables chat-template thinking mode; if `false`, disables it.
 
 ## Server API Surface
@@ -310,6 +319,52 @@ When `stream: true`, returns `text/event-stream` with OpenAI-style chunk objects
 - terminal chunk: `choices[0].finish_reason = "stop"` with `usage` and `debug`
 - completion terminator: `data: [DONE]`
 
+### `POST /v1/embeddings`
+Returns OpenAI-style embedding vectors produced from model activations.
+
+Body (example):
+
+```json
+{
+  "model": "optional-response-model-name",
+  "input": [
+    "In the beginning God created the heavens and the earth.",
+    "And the earth was without form, and void."
+  ],
+  "encoding_format": "float"
+}
+```
+
+Request notes:
+- `input` must be a string or an array of strings.
+- token-array inputs are not supported.
+- `encoding_format` currently supports only `"float"`.
+
+Response shape:
+
+```json
+{
+  "object": "list",
+  "model": "optional-response-model-name",
+  "data": [
+    {
+      "object": "embedding",
+      "index": 0,
+      "embedding": [0.1, 0.2, 0.3]
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 12,
+    "total_tokens": 12
+  }
+}
+```
+
+Behavior notes:
+- embeddings are produced from final hidden states, not generated text.
+- pooled responses are L2-normalized before they are returned.
+- the route is always exposed, but requests fail if no model is loaded or the loaded model does not support hidden-state extraction.
+
 ## Auth and Rate Limiting
 
 ### API key
@@ -319,7 +374,7 @@ If `api_key` is configured, send one of:
 
 ### Rate limiting
 If `rate_limit_rpm` is set to a positive integer:
-- Applied to `/v1/chat/completions`
+- Applied to `/v1/chat/completions` and `/v1/embeddings`
 - Fixed 60-second window
 - Exceeded requests return HTTP `429`
 
@@ -391,15 +446,49 @@ cargo run --bin generate -- \
 cargo run --bin mlx-server -- --config config.toml
 ```
 
+## Testing
+
+### Fast crate tests
+
+```bash
+cargo test -p mlx-lm
+```
+
+### Real embedding lifecycle test
+
+This repo includes an ignored integration test that exercises the full server lifecycle with a real embedding checkpoint:
+- start `mlx-server` with no preloaded model
+- verify `/v1/models` is empty
+- load a model through `/llm/load`
+- request vectors through `/v1/embeddings`
+- unload through `/llm/unload`
+
+Run it with the default `mxbai-embed-large-v1` snapshot:
+
+```bash
+cargo test --test embedding_server_real -- --ignored --nocapture
+```
+
+To override the model path:
+
+```bash
+MLX_TEST_EMBED_MODEL=/absolute/path/to/model/snapshot \
+cargo test --test embedding_server_real -- --ignored --nocapture
+```
+
 ## Benchmarking
 
 Scripts:
 - `scripts/run_enclosed_benchmarks.sh`
 - `scripts/benchmark_python_vs_rust_servers.py`
+- `scripts/benchmark_embeddings_concurrency.py`
+- `cargo run --bin embed_bench -- --model-dir /path/to/model --input "hello world"`
 
 Benchmark inputs:
 - Models list in `tests/benchmark_models.json`
 - Prompt/case in `tests/benchmark_cases.json`
+- Embedding-specific models list in `tests/benchmark_models_embeddings.json`
+- Embedding-specific request case in `tests/benchmark_case_embeddings.json`
 
 Output:
 - JSON logs under `logs/`
@@ -408,6 +497,11 @@ Output:
 Aligned benchmark notes:
 - Python and Rust are both exercised through the streaming path.
 - The harness records stop reason and comparability metadata, so token-count or stop-condition mismatches are explicit in the output.
+- Embedding benchmarks use `/v1/embeddings`, record prompt-token throughput plus embeddings/sec, and annotate Python/Rust vector cosine similarity.
+- `scripts/run_enclosed_benchmarks.sh` now runs both the default generation suite and the hardcoded `mxbai-embed-large-v1` embedding comparison.
+- `embed_bench` bypasses HTTP and reports encode, forward, pooling, normalization, plus overall embeddings/sec for server-path debugging.
+- The Rust server now batches same-length embedding inputs within a request; tune with `embeddings_batch_size` in `[server]` or `mlx-server --embeddings-batch-size`.
+- `scripts/benchmark_embeddings_concurrency.py` drives concurrent `/v1/embeddings` traffic against a running server and reports request throughput plus latency percentiles.
 - For model-specific debugging, use:
   - `src/bin/generate.rs` with `--dump-json-out`
   - `src/bin/generate_diag.rs`

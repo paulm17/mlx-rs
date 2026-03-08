@@ -1,0 +1,8 @@
+[
+  {
+    "key": "mxbai_embed_large_v1",
+    "name": "mxbai-embed-large-v1",
+    "request_model": "mxbai-embed-large-v1",
+    "model_dir": "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--mlx-community--mxbai-embed-large-v1/snapshots/3df9bfd9b9e80b101460ff7302e45476664e9588"
+  }
+]

@@ -28,11 +28,13 @@ class ModelSpec:
     model_dir: str
     python_model_dir: str
     rust_model_dir: str
+    request_model: str
 
 
 @dataclass
 class BenchmarkResult:
     backend: str
+    request_kind: str
     mode: str
     model_key: str
     model_name: str
@@ -62,6 +64,16 @@ class ChatMetrics:
     stop_reason: str
     content: str
     debug_profile: dict[str, Any] | None = None
+    debug_extra: dict[str, Any] | None = None
+
+
+@dataclass
+class EmbeddingMetrics:
+    total_s: float
+    prompt_tokens: int
+    embedding_count: int
+    embedding_dim: int
+    embeddings: list[list[float]]
     debug_extra: dict[str, Any] | None = None
 
 
@@ -216,6 +228,7 @@ def load_models(path: str) -> list[ModelSpec]:
                 model_dir=model_dir,
                 python_model_dir=python_model_dir,
                 rust_model_dir=rust_model_dir,
+                request_model=item.get("request_model", item["name"]),
             )
         )
     return out
@@ -254,6 +267,17 @@ def tail_token_ids(model_dir: str, text: str, n: int = 16) -> list[int]:
 def decode_tps(tokens: int, total_s: float, ttft_s: float) -> float:
     decode_s = max(total_s - ttft_s, 1e-9)
     return float(tokens) / decode_s if tokens > 0 else 0.0
+
+
+def cosine_similarity(a: list[float], b: list[float]) -> float:
+    if len(a) != len(b):
+        raise ValueError(f"vector length mismatch: {len(a)} != {len(b)}")
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = sum(x * x for x in a) ** 0.5
+    norm_b = sum(y * y for y in b) ** 0.5
+    if norm_a == 0.0 or norm_b == 0.0:
+        raise ValueError("cannot compare zero-norm embeddings")
+    return dot / (norm_a * norm_b)
 
 
 def stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: float) -> ChatMetrics:
@@ -396,6 +420,62 @@ def non_stream_chat(base_url: str, prompt: str, max_tokens: int, temperature: fl
     )
 
 
+def run_embeddings_request(
+    base_url: str,
+    request_model: str,
+    inputs: str | list[str],
+    encoding_format: str,
+) -> EmbeddingMetrics:
+    if not isinstance(inputs, (str, list)):
+        raise RuntimeError("embedding case must define 'input' as a string or array of strings")
+    payload = {
+        "model": request_model,
+        "input": inputs,
+        "encoding_format": encoding_format,
+    }
+    t0 = time.perf_counter()
+    status, body = _http_json(
+        "POST",
+        f"{base_url.rstrip('/')}/v1/embeddings",
+        payload,
+        timeout_s=900.0,
+    )
+    total_s = time.perf_counter() - t0
+    if status >= 300:
+        raise RuntimeError(f"embeddings status={status} body={body}")
+
+    data = body.get("data")
+    if not isinstance(data, list) or not data:
+        raise RuntimeError(f"embeddings response missing data: {body}")
+
+    embeddings: list[list[float]] = []
+    for idx, item in enumerate(data):
+        embedding = item.get("embedding") if isinstance(item, dict) else None
+        if not isinstance(embedding, list) or not embedding:
+            raise RuntimeError(f"embedding #{idx} missing vector payload: {item}")
+        embeddings.append([float(v) for v in embedding])
+
+    embedding_dim = len(embeddings[0])
+    if any(len(v) != embedding_dim for v in embeddings):
+        raise RuntimeError("embedding response returned mixed vector widths")
+
+    usage = body.get("usage", {})
+    prompt_tokens = int(usage.get("prompt_tokens") or 0)
+    return EmbeddingMetrics(
+        total_s=total_s,
+        prompt_tokens=prompt_tokens,
+        embedding_count=len(embeddings),
+        embedding_dim=embedding_dim,
+        embeddings=embeddings,
+        debug_extra={
+            "embedding_count": len(embeddings),
+            "embedding_dim": embedding_dim,
+            "first_embedding_preview": embeddings[0][:8],
+            "comparison_embeddings": embeddings,
+        },
+    )
+
+
 def rust_load_model(base_url: str, model_dir: str) -> None:
     status, body = _http_json("POST", f"{base_url.rstrip('/')}/llm/load", {"model_path": model_dir}, timeout_s=900.0)
     if status >= 300:
@@ -416,9 +496,12 @@ def benchmark_python(
     mode: str,
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
-    prompt = case["prompt"]
+    request_kind = str(case.get("kind", "chat"))
+    prompt = case.get("prompt", "")
     max_tokens = int(case.get("max_tokens", 256))
     temperature = float(case.get("temperature", 0.0))
+    embedding_input = case.get("input")
+    encoding_format = str(case.get("encoding_format", "float"))
 
     for model in models:
         cmd = shlex.split(
@@ -427,43 +510,77 @@ def benchmark_python(
         print(f"[python] starting server for {model.name}")
         try:
             with ServerProcess(cmd, host, port, ready_path="/v1/models", timeout_s=startup_timeout_s):
-                if mode == "stream":
-                    metrics = stream_chat(f"http://{host}:{port}", prompt, max_tokens, temperature)
-                else:
-                    metrics = non_stream_chat(f"http://{host}:{port}", prompt, max_tokens, temperature)
-                tokens = metrics.tokens
-                tokens_per_s = metrics.tokens_per_s
-                decode_tokens_per_s = metrics.decode_tokens_per_s
-                if tokens <= 0:
-                    tokens = count_tokens(model.python_model_dir, metrics.content)
-                    tokens_per_s = tokens / max(metrics.total_s, 1e-9)
-                    decode_tokens_per_s = decode_tps(tokens, metrics.total_s, metrics.ttft_s)
-                results.append(
-                    BenchmarkResult(
-                        backend="python",
-                        mode=mode,
-                        model_key=model.key,
-                        model_name=model.name,
-                        model_dir=model.python_model_dir,
-                        ttft_s=metrics.ttft_s,
-                        total_s=metrics.total_s,
-                        tokens=tokens,
-                        tokens_per_s=tokens_per_s,
-                        decode_tokens_per_s=decode_tokens_per_s,
-                        stop_reason=metrics.stop_reason,
-                        output_preview=metrics.content[:240],
-                        debug_profile=metrics.debug_profile,
-                        debug_extra={
-                            **(metrics.debug_extra or {}),
-                            "output_tail": metrics.content[-240:],
-                            "content_tail_token_ids": tail_token_ids(model.python_model_dir, metrics.content),
-                        },
+                if request_kind == "embeddings":
+                    metrics = run_embeddings_request(
+                        f"http://{host}:{port}",
+                        model.request_model,
+                        embedding_input,
+                        encoding_format,
                     )
-                )
+                    tokens = metrics.prompt_tokens
+                    tokens_per_s = tokens / max(metrics.total_s, 1e-9)
+                    decode_tokens_per_s = metrics.embedding_count / max(metrics.total_s, 1e-9)
+                    results.append(
+                        BenchmarkResult(
+                            backend="python",
+                            request_kind=request_kind,
+                            mode=request_kind,
+                            model_key=model.key,
+                            model_name=model.name,
+                            model_dir=model.python_model_dir,
+                            ttft_s=0.0,
+                            total_s=metrics.total_s,
+                            tokens=tokens,
+                            tokens_per_s=tokens_per_s,
+                            decode_tokens_per_s=decode_tokens_per_s,
+                            stop_reason=f"embeddings(dim={metrics.embedding_dim},count={metrics.embedding_count})",
+                            output_preview=json.dumps(metrics.debug_extra["first_embedding_preview"]),
+                            debug_extra={
+                                **(metrics.debug_extra or {}),
+                                "prompt_tokens": metrics.prompt_tokens,
+                            },
+                        )
+                    )
+                else:
+                    if mode == "stream":
+                        metrics = stream_chat(f"http://{host}:{port}", prompt, max_tokens, temperature)
+                    else:
+                        metrics = non_stream_chat(f"http://{host}:{port}", prompt, max_tokens, temperature)
+                    tokens = metrics.tokens
+                    tokens_per_s = metrics.tokens_per_s
+                    decode_tokens_per_s = metrics.decode_tokens_per_s
+                    if tokens <= 0:
+                        tokens = count_tokens(model.python_model_dir, metrics.content)
+                        tokens_per_s = tokens / max(metrics.total_s, 1e-9)
+                        decode_tokens_per_s = decode_tps(tokens, metrics.total_s, metrics.ttft_s)
+                    results.append(
+                        BenchmarkResult(
+                            backend="python",
+                            request_kind=request_kind,
+                            mode=mode,
+                            model_key=model.key,
+                            model_name=model.name,
+                            model_dir=model.python_model_dir,
+                            ttft_s=metrics.ttft_s,
+                            total_s=metrics.total_s,
+                            tokens=tokens,
+                            tokens_per_s=tokens_per_s,
+                            decode_tokens_per_s=decode_tokens_per_s,
+                            stop_reason=metrics.stop_reason,
+                            output_preview=metrics.content[:240],
+                            debug_profile=metrics.debug_profile,
+                            debug_extra={
+                                **(metrics.debug_extra or {}),
+                                "output_tail": metrics.content[-240:],
+                                "content_tail_token_ids": tail_token_ids(model.python_model_dir, metrics.content),
+                            },
+                        )
+                    )
         except Exception as e:
             results.append(
                 BenchmarkResult(
                     backend="python",
+                    request_kind=request_kind,
                     mode=mode,
                     model_key=model.key,
                     model_name=model.name,
@@ -492,9 +609,12 @@ def benchmark_rust(
     mode: str,
 ) -> list[BenchmarkResult]:
     results: list[BenchmarkResult] = []
-    prompt = case["prompt"]
+    request_kind = str(case.get("kind", "chat"))
+    prompt = case.get("prompt", "")
     max_tokens = int(case.get("max_tokens", 256))
     temperature = float(case.get("temperature", 0.0))
+    embedding_input = case.get("input")
+    encoding_format = str(case.get("encoding_format", "float"))
     cmd = shlex.split(rust_server_cmd)
 
     print("[rust] starting server")
@@ -504,39 +624,72 @@ def benchmark_rust(
             print(f"[rust] loading {model.name}")
             try:
                 rust_load_model(base_url, model.rust_model_dir)
-                if mode == "stream":
-                    metrics = stream_chat(base_url, prompt, max_tokens, temperature)
-                else:
-                    metrics = non_stream_chat(base_url, prompt, max_tokens, temperature)
-                tokens = metrics.tokens
-                tokens_per_s = metrics.tokens_per_s
-                decode_tokens_per_s = metrics.decode_tokens_per_s
-                if tokens <= 0:
-                    tokens = count_tokens(model.rust_model_dir, metrics.content)
-                    tokens_per_s = tokens / max(metrics.total_s, 1e-9)
-                    decode_tokens_per_s = decode_tps(tokens, metrics.total_s, metrics.ttft_s)
-                results.append(
-                    BenchmarkResult(
-                        backend="rust",
-                        mode=mode,
-                        model_key=model.key,
-                        model_name=model.name,
-                        model_dir=model.rust_model_dir,
-                        ttft_s=metrics.ttft_s,
-                        total_s=metrics.total_s,
-                        tokens=tokens,
-                        tokens_per_s=tokens_per_s,
-                        decode_tokens_per_s=decode_tokens_per_s,
-                        stop_reason=metrics.stop_reason,
-                        output_preview=metrics.content[:240],
-                        debug_profile=metrics.debug_profile,
-                        debug_extra={
-                            **(metrics.debug_extra or {}),
-                            "output_tail": metrics.content[-240:],
-                            "content_tail_token_ids": tail_token_ids(model.rust_model_dir, metrics.content),
-                        },
+                if request_kind == "embeddings":
+                    metrics = run_embeddings_request(
+                        base_url,
+                        model.request_model,
+                        embedding_input,
+                        encoding_format,
                     )
-                )
+                    tokens = metrics.prompt_tokens
+                    tokens_per_s = tokens / max(metrics.total_s, 1e-9)
+                    decode_tokens_per_s = metrics.embedding_count / max(metrics.total_s, 1e-9)
+                    results.append(
+                        BenchmarkResult(
+                            backend="rust",
+                            request_kind=request_kind,
+                            mode=request_kind,
+                            model_key=model.key,
+                            model_name=model.name,
+                            model_dir=model.rust_model_dir,
+                            ttft_s=0.0,
+                            total_s=metrics.total_s,
+                            tokens=tokens,
+                            tokens_per_s=tokens_per_s,
+                            decode_tokens_per_s=decode_tokens_per_s,
+                            stop_reason=f"embeddings(dim={metrics.embedding_dim},count={metrics.embedding_count})",
+                            output_preview=json.dumps(metrics.debug_extra["first_embedding_preview"]),
+                            debug_extra={
+                                **(metrics.debug_extra or {}),
+                                "prompt_tokens": metrics.prompt_tokens,
+                            },
+                        )
+                    )
+                else:
+                    if mode == "stream":
+                        metrics = stream_chat(base_url, prompt, max_tokens, temperature)
+                    else:
+                        metrics = non_stream_chat(base_url, prompt, max_tokens, temperature)
+                    tokens = metrics.tokens
+                    tokens_per_s = metrics.tokens_per_s
+                    decode_tokens_per_s = metrics.decode_tokens_per_s
+                    if tokens <= 0:
+                        tokens = count_tokens(model.rust_model_dir, metrics.content)
+                        tokens_per_s = tokens / max(metrics.total_s, 1e-9)
+                        decode_tokens_per_s = decode_tps(tokens, metrics.total_s, metrics.ttft_s)
+                    results.append(
+                        BenchmarkResult(
+                            backend="rust",
+                            request_kind=request_kind,
+                            mode=mode,
+                            model_key=model.key,
+                            model_name=model.name,
+                            model_dir=model.rust_model_dir,
+                            ttft_s=metrics.ttft_s,
+                            total_s=metrics.total_s,
+                            tokens=tokens,
+                            tokens_per_s=tokens_per_s,
+                            decode_tokens_per_s=decode_tokens_per_s,
+                            stop_reason=metrics.stop_reason,
+                            output_preview=metrics.content[:240],
+                            debug_profile=metrics.debug_profile,
+                            debug_extra={
+                                **(metrics.debug_extra or {}),
+                                "output_tail": metrics.content[-240:],
+                                "content_tail_token_ids": tail_token_ids(model.rust_model_dir, metrics.content),
+                            },
+                        )
+                    )
             except Exception as e:
                 error = str(e)
                 if server.proc is not None and server.proc.poll() is not None:
@@ -547,11 +700,12 @@ def benchmark_rust(
                         error = f"{error}\nserver log: {server.log_path}"
                 results.append(
                     BenchmarkResult(
-                    backend="rust",
-                    mode=mode,
-                    model_key=model.key,
-                    model_name=model.name,
-                    model_dir=model.rust_model_dir,
+                        backend="rust",
+                        request_kind=request_kind,
+                        mode=mode,
+                        model_key=model.key,
+                        model_name=model.name,
+                        model_dir=model.rust_model_dir,
                         ttft_s=0.0,
                         total_s=0.0,
                         tokens=0,
@@ -580,6 +734,7 @@ def print_table(results: list[BenchmarkResult]) -> None:
         "model",
         "backend",
         "mode",
+        "kind",
         "ok",
         "ttft_s",
         "tokens_per_s",
@@ -601,15 +756,16 @@ def print_table(results: list[BenchmarkResult]) -> None:
             if not r:
                 continue
             print(
-                f"{r.model_name} | {backend} | {r.mode} | {str(r.ok).lower()} | {r.ttft_s:.3f} | {r.tokens_per_s:.2f} | {r.decode_tokens_per_s:.2f} | {r.tokens} | {r.total_s:.3f} | {r.stop_reason} | {str(r.comparable).lower()} | {r.comparability_note[:80]} | {r.error[:120]}"
+                f"{r.model_name} | {backend} | {r.mode} | {r.request_kind} | {str(r.ok).lower()} | {r.ttft_s:.3f} | {r.tokens_per_s:.2f} | {r.decode_tokens_per_s:.2f} | {r.tokens} | {r.total_s:.3f} | {r.stop_reason} | {str(r.comparable).lower()} | {r.comparability_note[:80]} | {r.error[:120]}"
             )
 
         py = row.get("python")
         rs = row.get("rust")
         if py and rs and py.ok and rs.ok and py.tokens_per_s > 0.0 and py.decode_tokens_per_s > 0.0:
             note = py.comparability_note or rs.comparability_note
+            ttft_ratio = "n/a" if py.ttft_s <= 0.0 else f"{rs.ttft_s / py.ttft_s:.2f}x_ttft"
             print(
-                f"{py.model_name} | ratio | {py.mode} | true | {rs.ttft_s / py.ttft_s:.2f}x_ttft | {rs.tokens_per_s / py.tokens_per_s:.2%} | {rs.decode_tokens_per_s / py.decode_tokens_per_s:.2%} | - | - | - | {str(py.comparable and rs.comparable).lower()} | {note[:80]} | "
+                f"{py.model_name} | ratio | {py.mode} | {py.request_kind} | true | {ttft_ratio} | {rs.tokens_per_s / py.tokens_per_s:.2%} | {rs.decode_tokens_per_s / py.decode_tokens_per_s:.2%} | - | - | - | {str(py.comparable and rs.comparable).lower()} | {note[:80]} | "
             )
 
 
@@ -617,6 +773,7 @@ def to_json(results: list[BenchmarkResult]) -> list[dict[str, Any]]:
     return [
         {
             "backend": r.backend,
+            "request_kind": r.request_kind,
             "mode": r.mode,
             "model_key": r.model_key,
             "model_name": r.model_name,
@@ -651,17 +808,49 @@ def annotate_comparability(results: list[BenchmarkResult]) -> None:
             continue
 
         notes: list[str] = []
+        comparable = True
         if py.stop_reason != rs.stop_reason:
             notes.append(f"stop_reason differs: python={py.stop_reason}, rust={rs.stop_reason}")
+            comparable = False
         if py.tokens != rs.tokens:
             notes.append(f"token_count differs: python={py.tokens}, rust={rs.tokens}")
+            comparable = False
+        if py.request_kind != rs.request_kind:
+            notes.append(f"request_kind differs: python={py.request_kind}, rust={rs.request_kind}")
+            comparable = False
         if py.mode != rs.mode:
             notes.append(f"mode differs: python={py.mode}, rust={rs.mode}")
+            comparable = False
+        if py.request_kind == "embeddings":
+            py_vectors = (py.debug_extra or {}).get("comparison_embeddings")
+            rs_vectors = (rs.debug_extra or {}).get("comparison_embeddings")
+            py_dim = (py.debug_extra or {}).get("embedding_dim")
+            rs_dim = (rs.debug_extra or {}).get("embedding_dim")
+            py_count = (py.debug_extra or {}).get("embedding_count")
+            rs_count = (rs.debug_extra or {}).get("embedding_count")
+            if py_dim != rs_dim:
+                notes.append(f"embedding_dim differs: python={py_dim}, rust={rs_dim}")
+                comparable = False
+            if py_count != rs_count:
+                notes.append(f"embedding_count differs: python={py_count}, rust={rs_count}")
+                comparable = False
+            if py_vectors and rs_vectors and len(py_vectors) == len(rs_vectors):
+                sims = [cosine_similarity(pv, rv) for pv, rv in zip(py_vectors, rs_vectors)]
+                min_sim = min(sims)
+                avg_sim = sum(sims) / len(sims)
+                if min_sim < 0.999:
+                    notes.append(f"embedding cosine too low: min={min_sim:.6f}, avg={avg_sim:.6f}")
+                    comparable = False
+                else:
+                    notes.append(f"embedding cosine: min={min_sim:.6f}, avg={avg_sim:.6f}")
+            else:
+                notes.append("embedding vectors unavailable for comparison")
+                comparable = False
 
         if notes:
             note = "; ".join(notes)
-            py.comparable = False
-            rs.comparable = False
+            py.comparable = comparable
+            rs.comparable = comparable
             py.comparability_note = note
             rs.comparability_note = note
 
@@ -707,6 +896,8 @@ def main() -> int:
         raise RuntimeError("no models provided")
 
     request_mode = "stream" if args.mode in {"aligned_stream", "stream"} else "non_stream"
+    if str(case.get("kind", "chat")) == "embeddings":
+        request_mode = "embeddings"
 
     py_results = benchmark_python(
         models,

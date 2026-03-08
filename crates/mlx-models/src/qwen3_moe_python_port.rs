@@ -1,9 +1,7 @@
 //! Qwen3-MoE (Mixture of Experts) model implementation.
 
 use mlx_core::{Array, Module, Result};
-use mlx_nn::{
-    Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, RopeScaling, VarBuilder,
-};
+use mlx_nn::{Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, RopeScaling, VarBuilder};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -42,9 +40,15 @@ pub struct Qwen3MoePythonPortConfig {
     pub quantization: Option<super::llama::QuantizationConfig>,
 }
 
-fn default_eps() -> f32 { 1e-6 }
-fn default_rope_theta() -> f32 { 1_000_000.0 }
-fn default_max_pos() -> usize { 32768 }
+fn default_eps() -> f32 {
+    1e-6
+}
+fn default_rope_theta() -> f32 {
+    1_000_000.0
+}
+fn default_max_pos() -> usize {
+    32768
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct MoeProfileStats {
@@ -71,7 +75,10 @@ fn trace_qwen3_moe_python_port_generation_enabled() -> bool {
 }
 
 fn validate_device_router_enabled(target: &str) -> bool {
-    match std::env::var("MLX_VALIDATE_MOE_DEVICE_ROUTER").ok().as_deref() {
+    match std::env::var("MLX_VALIDATE_MOE_DEVICE_ROUTER")
+        .ok()
+        .as_deref()
+    {
         Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") => true,
         Some("all") | Some("ALL") => true,
         Some(v) if v.eq_ignore_ascii_case(target) => true,
@@ -89,9 +96,9 @@ fn top_pairs_match(lhs: &[(usize, f32)], rhs: &[(usize, f32)], tol: f32) -> bool
     if lhs.len() != rhs.len() {
         return false;
     }
-    lhs.iter().zip(rhs.iter()).all(|((l_idx, l_prob), (r_idx, r_prob))| {
-        l_idx == r_idx && (l_prob - r_prob).abs() <= tol
-    })
+    lhs.iter()
+        .zip(rhs.iter())
+        .all(|((l_idx, l_prob), (r_idx, r_prob))| l_idx == r_idx && (l_prob - r_prob).abs() <= tol)
 }
 
 fn validate_qwen3_moe_python_port_shadow_top_k(
@@ -156,12 +163,16 @@ impl Qwen3MoePythonPortConfig {
     }
 
     pub fn head_dim(&self) -> usize {
-        self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     pub fn quant_config(&self) -> QuantConfig {
         match &self.quantization {
-            Some(q) => QuantConfig { group_size: q.group_size, bits: q.bits },
+            Some(q) => QuantConfig {
+                group_size: q.group_size,
+                bits: q.bits,
+            },
             None => QuantConfig::default(),
         }
     }
@@ -390,7 +401,10 @@ impl SparseMoeBlock {
         };
 
         let shared_expert_gate = if vb.pp("shared_expert_gate").contains("weight") {
-            Some(Linear::new(&vb.pp("shared_expert_gate"), &cfg.quant_config())?)
+            Some(Linear::new(
+                &vb.pp("shared_expert_gate"),
+                &cfg.quant_config(),
+            )?)
         } else {
             None
         };
@@ -440,7 +454,13 @@ impl SparseMoeBlock {
                 .into_iter()
                 .map(|(idx, _)| (idx, row_probs[idx]))
                 .collect();
-            validate_qwen3_moe_python_port_shadow_top_k("qwen", &router_probs, num_experts, k, &top)?;
+            validate_qwen3_moe_python_port_shadow_top_k(
+                "qwen",
+                &router_probs,
+                num_experts,
+                k,
+                &top,
+            )?;
         }
 
         let stage_t0 = Instant::now();
@@ -493,10 +513,7 @@ fn softmax_row(logits: &[f32]) -> Vec<f32> {
     if logits.is_empty() {
         return Vec::new();
     }
-    let max_v = logits
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max);
+    let max_v = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let mut exps = Vec::with_capacity(logits.len());
     let mut sum = 0.0f32;
     for &v in logits {
@@ -585,20 +602,35 @@ impl MoeAttention {
 
         let q_norm = if vb.pp("q_norm").contains("weight") {
             Some(RmsNorm::new(cfg.rms_norm_eps, &vb.pp("q_norm"))?)
-        } else { None };
+        } else {
+            None
+        };
         let k_norm = if vb.pp("k_norm").contains("weight") {
             Some(RmsNorm::new(cfg.rms_norm_eps, &vb.pp("k_norm"))?)
-        } else { None };
+        } else {
+            None
+        };
 
         let head_dim = cfg.head_dim();
         let rope = match &cfg.rope_scaling {
-            Some(scaling) => RoPE::with_scaling(head_dim as i32, cfg.rope_theta, false, scaling, cfg.max_position_embeddings)?,
+            Some(scaling) => RoPE::with_scaling(
+                head_dim as i32,
+                cfg.rope_theta,
+                false,
+                scaling,
+                cfg.max_position_embeddings,
+            )?,
             None => RoPE::new(head_dim as i32, cfg.rope_theta, false),
         };
 
         Ok(Self {
-            q_proj, k_proj, v_proj, o_proj,
-            q_norm, k_norm, rope,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
+            rope,
             kv_cache: KvCache::new(),
             num_heads: cfg.num_attention_heads,
             num_kv_heads: cfg.num_kv_heads(),
@@ -612,18 +644,30 @@ impl MoeAttention {
         let (b, seq_len) = (shape[0], shape[1]);
         let offset = self.kv_cache.offset() as i32;
 
-        let q = self.q_proj.forward(x)?
+        let q = self
+            .q_proj
+            .forward(x)?
             .reshape(&[b, seq_len, self.num_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let k = self.k_proj.forward(x)?
+        let k = self
+            .k_proj
+            .forward(x)?
             .reshape(&[b, seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[0, 2, 1, 3])?;
-        let v = self.v_proj.forward(x)?
+        let v = self
+            .v_proj
+            .forward(x)?
             .reshape(&[b, seq_len, self.num_kv_heads as i32, self.head_dim as i32])?
             .transpose_axes(&[0, 2, 1, 3])?;
 
-        let q = match &self.q_norm { Some(n) => n.forward(&q)?, None => q };
-        let k = match &self.k_norm { Some(n) => n.forward(&k)?, None => k };
+        let q = match &self.q_norm {
+            Some(n) => n.forward(&q)?,
+            None => q,
+        };
+        let k = match &self.k_norm {
+            Some(n) => n.forward(&k)?,
+            None => k,
+        };
 
         let q = self.rope.forward(&q, offset)?;
         let k = self.rope.forward(&k, offset)?;
@@ -634,13 +678,18 @@ impl MoeAttention {
         let mask_mode = if seq_len > 1 { "causal" } else { "" };
         let attn = q.fast_scaled_dot_product_attention(&k, &v, self.scale, mask_mode, None)?;
 
-        let attn = attn.transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, seq_len, (self.num_heads * self.head_dim) as i32])?;
+        let attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            b,
+            seq_len,
+            (self.num_heads * self.head_dim) as i32,
+        ])?;
 
         self.o_proj.forward(&attn)
     }
 
-    fn clear_cache(&mut self) { self.kv_cache.reset(); }
+    fn clear_cache(&mut self) {
+        self.kv_cache.reset();
+    }
 }
 
 // ------------------------------------------------------------------
@@ -655,7 +704,11 @@ struct MoeBlock {
 }
 
 impl MoeBlock {
-    fn load(layer_idx: usize, vb: &VarBuilder, cfg: &Qwen3MoePythonPortConfig) -> anyhow::Result<Self> {
+    fn load(
+        layer_idx: usize,
+        vb: &VarBuilder,
+        cfg: &Qwen3MoePythonPortConfig,
+    ) -> anyhow::Result<Self> {
         let ff = if cfg.is_moe_layer(layer_idx) {
             FeedForward::Moe(SparseMoeBlock::load(&vb.pp("mlp"), cfg)?)
         } else {
@@ -666,7 +719,10 @@ impl MoeBlock {
             attn: MoeAttention::load(&vb.pp("self_attn"), cfg)?,
             ff,
             input_layernorm: RmsNorm::new(cfg.rms_norm_eps, &vb.pp("input_layernorm"))?,
-            post_attention_layernorm: RmsNorm::new(cfg.rms_norm_eps, &vb.pp("post_attention_layernorm"))?,
+            post_attention_layernorm: RmsNorm::new(
+                cfg.rms_norm_eps,
+                &vb.pp("post_attention_layernorm"),
+            )?,
         })
     }
 
@@ -682,7 +738,9 @@ impl MoeBlock {
         residual.add(&h)
     }
 
-    fn clear_cache(&mut self) { self.attn.clear_cache(); }
+    fn clear_cache(&mut self) {
+        self.attn.clear_cache();
+    }
 }
 
 // ------------------------------------------------------------------
@@ -717,18 +775,19 @@ impl Qwen3MoePythonPort {
             Linear::new(&vb.pp("lm_head"), &qc)?
         };
 
-        Ok(Self { embed_tokens, layers, norm, lm_head })
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
     }
 
     pub fn forward(&mut self, input_ids: &Array) -> Result<Array> {
         let shape = input_ids.shape_raw();
         let seq_len = shape[shape.len() - 1];
 
-        let mut h = self.embed_tokens.forward(input_ids)?;
-        for layer in &mut self.layers {
-            h = layer.forward(&h)?;
-        }
-        h = self.norm.forward(&h)?;
+        let mut h = self.forward_hidden_states(input_ids)?;
 
         if seq_len > 1 {
             let h_shape = h.shape_raw();
@@ -740,6 +799,14 @@ impl Qwen3MoePythonPort {
         }
 
         self.lm_head.forward(&h)
+    }
+
+    pub fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        let mut h = self.embed_tokens.forward(input_ids)?;
+        for layer in &mut self.layers {
+            h = layer.forward(&h)?;
+        }
+        self.norm.forward(&h)
     }
 
     pub fn clear_cache(&mut self) {

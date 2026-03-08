@@ -20,7 +20,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_subtract(&mut out, self.inner, other.inner, s), "mlx_subtract")?;
+            Self::check(
+                mlx_subtract(&mut out, self.inner, other.inner, s),
+                "mlx_subtract",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -29,7 +32,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_multiply(&mut out, self.inner, other.inner, s), "mlx_multiply")?;
+            Self::check(
+                mlx_multiply(&mut out, self.inner, other.inner, s),
+                "mlx_multiply",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -167,7 +173,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_sum_axis(&mut out, self.inner, axis, keepdims, s), "mlx_sum_axis")?;
+            Self::check(
+                mlx_sum_axis(&mut out, self.inner, axis, keepdims, s),
+                "mlx_sum_axis",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -176,7 +185,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_mean_axis(&mut out, self.inner, axis, keepdims, s), "mlx_mean_axis")?;
+            Self::check(
+                mlx_mean_axis(&mut out, self.inner, axis, keepdims, s),
+                "mlx_mean_axis",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -270,7 +282,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_squeeze_axis(&mut out, self.inner, axis, s), "mlx_squeeze_axis")?;
+            Self::check(
+                mlx_squeeze_axis(&mut out, self.inner, axis, s),
+                "mlx_squeeze_axis",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -279,7 +294,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_expand_dims(&mut out, self.inner, axis, s), "mlx_expand_dims")?;
+            Self::check(
+                mlx_expand_dims(&mut out, self.inner, axis, s),
+                "mlx_expand_dims",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -300,7 +318,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_contiguous(&mut out, self.inner, false, s), "mlx_contiguous")?;
+            Self::check(
+                mlx_contiguous(&mut out, self.inner, false, s),
+                "mlx_contiguous",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -416,7 +437,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_matmul(&mut out, self.inner, other.inner, s), "mlx_matmul")?;
+            Self::check(
+                mlx_matmul(&mut out, self.inner, other.inner, s),
+                "mlx_matmul",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -457,7 +481,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_astype(&mut out, self.inner, dtype.to_mlx(), s), "mlx_astype")?;
+            Self::check(
+                mlx_astype(&mut out, self.inner, dtype.to_mlx(), s),
+                "mlx_astype",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -495,19 +522,35 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            let opt_gs = mlx_optional_int_ { value: group_size, has_value: true };
-            let opt_bits = mlx_optional_int_ { value: bits, has_value: true };
+            let opt_gs = mlx_optional_int_ {
+                value: group_size,
+                has_value: true,
+            };
+            let opt_bits = mlx_optional_int_ {
+                value: bits,
+                has_value: true,
+            };
 
             // Use null pointer for optional biases (matching deprecated code pattern)
             let b_inner = biases.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |m| m.inner,
             );
 
             let mode = CString::new("affine").unwrap();
             let rc = mlx_quantized_matmul(
-                &mut out, self.inner, w.inner, scales.inner, b_inner,
-                transpose_w, opt_gs, opt_bits, mode.as_ptr(), s,
+                &mut out,
+                self.inner,
+                w.inner,
+                scales.inner,
+                b_inner,
+                transpose_w,
+                opt_gs,
+                opt_bits,
+                mode.as_ptr(),
+                s,
             );
             Self::check(rc, "mlx_quantized_matmul")?;
             Ok(Array::from_raw(out))
@@ -524,20 +567,38 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            let opt_gs = mlx_optional_int_ { value: group_size, has_value: true };
-            let opt_bits = mlx_optional_int_ { value: bits, has_value: true };
+            let opt_gs = mlx_optional_int_ {
+                value: group_size,
+                has_value: true,
+            };
+            let opt_bits = mlx_optional_int_ {
+                value: bits,
+                has_value: true,
+            };
 
             let b_inner = biases.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |m| m.inner,
             );
 
             let mode = CString::new("affine").unwrap();
-            let dtype = mlx_optional_dtype_ { value: 0, has_value: false }; // Let MLX infer
+            let dtype = mlx_optional_dtype_ {
+                value: 0,
+                has_value: false,
+            }; // Let MLX infer
 
             mlx_dequantize(
-                &mut out, self.inner, scales.inner, b_inner,
-                opt_gs, opt_bits, mode.as_ptr(), dtype, s,
+                &mut out,
+                self.inner,
+                scales.inner,
+                b_inner,
+                opt_gs,
+                opt_bits,
+                mode.as_ptr(),
+                dtype,
+                s,
             );
             Ok(Array::from_raw(out))
         }
@@ -577,12 +638,22 @@ impl Array {
             };
             // Use null pointer for optional freqs (matching deprecated code)
             let freqs_val = freqs.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |m| m.inner,
             );
 
             mlx_fast_rope(
-                &mut out, self.inner, dims, traditional, base_opt, scale, offset, freqs_val, s,
+                &mut out,
+                self.inner,
+                dims,
+                traditional,
+                base_opt,
+                scale,
+                offset,
+                freqs_val,
+                s,
             );
             Ok(Array::from_raw(out))
         }
@@ -604,23 +675,27 @@ impl Array {
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
             let mask_val = mask.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |m| m.inner,
             );
-            let sinks_val = mlx_array_ { ctx: std::ptr::null_mut() };
+            let sinks_val = mlx_array_ {
+                ctx: std::ptr::null_mut(),
+            };
             let c_mask_mode = CString::new(mask_mode)
                 .map_err(|_| Error::Message("mask_mode contains null byte".into()))?;
 
             let rc = mlx_fast_scaled_dot_product_attention(
                 &mut out,
-                self.inner,  // queries
+                self.inner, // queries
                 keys.inner,
                 values.inner,
                 scale,
-                c_mask_mode.as_ptr(),  // mask_mode string
-                mask_val,   // mask_arr
-                sinks_val,  // sinks
-                s,          // stream
+                c_mask_mode.as_ptr(), // mask_mode string
+                mask_val,             // mask_arr
+                sinks_val,            // sinks
+                s,                    // stream
             );
             Self::check(rc, "mlx_fast_sdpa")?;
             Ok(Array::from_raw(out))
@@ -642,15 +717,25 @@ impl Array {
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
             let lhs_inner = lhs_indices.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |v| v.inner,
             );
             let rhs_inner = rhs_indices.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |v| v.inner,
             );
             let rc = mlx_gather_mm(
-                &mut out, self.inner, b.inner, lhs_inner, rhs_inner, sorted_indices, s,
+                &mut out,
+                self.inner,
+                b.inner,
+                lhs_inner,
+                rhs_inner,
+                sorted_indices,
+                s,
             );
             Self::check(rc, "mlx_gather_mm")?;
             Ok(Array::from_raw(out))
@@ -677,24 +762,46 @@ impl Array {
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
             let b_inner = biases.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |v| v.inner,
             );
             let lhs_inner = lhs_indices.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |v| v.inner,
             );
             let rhs_inner = rhs_indices.map_or(
-                mlx_array_ { ctx: std::ptr::null_mut() },
+                mlx_array_ {
+                    ctx: std::ptr::null_mut(),
+                },
                 |v| v.inner,
             );
-            let opt_gs = mlx_optional_int_ { value: group_size, has_value: true };
-            let opt_bits = mlx_optional_int_ { value: bits, has_value: true };
+            let opt_gs = mlx_optional_int_ {
+                value: group_size,
+                has_value: true,
+            };
+            let opt_bits = mlx_optional_int_ {
+                value: bits,
+                has_value: true,
+            };
             let mode = CString::new("affine").unwrap();
             let rc = mlx_gather_qmm(
-                &mut out, self.inner, w.inner, scales.inner, b_inner,
-                lhs_inner, rhs_inner, transpose, opt_gs, opt_bits,
-                mode.as_ptr(), sorted_indices, s,
+                &mut out,
+                self.inner,
+                w.inner,
+                scales.inner,
+                b_inner,
+                lhs_inner,
+                rhs_inner,
+                transpose,
+                opt_gs,
+                opt_bits,
+                mode.as_ptr(),
+                sorted_indices,
+                s,
             );
             Self::check(rc, "mlx_gather_qmm")?;
             Ok(Array::from_raw(out))
@@ -709,7 +816,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_where(&mut out, self.inner, x.inner, y.inner, s), "mlx_where")?;
+            Self::check(
+                mlx_where(&mut out, self.inner, x.inner, y.inner, s),
+                "mlx_where",
+            )?;
             Ok(Array::from_raw(out))
         }
     }
@@ -722,7 +832,10 @@ impl Array {
         let s = Self::default_stream();
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
-            Self::check(mlx_greater(&mut out, self.inner, other.inner, s), "mlx_greater")?;
+            Self::check(
+                mlx_greater(&mut out, self.inner, other.inner, s),
+                "mlx_greater",
+            )?;
             Ok(Array::from_raw(out))
         }
     }

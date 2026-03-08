@@ -375,10 +375,7 @@ impl ChatTemplate {
     }
 
     /// Convenience: apply with `add_generation_prompt = true`.
-    pub fn apply_for_generation(
-        &self,
-        messages: &[Message],
-    ) -> Result<String, ChatTemplateError> {
+    pub fn apply_for_generation(&self, messages: &[Message]) -> Result<String, ChatTemplateError> {
         self.apply(messages, &ChatTemplateOptions::for_generation())
     }
 }
@@ -420,10 +417,7 @@ impl Conversation {
     }
 
     /// Add a user message and return the formatted prompt for generation.
-    pub fn user_turn(
-        &mut self,
-        content: impl Into<String>,
-    ) -> Result<String, ChatTemplateError> {
+    pub fn user_turn(&mut self, content: impl Into<String>) -> Result<String, ChatTemplateError> {
         self.messages.push(Message::user(content));
         self.template.apply(&self.messages, &self.options)
     }

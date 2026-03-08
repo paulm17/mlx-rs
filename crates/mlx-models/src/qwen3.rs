@@ -4,9 +4,7 @@
 //! differences in attention (e.g. qk_norm, bias options).
 
 use mlx_core::{Array, Module, Result};
-use mlx_nn::{
-    Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, RopeScaling, VarBuilder,
-};
+use mlx_nn::{Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, RopeScaling, VarBuilder};
 
 // ------------------------------------------------------------------
 // Config
@@ -34,10 +32,18 @@ pub struct Qwen3Config {
     pub quantization: Option<super::llama::QuantizationConfig>,
 }
 
-fn default_eps() -> f32 { 1e-6 }
-fn default_rope_theta() -> f32 { 1_000_000.0 }
-fn default_max_pos() -> usize { 32768 }
-fn default_head_dim() -> Option<usize> { None }
+fn default_eps() -> f32 {
+    1e-6
+}
+fn default_rope_theta() -> f32 {
+    1_000_000.0
+}
+fn default_max_pos() -> usize {
+    32768
+}
+fn default_head_dim() -> Option<usize> {
+    None
+}
 
 impl Qwen3Config {
     pub fn num_kv_heads(&self) -> usize {
@@ -45,7 +51,8 @@ impl Qwen3Config {
     }
 
     pub fn head_dim(&self) -> usize {
-        self.head_dim.unwrap_or(self.hidden_size / self.num_attention_heads)
+        self.head_dim
+            .unwrap_or(self.hidden_size / self.num_attention_heads)
     }
 
     pub fn quant_config(&self) -> QuantConfig {
@@ -110,8 +117,12 @@ impl Qwen3Attention {
         };
 
         Ok(Self {
-            q_proj, k_proj, v_proj, o_proj,
-            q_norm, k_norm,
+            q_proj,
+            k_proj,
+            v_proj,
+            o_proj,
+            q_norm,
+            k_norm,
             rope,
             kv_cache: KvCache::new(),
             num_heads: cfg.num_attention_heads,
@@ -159,9 +170,11 @@ impl Qwen3Attention {
         let mask_mode = if seq_len > 1 { "causal" } else { "" };
         let attn = q.fast_scaled_dot_product_attention(&k, &v, self.scale, mask_mode, None)?;
 
-        let attn = attn
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, seq_len, (self.num_heads * self.head_dim) as i32])?;
+        let attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            b,
+            seq_len,
+            (self.num_heads * self.head_dim) as i32,
+        ])?;
 
         self.o_proj.forward(&attn)
     }
@@ -216,7 +229,10 @@ impl Qwen3Block {
             attn: Qwen3Attention::load(&vb.pp("self_attn"), cfg)?,
             mlp: Qwen3Mlp::load(&vb.pp("mlp"), cfg)?,
             input_layernorm: RmsNorm::new(cfg.rms_norm_eps, &vb.pp("input_layernorm"))?,
-            post_attention_layernorm: RmsNorm::new(cfg.rms_norm_eps, &vb.pp("post_attention_layernorm"))?,
+            post_attention_layernorm: RmsNorm::new(
+                cfg.rms_norm_eps,
+                &vb.pp("post_attention_layernorm"),
+            )?,
         })
     }
 
@@ -269,18 +285,19 @@ impl Qwen3 {
             Linear::new(&vb.pp("lm_head"), &qc)?
         };
 
-        Ok(Self { embed_tokens, layers, norm, lm_head })
+        Ok(Self {
+            embed_tokens,
+            layers,
+            norm,
+            lm_head,
+        })
     }
 
     pub fn forward(&mut self, input_ids: &Array) -> Result<Array> {
         let shape = input_ids.shape_raw();
         let seq_len = shape[shape.len() - 1];
 
-        let mut h = self.embed_tokens.forward(input_ids)?;
-        for layer in &mut self.layers {
-            h = layer.forward(&h)?;
-        }
-        h = self.norm.forward(&h)?;
+        let mut h = self.forward_hidden_states(input_ids)?;
 
         if seq_len > 1 {
             let h_shape = h.shape_raw();
@@ -292,6 +309,14 @@ impl Qwen3 {
         }
 
         self.lm_head.forward(&h)
+    }
+
+    pub fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        let mut h = self.embed_tokens.forward(input_ids)?;
+        for layer in &mut self.layers {
+            h = layer.forward(&h)?;
+        }
+        self.norm.forward(&h)
     }
 
     pub fn clear_cache(&mut self) {

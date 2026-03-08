@@ -17,12 +17,20 @@ impl Drop for Stream {
 impl Stream {
     /// Create the default GPU stream.
     pub fn new_gpu_default() -> Self {
-        unsafe { Self { inner: mlx_default_gpu_stream_new() } }
+        unsafe {
+            Self {
+                inner: mlx_default_gpu_stream_new(),
+            }
+        }
     }
 
     /// Create the default CPU stream.
     pub fn new_cpu_default() -> Self {
-        unsafe { Self { inner: mlx_default_cpu_stream_new() } }
+        unsafe {
+            Self {
+                inner: mlx_default_cpu_stream_new(),
+            }
+        }
     }
 
     /// Synchronize (wait for all pending operations on this stream).

@@ -118,10 +118,11 @@ fn main() -> Result<()> {
     eprintln!("Generating...");
     let start = std::time::Instant::now();
     let mut stdout = std::io::stdout();
-    let (output, metrics) = pipeline.generate_with_metrics(&prompt, args.max_tokens, |_token, piece| {
-        let _ = stdout.write_all(piece.as_bytes());
-        let _ = stdout.flush();
-    })?;
+    let (output, metrics) =
+        pipeline.generate_with_metrics(&prompt, args.max_tokens, |_token, piece| {
+            let _ = stdout.write_all(piece.as_bytes());
+            let _ = stdout.flush();
+        })?;
     let elapsed = start.elapsed();
 
     if let Some(path) = &args.dump_json_out {

@@ -32,6 +32,10 @@ path = "src/bin/generate.rs"
 name = "mlx-server"
 path = "src/bin/mlx-server.rs"
 
+[[bin]]
+name = "embed_bench"
+path = "src/bin/embed_bench.rs"
+
 [dependencies]
 mlx-lm = { path = "crates/mlx-lm" }
 mlx-models = { path = "crates/mlx-models" }

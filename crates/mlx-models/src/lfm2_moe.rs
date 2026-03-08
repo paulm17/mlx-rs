@@ -1,7 +1,5 @@
 use mlx_core::{Array, Module, Result};
-use mlx_nn::{
-    Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, VarBuilder,
-};
+use mlx_nn::{Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, VarBuilder};
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
@@ -35,10 +33,18 @@ pub struct Lfm2MoeConfig {
     pub quantization: Option<super::llama::QuantizationConfig>,
 }
 
-fn default_norm_eps() -> f32 { 1e-5 }
-fn default_rope_theta() -> f32 { 10_000.0 }
-fn default_max_pos() -> usize { 131072 }
-fn default_conv_l_cache() -> usize { 3 }
+fn default_norm_eps() -> f32 {
+    1e-5
+}
+fn default_rope_theta() -> f32 {
+    10_000.0
+}
+fn default_max_pos() -> usize {
+    131072
+}
+fn default_conv_l_cache() -> usize {
+    3
+}
 
 static LFM2_MOE_PROFILE_STATS: OnceLock<Mutex<MoeProfileStats>> = OnceLock::new();
 
@@ -173,20 +179,24 @@ impl FullAttention {
         let (b, seq_len) = (shape[0], shape[1]);
         let offset = self.kv_cache.offset() as i32;
 
-        let q = self
-            .q_proj
-            .forward(x)?
-            .reshape(&[b, seq_len, self.num_heads as i32, self.head_dim as i32])?;
+        let q = self.q_proj.forward(x)?.reshape(&[
+            b,
+            seq_len,
+            self.num_heads as i32,
+            self.head_dim as i32,
+        ])?;
         let q = match &self.q_norm {
             Some(n) => n.forward(&q)?,
             None => q,
         }
         .transpose_axes(&[0, 2, 1, 3])?;
 
-        let k = self
-            .k_proj
-            .forward(x)?
-            .reshape(&[b, seq_len, self.num_kv_heads as i32, self.head_dim as i32])?;
+        let k = self.k_proj.forward(x)?.reshape(&[
+            b,
+            seq_len,
+            self.num_kv_heads as i32,
+            self.head_dim as i32,
+        ])?;
         let k = match &self.k_norm {
             Some(n) => n.forward(&k)?,
             None => k,
@@ -207,9 +217,11 @@ impl FullAttention {
         let mask_mode = if seq_len > 1 { "causal" } else { "" };
         let attn = q.fast_scaled_dot_product_attention(&k, &v, self.scale, mask_mode, None)?;
 
-        let attn = attn
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, seq_len, (self.num_heads * self.head_dim) as i32])?;
+        let attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            b,
+            seq_len,
+            (self.num_heads * self.head_dim) as i32,
+        ])?;
         self.o_proj.forward(&attn)
     }
 
@@ -353,7 +365,12 @@ impl ExpertLinear {
         })
     }
 
-    fn forward_switch(&self, x: &Array, expert_indices: &Array, sorted_indices: bool) -> Result<Array> {
+    fn forward_switch(
+        &self,
+        x: &Array,
+        expert_indices: &Array,
+        sorted_indices: bool,
+    ) -> Result<Array> {
         if let Some(scales) = &self.scales {
             return x.gather_qmm(
                 &self.weight,
@@ -371,7 +388,6 @@ impl ExpertLinear {
         let wt = self.weight.transpose_axes(&[0, 2, 1])?;
         x.gather_mm(&wt, None, Some(expert_indices), sorted_indices)
     }
-
 }
 
 struct SwitchGlu {
@@ -466,7 +482,10 @@ impl MoeFeedForward {
                 stats.expert_forward_s += stage_t0.elapsed().as_secs_f64();
             });
             let score_arr = top_scores.expand_dims(-1)?.as_type(expert_out.dtype())?;
-            let out = expert_out.multiply(&score_arr)?.sum_axis(1, false)?.reshape(&[1, hidden])?;
+            let out = expert_out
+                .multiply(&score_arr)?
+                .sum_axis(1, false)?
+                .reshape(&[1, hidden])?;
             return out.reshape(&orig_shape);
         }
 
@@ -567,7 +586,11 @@ impl Lfm2Layer {
             LayerOperator::ShortConv(ShortConv::load(&vb.pp("conv"), cfg)?)
         };
 
-        let is_moe = vb.pp("feed_forward").pp("switch_mlp").pp("gate_proj").contains("weight");
+        let is_moe = vb
+            .pp("feed_forward")
+            .pp("switch_mlp")
+            .pp("gate_proj")
+            .contains("weight");
         let ffn = if is_moe {
             LayerFfn::Moe(MoeFeedForward::load(&vb.pp("feed_forward"), cfg)?)
         } else {
@@ -614,7 +637,11 @@ impl Lfm2Moe {
         let embed_tokens = Embedding::new(&model_vb.pp("embed_tokens"), &qc)?;
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
         for i in 0..cfg.num_hidden_layers {
-            layers.push(Lfm2Layer::load(i, &model_vb.pp(format!("layers.{i}")), cfg)?);
+            layers.push(Lfm2Layer::load(
+                i,
+                &model_vb.pp(format!("layers.{i}")),
+                cfg,
+            )?);
         }
 
         let norm = if model_vb.pp("embedding_norm").contains("weight") {
@@ -641,11 +668,7 @@ impl Lfm2Moe {
         let shape = input_ids.shape_raw();
         let seq_len = shape[shape.len() - 1];
 
-        let mut h = self.embed_tokens.forward(input_ids)?;
-        for layer in &mut self.layers {
-            h = layer.forward(&h)?;
-        }
-        h = self.norm.forward(&h)?;
+        let mut h = self.forward_hidden_states(input_ids)?;
 
         if seq_len > 1 {
             let h_shape = h.shape_raw();
@@ -657,6 +680,14 @@ impl Lfm2Moe {
         }
 
         self.lm_head.forward(&h)
+    }
+
+    pub fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        let mut h = self.embed_tokens.forward(input_ids)?;
+        for layer in &mut self.layers {
+            h = layer.forward(&h)?;
+        }
+        self.norm.forward(&h)
     }
 
     pub fn clear_cache(&mut self) {

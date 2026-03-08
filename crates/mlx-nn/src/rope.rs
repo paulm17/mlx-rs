@@ -63,16 +63,17 @@ impl RoPE {
         scaling: &RopeScaling,
         max_position_embeddings: usize,
     ) -> Result<Self> {
-        let rope_type = scaling
-            .rope_type
-            .as_deref()
-            .unwrap_or("default");
+        let rope_type = scaling.rope_type.as_deref().unwrap_or("default");
 
         match rope_type {
             "llama3" => {
                 // Llama3-style frequency scaling
                 let head_dim = dims as usize;
-                let factor = if scaling.factor > 0.0 { scaling.factor } else { 1.0 };
+                let factor = if scaling.factor > 0.0 {
+                    scaling.factor
+                } else {
+                    1.0
+                };
                 let low_freq_factor = if scaling.low_freq_factor > 0.0 {
                     scaling.low_freq_factor
                 } else {
@@ -86,11 +87,12 @@ impl RoPE {
                 if high_freq_factor <= low_freq_factor {
                     high_freq_factor = low_freq_factor + 1.0;
                 }
-                let original_max_position_embeddings = if scaling.original_max_position_embeddings > 0 {
-                    scaling.original_max_position_embeddings
-                } else {
-                    max_position_embeddings.max(1)
-                } as f32;
+                let original_max_position_embeddings =
+                    if scaling.original_max_position_embeddings > 0 {
+                        scaling.original_max_position_embeddings
+                    } else {
+                        max_position_embeddings.max(1)
+                    } as f32;
 
                 let low_freq_wavelen = original_max_position_embeddings / low_freq_factor;
                 let high_freq_wavelen = original_max_position_embeddings / high_freq_factor;
@@ -105,9 +107,8 @@ impl RoPE {
                     } else if wavelen > low_freq_wavelen {
                         base_freq * factor
                     } else {
-                        let smooth =
-                            (original_max_position_embeddings / wavelen - low_freq_factor)
-                                / (high_freq_factor - low_freq_factor);
+                        let smooth = (original_max_position_embeddings / wavelen - low_freq_factor)
+                            / (high_freq_factor - low_freq_factor);
                         let low_adjusted = base_freq * factor;
                         low_adjusted / ((1.0 - smooth) / factor + smooth)
                     };
@@ -141,7 +142,11 @@ impl RoPE {
         x.fast_rope(
             self.dims,
             self.traditional,
-            if self.freqs.is_some() { None } else { Some(self.base) },
+            if self.freqs.is_some() {
+                None
+            } else {
+                Some(self.base)
+            },
             self.scale,
             offset,
             self.freqs.as_ref(),

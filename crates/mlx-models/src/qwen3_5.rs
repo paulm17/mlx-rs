@@ -1,7 +1,5 @@
 use mlx_core::{Array, Module, Result};
-use mlx_nn::{
-    Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, VarBuilder, repeat_kv,
-};
+use mlx_nn::{repeat_kv, Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, VarBuilder};
 
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Qwen35Config {
@@ -46,13 +44,27 @@ pub struct RopeParameters {
     pub partial_rotary_factor: Option<f32>,
 }
 
-fn default_eps() -> f32 { 1e-6 }
-fn default_rope_theta() -> f32 { 10_000_000.0 }
-fn default_linear_num_key_heads() -> usize { 16 }
-fn default_linear_num_value_heads() -> usize { 16 }
-fn default_linear_key_head_dim() -> usize { 128 }
-fn default_linear_value_head_dim() -> usize { 128 }
-fn default_linear_conv_kernel_dim() -> usize { 4 }
+fn default_eps() -> f32 {
+    1e-6
+}
+fn default_rope_theta() -> f32 {
+    10_000_000.0
+}
+fn default_linear_num_key_heads() -> usize {
+    16
+}
+fn default_linear_num_value_heads() -> usize {
+    16
+}
+fn default_linear_key_head_dim() -> usize {
+    128
+}
+fn default_linear_value_head_dim() -> usize {
+    128
+}
+fn default_linear_conv_kernel_dim() -> usize {
+    4
+}
 
 impl Qwen35Config {
     fn quant_config(&self) -> QuantConfig {
@@ -162,11 +174,19 @@ impl FullAttention {
             self.num_heads as i32,
             (2 * self.head_dim) as i32,
         ])?;
-        let q = qg.slice(&[0, 0, 0, 0], &[b, seq_len, self.num_heads as i32, self.head_dim as i32])?;
+        let q = qg.slice(
+            &[0, 0, 0, 0],
+            &[b, seq_len, self.num_heads as i32, self.head_dim as i32],
+        )?;
         let gate = qg
             .slice(
                 &[0, 0, 0, self.head_dim as i32],
-                &[b, seq_len, self.num_heads as i32, (2 * self.head_dim) as i32],
+                &[
+                    b,
+                    seq_len,
+                    self.num_heads as i32,
+                    (2 * self.head_dim) as i32,
+                ],
             )?
             .reshape(&[b, seq_len, q_dim])?;
         let q = q.reshape(&[b, seq_len, self.num_heads as i32, self.head_dim as i32])?;
@@ -198,9 +218,11 @@ impl FullAttention {
         let mask_mode = if seq_len > 1 { "causal" } else { "" };
         let attn = q.fast_scaled_dot_product_attention(&k, &v, self.scale, mask_mode, None)?;
 
-        let attn = attn
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, seq_len, (self.num_heads * self.head_dim) as i32])?;
+        let attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            b,
+            seq_len,
+            (self.num_heads * self.head_dim) as i32,
+        ])?;
         self.o_proj.forward(&attn.multiply(&gate.sigmoid()?)?)
     }
 
@@ -305,28 +327,37 @@ impl LinearAttention {
         let conv = mixed.conv1d(&self.conv_weight, 1, 0, 1, conv_dim)?;
         let conv = conv.multiply(&conv.sigmoid()?)?;
 
-        let q = conv.slice(&[0, 0, 0], &[b, seq_len, key_dim])?
+        let q = conv.slice(&[0, 0, 0], &[b, seq_len, key_dim])?.reshape(&[
+            b,
+            seq_len,
+            self.k_heads as i32,
+            self.k_head_dim as i32,
+        ])?;
+        let k = conv
+            .slice(&[0, 0, key_dim], &[b, seq_len, 2 * key_dim])?
             .reshape(&[b, seq_len, self.k_heads as i32, self.k_head_dim as i32])?;
-        let k = conv.slice(&[0, 0, key_dim], &[b, seq_len, 2 * key_dim])?
-            .reshape(&[b, seq_len, self.k_heads as i32, self.k_head_dim as i32])?;
-        let v = conv.slice(&[0, 0, 2 * key_dim], &[b, seq_len, 2 * key_dim + value_dim])?
+        let v = conv
+            .slice(&[0, 0, 2 * key_dim], &[b, seq_len, 2 * key_dim + value_dim])?
             .reshape(&[b, seq_len, self.v_heads as i32, self.v_head_dim as i32])?;
 
         // q/k normalization and scaling
         let inv_scale = (self.k_head_dim as f32).powf(-0.5);
-        let q = q.fast_rms_norm(&Array::ones(&[self.k_head_dim as i32], q.dtype())?, 1e-6)?
+        let q = q
+            .fast_rms_norm(&Array::ones(&[self.k_head_dim as i32], q.dtype())?, 1e-6)?
             .multiply(&Array::from_float(inv_scale * inv_scale)?)?;
-        let k = k.fast_rms_norm(&Array::ones(&[self.k_head_dim as i32], k.dtype())?, 1e-6)?
+        let k = k
+            .fast_rms_norm(&Array::ones(&[self.k_head_dim as i32], k.dtype())?, 1e-6)?
             .multiply(&Array::from_float(inv_scale)?)?;
 
         // Compute beta and decay g; match mlx_lm.models.gated_delta.compute_g:
         // g = exp(-exp(A_log.float32) * softplus(a + dt_bias)).astype(A_log.dtype)
         let beta = b_proj.sigmoid()?; // [B,S,Hv]
         let a = a_proj.as_type(mlx_core::DType::Float32)?; // [B,S,Hv]
-        let dt_bias = self
-            .dt_bias
-            .as_type(mlx_core::DType::Float32)?
-            .reshape(&[1, 1, self.v_heads as i32])?;
+        let dt_bias = self.dt_bias.as_type(mlx_core::DType::Float32)?.reshape(&[
+            1,
+            1,
+            self.v_heads as i32,
+        ])?;
         let a_log_exp = self.a_log.as_type(mlx_core::DType::Float32)?.exp()?;
         let g_pre = a.add(&dt_bias)?;
         let g_sp = Self::softplus(&g_pre)?;
@@ -360,29 +391,52 @@ impl LinearAttention {
         for t in 0..(seq_len as usize) {
             let t0 = t as i32;
             let t1 = (t + 1) as i32;
-            let q_t = q.slice(&[0, t0, 0, 0], &[b, t1, self.v_heads as i32, self.k_head_dim as i32])?
+            let q_t = q
+                .slice(
+                    &[0, t0, 0, 0],
+                    &[b, t1, self.v_heads as i32, self.k_head_dim as i32],
+                )?
                 .squeeze(1)?;
-            let k_t = k.slice(&[0, t0, 0, 0], &[b, t1, self.v_heads as i32, self.k_head_dim as i32])?
+            let k_t = k
+                .slice(
+                    &[0, t0, 0, 0],
+                    &[b, t1, self.v_heads as i32, self.k_head_dim as i32],
+                )?
                 .squeeze(1)?;
-            let v_t = v.slice(&[0, t0, 0, 0], &[b, t1, self.v_heads as i32, self.v_head_dim as i32])?
+            let v_t = v
+                .slice(
+                    &[0, t0, 0, 0],
+                    &[b, t1, self.v_heads as i32, self.v_head_dim as i32],
+                )?
                 .squeeze(1)?;
-            let g_t = g.slice(&[0, t0, 0], &[b, t1, self.v_heads as i32])?.squeeze(1)?
+            let g_t = g
+                .slice(&[0, t0, 0], &[b, t1, self.v_heads as i32])?
+                .squeeze(1)?
                 .reshape(&[b, self.v_heads as i32, 1, 1])?;
-            let beta_t = beta.slice(&[0, t0, 0], &[b, t1, self.v_heads as i32])?.squeeze(1)?
+            let beta_t = beta
+                .slice(&[0, t0, 0], &[b, t1, self.v_heads as i32])?
+                .squeeze(1)?
                 .reshape(&[b, self.v_heads as i32, 1])?;
 
             state = state.multiply(&g_t)?;
-            let kv_mem = state.multiply(&k_t.reshape(&[b, self.v_heads as i32, 1, self.k_head_dim as i32])?)?
+            let kv_mem = state
+                .multiply(&k_t.reshape(&[b, self.v_heads as i32, 1, self.k_head_dim as i32])?)?
                 .sum_axis(-1, false)?;
-            let delta = v_t.add(&kv_mem.multiply(&Array::from_float(-1.0)?)?)?
+            let delta = v_t
+                .add(&kv_mem.multiply(&Array::from_float(-1.0)?)?)?
                 .multiply(&beta_t)?;
             state = state.add(
                 &k_t.reshape(&[b, self.v_heads as i32, 1, self.k_head_dim as i32])?
-                    .multiply(&delta.reshape(&[b, self.v_heads as i32, self.v_head_dim as i32, 1])?)?
+                    .multiply(&delta.reshape(&[
+                        b,
+                        self.v_heads as i32,
+                        self.v_head_dim as i32,
+                        1,
+                    ])?)?,
             )?;
-            let y_t = state.multiply(
-                &q_t.reshape(&[b, self.v_heads as i32, 1, self.k_head_dim as i32])?
-            )?.sum_axis(-1, false)?;
+            let y_t = state
+                .multiply(&q_t.reshape(&[b, self.v_heads as i32, 1, self.k_head_dim as i32])?)?
+                .sum_axis(-1, false)?;
             ys.push(y_t.reshape(&[b, 1, self.v_heads as i32, self.v_head_dim as i32])?);
         }
         let y_refs: Vec<&Array> = ys.iter().collect();
@@ -512,7 +566,11 @@ impl Qwen35 {
         let embed_tokens = Embedding::new(&model_vb.pp("embed_tokens"), &qc)?;
         let mut layers = Vec::with_capacity(cfg.text_config.num_hidden_layers);
         for i in 0..cfg.text_config.num_hidden_layers {
-            layers.push(Qwen35Layer::load(i, &model_vb.pp(format!("layers.{i}")), cfg)?);
+            layers.push(Qwen35Layer::load(
+                i,
+                &model_vb.pp(format!("layers.{i}")),
+                cfg,
+            )?);
         }
 
         let norm = RmsNorm::new(cfg.text_config.rms_norm_eps, &model_vb.pp("norm"))?;
@@ -535,11 +593,7 @@ impl Qwen35 {
         let shape = input_ids.shape_raw();
         let seq_len = shape[shape.len() - 1];
 
-        let mut h = self.embed_tokens.forward(input_ids)?;
-        for layer in &mut self.layers {
-            h = layer.forward(&h)?;
-        }
-        h = self.norm.forward(&h)?;
+        let mut h = self.forward_hidden_states(input_ids)?;
 
         if seq_len > 1 {
             let h_shape = h.shape_raw();
@@ -551,6 +605,14 @@ impl Qwen35 {
         }
 
         self.lm_head.forward(&h)
+    }
+
+    pub fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        let mut h = self.embed_tokens.forward(input_ids)?;
+        for layer in &mut self.layers {
+            h = layer.forward(&h)?;
+        }
+        self.norm.forward(&h)
     }
 
     pub fn clear_cache(&mut self) {

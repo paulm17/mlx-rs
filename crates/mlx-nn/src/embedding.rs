@@ -1,5 +1,5 @@
-use crate::var_builder::VarBuilder;
 use crate::linear::QuantConfig;
+use crate::var_builder::VarBuilder;
 use mlx_core::{Array, Module, Result};
 
 /// Embedding layer supporting both full-precision and quantized weights.
@@ -40,7 +40,11 @@ impl Embedding {
                 let unpacked = n_groups * gs;
                 let bits_val = if unpacked > 0 && (packed * 32) % unpacked == 0 {
                     let b = (packed * 32 / unpacked) as i32;
-                    if matches!(b, 2 | 4 | 8) { b } else { config.bits }
+                    if matches!(b, 2 | 4 | 8) {
+                        b
+                    } else {
+                        config.bits
+                    }
                 } else {
                     config.bits
                 };
@@ -98,7 +102,11 @@ impl Module for Embedding {
             // Quantized embedding lookup: gather then dequantize
             let q_rows = self.weight.take(token_ids, 0)?;
             let s_rows = scales.take(token_ids, 0)?;
-            let b_rows = self.biases.as_ref().map(|b| b.take(token_ids, 0)).transpose()?;
+            let b_rows = self
+                .biases
+                .as_ref()
+                .map(|b| b.take(token_ids, 0))
+                .transpose()?;
             q_rows.dequantize(&s_rows, b_rows.as_ref(), self.group_size, self.bits)
         } else {
             // Full-precision: simple gather

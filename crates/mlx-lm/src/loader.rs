@@ -4,10 +4,12 @@ use mlx_nn::VarBuilder;
 use serde_json::Value;
 use std::path::Path;
 
-use crate::generate::CausalLM;
+use crate::generate::ModelRuntime;
 
 fn parse_env_usize(name: &str) -> Option<usize> {
-    std::env::var(name).ok().and_then(|v| v.trim().parse::<usize>().ok())
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
 }
 
 fn configure_mlx_cache_policy() {
@@ -41,6 +43,7 @@ fn configure_mlx_cache_policy() {
 /// Supported model architectures.
 #[derive(Debug, Clone)]
 pub enum ModelArch {
+    Bert,
     Llama,
     Qwen3,
     Qwen35,
@@ -55,10 +58,13 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
     // Check model_type field
     if let Some(model_type) = config.get("model_type").and_then(|v| v.as_str()) {
         match model_type.to_lowercase().as_str() {
+            "bert" => return Ok(ModelArch::Bert),
             "llama" => return Ok(ModelArch::Llama),
             "qwen3_5" | "qwen3.5" => return Ok(ModelArch::Qwen35),
             "qwen3" => {
-                if config.get("num_experts").is_some() || config.get("num_experts_per_tok").is_some() {
+                if config.get("num_experts").is_some()
+                    || config.get("num_experts_per_tok").is_some()
+                {
                     return Err(anyhow::anyhow!(
                         "qwen3_moe is not supported in the current runtime; use dense qwen3"
                     ));
@@ -85,11 +91,16 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 if lower.contains("qwen3_5") || lower.contains("qwen3.5") {
                     return Ok(ModelArch::Qwen35);
                 }
+                if lower.contains("bertmodel") || lower == "bert" {
+                    return Ok(ModelArch::Bert);
+                }
                 if lower.contains("llama") {
                     return Ok(ModelArch::Llama);
                 }
                 if lower.contains("qwen3") {
-                    if config.get("num_experts").is_some() || config.get("num_experts_per_tok").is_some() {
+                    if config.get("num_experts").is_some()
+                        || config.get("num_experts_per_tok").is_some()
+                    {
                         return Err(anyhow::anyhow!(
                             "qwen3_moe is not supported in the current runtime; use dense qwen3"
                         ));
@@ -112,7 +123,8 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 {
                     return Ok(ModelArch::Lfm2MoePythonPort);
                 }
-                if lower.contains("lfm2moe") || lower.contains("lfm2_moe") || lower.contains("lfm2") {
+                if lower.contains("lfm2moe") || lower.contains("lfm2_moe") || lower.contains("lfm2")
+                {
                     return Ok(ModelArch::Lfm2Moe);
                 }
             }
@@ -161,10 +173,11 @@ fn load_stop_tokens(
 ) -> crate::tokenizer::Tokenizer {
     let mut stops: Vec<u32> = Vec::new();
 
-    if let Some(eos_id) = config
-        .get("eos_token_id")
-        .or_else(|| config.get("text_config").and_then(|tc| tc.get("eos_token_id")))
-    {
+    if let Some(eos_id) = config.get("eos_token_id").or_else(|| {
+        config
+            .get("text_config")
+            .and_then(|tc| tc.get("eos_token_id"))
+    }) {
         extend_stop_tokens_from_value(&tokenizer, &mut stops, eos_id);
     }
 
@@ -193,7 +206,9 @@ fn load_stop_tokens(
 }
 
 /// Load a model from a directory containing config.json and .safetensors files.
-pub fn load_model(model_dir: &Path) -> Result<(Box<dyn CausalLM>, crate::tokenizer::Tokenizer)> {
+pub fn load_model(
+    model_dir: &Path,
+) -> Result<(Box<dyn ModelRuntime>, crate::tokenizer::Tokenizer)> {
     // Read config.json
     let config_path = model_dir.join("config.json");
     let config_str = std::fs::read_to_string(&config_path)
@@ -208,7 +223,11 @@ pub fn load_model(model_dir: &Path) -> Result<(Box<dyn CausalLM>, crate::tokeniz
     eprintln!("Loaded {} tensors", vb.data().len());
 
     // Build model
-    let model: Box<dyn CausalLM> = match arch {
+    let model: Box<dyn ModelRuntime> = match arch {
+        ModelArch::Bert => {
+            let cfg: mlx_models::BertConfig = serde_json::from_value(config.clone())?;
+            Box::new(mlx_models::Bert::new(&cfg, &vb)?)
+        }
         ModelArch::Llama => {
             let cfg: mlx_models::LlamaConfig = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Llama::new(&cfg, &vb)?)
@@ -248,4 +267,28 @@ pub fn load_model(model_dir: &Path) -> Result<(Box<dyn CausalLM>, crate::tokeniz
     tokenizer = load_stop_tokens(model_dir, tokenizer, &config);
 
     Ok((model, tokenizer))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn detects_bert_from_model_type() {
+        let config = json!({"model_type": "bert"});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Bert
+        ));
+    }
+
+    #[test]
+    fn detects_bert_from_architecture() {
+        let config = json!({"architectures": ["BertModel"]});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Bert
+        ));
+    }
 }

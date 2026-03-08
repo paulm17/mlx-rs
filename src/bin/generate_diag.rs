@@ -24,7 +24,10 @@ fn qwen_tie_break_sampler() -> mlx_lm::Sampler {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "generate_diag", about = "Generate text with per-step top-k diagnostics")]
+#[command(
+    name = "generate_diag",
+    about = "Generate text with per-step top-k diagnostics"
+)]
 struct Args {
     #[arg(long)]
     model_dir: PathBuf,
@@ -69,7 +72,11 @@ fn topk_from_logits(logits: &mlx_core::Array, topk: usize) -> Result<Vec<(u32, f
     let arr = squeeze_all_singletons(logits.clone())?.contiguous()?;
     let vals = arr.to_vec_f32()?;
     let mut idxs: Vec<usize> = (0..vals.len()).collect();
-    idxs.sort_by(|&a, &b| vals[b].partial_cmp(&vals[a]).unwrap_or(std::cmp::Ordering::Equal));
+    idxs.sort_by(|&a, &b| {
+        vals[b]
+            .partial_cmp(&vals[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     Ok(idxs
         .into_iter()
         .take(topk)
@@ -103,7 +110,9 @@ fn main() -> Result<()> {
                 Ok(p) => p,
                 Err(_) => mlx_lm::ChatTemplate::chatml()
                     .apply(&messages, &template_options)
-                    .or_else(|_| mlx_lm::ChatTemplate::qwen35().apply(&messages, &template_options))?,
+                    .or_else(|_| {
+                        mlx_lm::ChatTemplate::qwen35().apply(&messages, &template_options)
+                    })?,
             },
             Err(_) => args.prompt.clone(),
         }
@@ -111,7 +120,8 @@ fn main() -> Result<()> {
 
     let prompt_ids = tokenizer.encode(&prompt)?;
     let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&x| x as i32).collect();
-    let input = mlx_core::Array::from_slice_i32(&prompt_i32)?.reshape(&[1, prompt_i32.len() as i32])?;
+    let input =
+        mlx_core::Array::from_slice_i32(&prompt_i32)?.reshape(&[1, prompt_i32.len() as i32])?;
 
     model.clear_cache();
     let mut generated_ids: Vec<u32> = Vec::new();

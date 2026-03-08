@@ -43,7 +43,12 @@ impl Linear {
         let (group_size, bits) = if let Some(ref s) = scales {
             (
                 config.group_size,
-                infer_bits(&weight.shape_raw(), &s.shape_raw(), config.group_size, config.bits),
+                infer_bits(
+                    &weight.shape_raw(),
+                    &s.shape_raw(),
+                    config.group_size,
+                    config.bits,
+                ),
             )
         } else {
             (0, 0)
@@ -95,7 +100,15 @@ impl Linear {
         } else {
             None
         };
-        Self { weight, weight_t, bias, scales, biases, group_size, bits }
+        Self {
+            weight,
+            weight_t,
+            bias,
+            scales,
+            biases,
+            group_size,
+            bits,
+        }
     }
 
     /// Get a reference to the weight tensor.

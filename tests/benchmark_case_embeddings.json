@@ -1,0 +1,9 @@
+{
+  "kind": "embeddings",
+  "name": "mxbai_embed_pair",
+  "input": [
+    "In the beginning God created the heavens and the earth.",
+    "And the earth was without form, and void."
+  ],
+  "encoding_format": "float"
+}

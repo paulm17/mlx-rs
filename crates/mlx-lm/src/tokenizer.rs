@@ -9,6 +9,13 @@ pub struct Tokenizer {
     stop_token_ids: Vec<u32>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EmbeddingInputs {
+    pub ids: Vec<u32>,
+    pub attention_mask: Vec<u32>,
+    pub type_ids: Vec<u32>,
+}
+
 impl Tokenizer {
     /// Load a tokenizer from a file (tokenizer.json).
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self> {
@@ -56,6 +63,25 @@ impl Tokenizer {
             .encode(text, false)
             .map_err(|e| anyhow::anyhow!("encoding failed: {e}"))?;
         Ok(encoding.get_ids().to_vec())
+    }
+
+    /// Encode text for encoder-style embedding models.
+    pub fn encode_for_embeddings(&self, text: &str) -> Result<EmbeddingInputs> {
+        let encoding = self
+            .inner
+            .encode(text, true)
+            .map_err(|e| anyhow::anyhow!("encoding failed: {e}"))?;
+        let ids = encoding.get_ids().to_vec();
+        let attention_mask = encoding.get_attention_mask().to_vec();
+        let mut type_ids = encoding.get_type_ids().to_vec();
+        if type_ids.len() != ids.len() {
+            type_ids = vec![0; ids.len()];
+        }
+        Ok(EmbeddingInputs {
+            ids,
+            attention_mask,
+            type_ids,
+        })
     }
 
     /// Decode token IDs to text.

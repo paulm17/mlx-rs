@@ -1,8 +1,9 @@
 use crate::{
-    load_model, CausalLM, ChatTemplate, ChatTemplateOptions, GenerationPipeline,
-    Message as LmMessage, Sampler, Tokenizer,
+    load_model, ChatTemplate, ChatTemplateOptions, EmbeddingPooling, GenerationPipeline,
+    Message as LmMessage, ModelRuntime, Sampler, Tokenizer,
 };
 use anyhow::Result;
+use mlx_core::Array;
 use serde::Deserialize;
 use serde_json::json;
 use serde_json::{Map, Value};
@@ -14,7 +15,7 @@ use std::time::Instant;
 
 struct LoadedModel {
     model_dir: PathBuf,
-    model: Box<dyn CausalLM>,
+    model: Box<dyn ModelRuntime>,
     tokenizer: Tokenizer,
 }
 
@@ -61,6 +62,7 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     pub rate_limit_rpm: Option<u32>,
     pub thinking: Option<bool>,
+    pub embeddings_batch_size: Option<usize>,
 }
 
 impl ServerConfig {
@@ -79,6 +81,7 @@ impl ServerConfig {
             api_key: None,
             rate_limit_rpm: None,
             thinking: None,
+            embeddings_batch_size: None,
         };
 
         for raw_line in content.lines() {
@@ -114,6 +117,9 @@ impl ServerConfig {
                 "model" => cfg.model = Some(unquote(v)),
                 "api_key" => cfg.api_key = Some(unquote(v)),
                 "rate_limit_rpm" => cfg.rate_limit_rpm = unquote(v).parse::<u32>().ok(),
+                "embeddings_batch_size" => {
+                    cfg.embeddings_batch_size = unquote(v).parse::<usize>().ok()
+                }
                 "thinking" => {
                     let vv = unquote(v).to_ascii_lowercase();
                     cfg.thinking = match vv.as_str() {
@@ -156,6 +162,10 @@ impl ServerConfig {
     fn thinking_enabled(&self) -> bool {
         self.thinking.unwrap_or(false)
     }
+
+    fn embeddings_batch_size(&self) -> usize {
+        self.embeddings_batch_size.unwrap_or(32).max(1)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -176,6 +186,427 @@ struct ChatRequest {
     temperature: Option<f32>,
     top_p: Option<f32>,
     stream: Option<bool>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct EmbeddingsRequest {
+    input: Value,
+    model: Option<String>,
+    encoding_format: Option<String>,
+}
+
+fn parse_embeddings_input(input: Value) -> Result<Vec<String>> {
+    match input {
+        Value::String(s) => Ok(vec![s]),
+        Value::Array(values) => values
+            .into_iter()
+            .map(|value| match value {
+                Value::String(s) => Ok(s),
+                Value::Array(_) => anyhow::bail!("token array inputs are not supported"),
+                _ => anyhow::bail!("input array entries must be strings"),
+            })
+            .collect(),
+        Value::Null => anyhow::bail!("\"input\" must be provided"),
+        _ => anyhow::bail!("\"input\" must be a string or an array of strings"),
+    }
+}
+
+fn normalize_embedding(mut embedding: Vec<f32>) -> Result<Vec<f32>> {
+    let norm = embedding
+        .iter()
+        .map(|v| (*v as f64) * (*v as f64))
+        .sum::<f64>()
+        .sqrt();
+    if norm == 0.0 {
+        anyhow::bail!("embedding vector has zero norm");
+    }
+    for value in &mut embedding {
+        *value = (*value as f64 / norm) as f32;
+    }
+    Ok(embedding)
+}
+
+fn embedding_response(
+    model_name: String,
+    embeddings: Vec<Vec<f32>>,
+    prompt_tokens: usize,
+) -> Value {
+    let data = embeddings
+        .into_iter()
+        .enumerate()
+        .map(|(index, embedding)| {
+            json!({
+                "object": "embedding",
+                "index": index,
+                "embedding": embedding,
+            })
+        })
+        .collect::<Vec<_>>();
+
+    json!({
+        "object": "list",
+        "model": model_name,
+        "data": data,
+        "usage": {
+            "prompt_tokens": prompt_tokens,
+            "total_tokens": prompt_tokens,
+        }
+    })
+}
+
+fn pool_embedding_values(
+    values: &[f32],
+    seq_len: usize,
+    hidden_size: usize,
+    pooling: EmbeddingPooling,
+    attention_mask: &[u32],
+) -> Result<Vec<f32>> {
+    match pooling {
+        EmbeddingPooling::LastToken => {
+            if seq_len == 0 {
+                anyhow::bail!("hidden states did not contain any sequence positions");
+            }
+            let offset = (seq_len - 1) * hidden_size;
+            Ok(values[offset..offset + hidden_size].to_vec())
+        }
+        EmbeddingPooling::Mean => {
+            if attention_mask.len() != seq_len {
+                anyhow::bail!(
+                    "attention mask length {} did not match sequence length {seq_len}",
+                    attention_mask.len()
+                );
+            }
+            let mut pooled = vec![0.0f32; hidden_size];
+            let mut count = 0.0f32;
+            for (token_idx, &mask) in attention_mask.iter().enumerate() {
+                if mask == 0 {
+                    continue;
+                }
+                count += 1.0;
+                let offset = token_idx * hidden_size;
+                for dim in 0..hidden_size {
+                    pooled[dim] += values[offset + dim];
+                }
+            }
+            if count == 0.0 {
+                anyhow::bail!("attention mask excluded every token");
+            }
+            for value in &mut pooled {
+                *value /= count;
+            }
+            Ok(pooled)
+        }
+    }
+}
+
+fn mean_pool_embeddings_gpu(hidden_states: &Array, attention_masks: &[Vec<u32>]) -> Result<Array> {
+    let shape = hidden_states.shape_raw();
+    if shape.len() != 3 {
+        anyhow::bail!("expected rank-3 hidden states for mean pooling, got rank {}", shape.len());
+    }
+    let batch = shape[0] as usize;
+    let seq_len = shape[1] as usize;
+    if attention_masks.len() != batch {
+        anyhow::bail!(
+            "attention mask batch length {} did not match hidden batch {batch}",
+            attention_masks.len()
+        );
+    }
+    let mut flat_mask = Vec::with_capacity(batch * seq_len);
+    for mask in attention_masks {
+        if mask.len() != seq_len {
+            anyhow::bail!(
+                "attention mask length {} did not match sequence length {seq_len}",
+                mask.len()
+            );
+        }
+        flat_mask.extend(mask.iter().map(|&v| v as f32));
+    }
+    let mask = Array::from_slice_f32(&flat_mask)?
+        .reshape(&[batch as i32, seq_len as i32, 1])?
+        .as_type(hidden_states.dtype())?;
+    let summed = hidden_states.multiply(&mask)?.sum_axis(1, false)?;
+    let counts = mask.sum_axis(1, false)?;
+    if counts
+        .to_vec_f32()?
+        .into_iter()
+        .any(|count| count <= 0.0)
+    {
+        anyhow::bail!("attention mask excluded every token");
+    }
+    Ok(summed.divide(&counts)?)
+}
+
+fn normalize_embeddings_gpu(embeddings: &Array) -> Result<Array> {
+    let squared = embeddings.square()?;
+    let norms = squared.sum_axis(-1, true)?.sqrt()?;
+    Ok(embeddings.divide(&norms)?)
+}
+
+fn embeddings_from_array(embeddings: &Array) -> Result<Vec<Vec<f32>>> {
+    let shape = embeddings.shape_raw();
+    if shape.len() != 2 {
+        anyhow::bail!("expected rank-2 embeddings array, got rank {}", shape.len());
+    }
+    let batch = shape[0] as usize;
+    let hidden_size = shape[1] as usize;
+    let values = embeddings.to_vec_f32()?;
+    if values.len() != batch * hidden_size {
+        anyhow::bail!(
+            "embedding values length {} did not match expected {}",
+            values.len(),
+            batch * hidden_size
+        );
+    }
+    Ok(values
+        .chunks(hidden_size)
+        .map(|chunk| chunk.to_vec())
+        .collect::<Vec<_>>())
+}
+
+fn compute_embeddings(
+    loaded: &mut LoadedModel,
+    inputs: &[String],
+    response_model_name: Option<String>,
+    embeddings_batch_size: usize,
+) -> Result<Value> {
+    #[derive(Debug, Clone)]
+    struct EncodedEmbeddingInput {
+        original_index: usize,
+        ids: Vec<u32>,
+        attention_mask: Vec<u32>,
+    }
+
+    fn pool_embedding_batch_values(
+        values: &[f32],
+        batch: usize,
+        seq_len: usize,
+        hidden_size: usize,
+        pooling: EmbeddingPooling,
+        attention_masks: &[Vec<u32>],
+    ) -> Result<Vec<Vec<f32>>> {
+        if attention_masks.len() != batch {
+            anyhow::bail!(
+                "attention mask batch length {} did not match hidden batch {batch}",
+                attention_masks.len()
+            );
+        }
+        let expected = batch
+            .checked_mul(seq_len)
+            .and_then(|v| v.checked_mul(hidden_size))
+            .ok_or_else(|| anyhow::anyhow!("hidden state size overflow"))?;
+        if values.len() != expected {
+            anyhow::bail!(
+                "hidden state values length {} did not match expected {}",
+                values.len(),
+                expected
+            );
+        }
+
+        let mut embeddings = Vec::with_capacity(batch);
+        for (batch_idx, attention_mask) in attention_masks.iter().enumerate() {
+            let base = batch_idx * seq_len * hidden_size;
+            let embedding = match pooling {
+                EmbeddingPooling::LastToken => {
+                    let offset = base + (seq_len - 1) * hidden_size;
+                    values[offset..offset + hidden_size].to_vec()
+                }
+                EmbeddingPooling::Mean => pool_embedding_values(
+                    &values[base..base + seq_len * hidden_size],
+                    seq_len,
+                    hidden_size,
+                    pooling,
+                    attention_mask,
+                )?,
+            };
+            embeddings.push(normalize_embedding(embedding)?);
+        }
+        Ok(embeddings)
+    }
+
+    let mut prompt_tokens = 0usize;
+    let mut encoded_inputs = Vec::with_capacity(inputs.len());
+    for (original_index, input) in inputs.iter().enumerate() {
+        let encoded = loaded.tokenizer.encode_for_embeddings(input)?;
+        if encoded.ids.is_empty() {
+            anyhow::bail!("input produced no tokens");
+        }
+        prompt_tokens += encoded.ids.len();
+        encoded_inputs.push(EncodedEmbeddingInput {
+            original_index,
+            ids: encoded.ids,
+            attention_mask: encoded.attention_mask,
+        });
+    }
+
+    if loaded.model.supports_padded_embedding_batching() {
+        let pooling = loaded.model.embedding_pooling();
+        if pooling == EmbeddingPooling::Mean {
+            let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
+            for chunk in encoded_inputs.chunks(embeddings_batch_size.max(1)) {
+                loaded.model.clear_cache();
+                let batch = chunk.len();
+                let max_seq_len = chunk.iter().map(|encoded| encoded.ids.len()).max().unwrap_or(0);
+                let mut flat_input_ids = Vec::with_capacity(batch * max_seq_len);
+                let mut flat_attention_mask = Vec::with_capacity(batch * max_seq_len);
+                let mut attention_masks = Vec::with_capacity(batch);
+                for encoded in chunk {
+                    let mut ids = encoded.ids.iter().map(|v| *v as i32).collect::<Vec<_>>();
+                    ids.resize(max_seq_len, 0);
+                    flat_input_ids.extend(ids);
+
+                    let mut attention_mask = encoded.attention_mask.clone();
+                    attention_mask.resize(max_seq_len, 0);
+                    flat_attention_mask.extend(attention_mask.iter().map(|&v| v as f32));
+                    attention_masks.push(attention_mask);
+                }
+                let input = Array::from_slice_i32(&flat_input_ids)?
+                    .reshape(&[batch as i32, max_seq_len as i32])?;
+                let attention_mask_arr = Array::from_slice_f32(&flat_attention_mask)?
+                    .reshape(&[batch as i32, max_seq_len as i32])?;
+                let hidden_states = loaded
+                    .model
+                    .forward_hidden_states_masked(&input, Some(&attention_mask_arr))
+                    .map_err(|e| anyhow::anyhow!("embedding inference failed: {e}"))?;
+                let pooled = mean_pool_embeddings_gpu(&hidden_states, &attention_masks)?;
+                let normalized = normalize_embeddings_gpu(&pooled)?;
+                let batch_embeddings = embeddings_from_array(&normalized)?;
+                for (encoded, embedding) in chunk.iter().zip(batch_embeddings.into_iter()) {
+                    embeddings[encoded.original_index] = Some(embedding);
+                }
+            }
+
+            loaded.model.clear_cache();
+            return Ok(embedding_response(
+                response_model_name.unwrap_or_else(|| loaded.model_dir.display().to_string()),
+                embeddings
+                    .into_iter()
+                    .map(|embedding| {
+                        embedding
+                            .ok_or_else(|| anyhow::anyhow!("missing embedding result after batching"))
+                    })
+                    .collect::<Result<Vec<_>>>()?,
+                prompt_tokens,
+            ));
+        }
+    }
+
+    let pooling = loaded.model.embedding_pooling();
+    let mut embeddings: Vec<Option<Vec<f32>>> = vec![None; inputs.len()];
+    let mut groups: HashMap<usize, Vec<EncodedEmbeddingInput>> = HashMap::new();
+    for encoded in encoded_inputs {
+        groups.entry(encoded.ids.len()).or_default().push(encoded);
+    }
+
+    let mut lengths = groups.keys().copied().collect::<Vec<_>>();
+    lengths.sort_unstable();
+    for seq_len in lengths {
+        let group = groups
+            .remove(&seq_len)
+            .ok_or_else(|| anyhow::anyhow!("missing encoded group for length {seq_len}"))?;
+        for chunk in group.chunks(embeddings_batch_size.max(1)) {
+            loaded.model.clear_cache();
+            let batch = chunk.len();
+            let mut flat_input_ids = Vec::with_capacity(batch * seq_len);
+            let mut attention_masks = Vec::with_capacity(batch);
+            for encoded in chunk {
+                flat_input_ids.extend(encoded.ids.iter().map(|v| *v as i32));
+                attention_masks.push(encoded.attention_mask.clone());
+            }
+            let input = Array::from_slice_i32(&flat_input_ids)?
+                .reshape(&[batch as i32, seq_len as i32])?;
+            let hidden_states = loaded
+                .model
+                .forward_hidden_states(&input)
+                .map_err(|e| anyhow::anyhow!("embedding inference failed: {e}"))?;
+            let hidden_shape = hidden_states.shape_raw();
+            if hidden_shape.len() < 3 {
+                anyhow::bail!("unexpected hidden state rank {}", hidden_states.ndim());
+            }
+            let hidden_batch = hidden_shape[0] as usize;
+            let hidden_seq_len = hidden_shape[hidden_shape.len() - 2] as usize;
+            let hidden_size = hidden_shape[hidden_shape.len() - 1] as usize;
+            if hidden_batch != batch {
+                anyhow::bail!(
+                    "hidden state batch {} did not match requested batch {batch}",
+                    hidden_batch
+                );
+            }
+            if hidden_seq_len != seq_len {
+                anyhow::bail!(
+                    "hidden state sequence length {} did not match requested length {seq_len}",
+                    hidden_seq_len
+                );
+            }
+            let values = hidden_states.to_vec_f32()?;
+            let batch_embeddings = pool_embedding_batch_values(
+                &values,
+                batch,
+                seq_len,
+                hidden_size,
+                pooling,
+                &attention_masks,
+            )?;
+            for (encoded, embedding) in chunk.iter().zip(batch_embeddings.into_iter()) {
+                embeddings[encoded.original_index] = Some(embedding);
+            }
+        }
+    }
+
+    loaded.model.clear_cache();
+    Ok(embedding_response(
+        response_model_name.unwrap_or_else(|| loaded.model_dir.display().to_string()),
+        embeddings
+            .into_iter()
+            .map(|embedding| {
+                embedding.ok_or_else(|| anyhow::anyhow!("missing embedding result after batching"))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        prompt_tokens,
+    ))
+}
+
+fn handle_embeddings_request(
+    parsed: EmbeddingsRequest,
+    loaded: &mut Option<LoadedModel>,
+    embeddings_batch_size: usize,
+) -> (u16, Value) {
+    if let Some(format) = parsed.encoding_format.as_deref() {
+        if format != "float" {
+            return (
+                400,
+                error_json(
+                    "invalid_encoding_format",
+                    "encoding_format must be \"float\"",
+                ),
+            );
+        }
+    }
+    let inputs = match parse_embeddings_input(parsed.input) {
+        Ok(v) => v,
+        Err(e) => return (400, error_json("invalid_request", e.to_string())),
+    };
+    let lm = match loaded.as_mut() {
+        Some(v) => v,
+        None => {
+            return (
+                400,
+                error_json("model_not_loaded", "No model loaded. Call /llm/load first."),
+            )
+        }
+    };
+    match compute_embeddings(lm, &inputs, parsed.model, embeddings_batch_size) {
+        Ok(body) => (200, body),
+        Err(e) => {
+            let message = e.to_string();
+            let code = if message.contains("embeddings are not supported") {
+                "embeddings_not_supported"
+            } else {
+                "embedding_error"
+            };
+            (400, error_json(code, message))
+        }
+    }
 }
 
 struct HttpRequest {
@@ -371,7 +802,10 @@ fn generation_debug_json(
     );
     debug.insert("stop_reason".into(), json!(metrics.stop_reason));
     debug.insert("last_token_id".into(), json!(metrics.last_token_id));
-    debug.insert("generated_token_ids".into(), json!(metrics.generated_token_ids));
+    debug.insert(
+        "generated_token_ids".into(),
+        json!(metrics.generated_token_ids),
+    );
     debug.insert("tail_token_ids".into(), json!(metrics.tail_token_ids));
     debug.insert("stop_token_ids".into(), json!(metrics.stop_token_ids));
 
@@ -472,6 +906,7 @@ fn handle_request(
     api_key: Option<&str>,
     limiter: &mut Option<FixedWindowRateLimiter>,
     thinking: bool,
+    embeddings_batch_size: usize,
 ) -> Option<(u16, serde_json::Value)> {
     if req.path != "/health" {
         if let Some(key) = api_key {
@@ -484,7 +919,7 @@ fn handle_request(
         }
     }
 
-    if req.path == "/v1/chat/completions" {
+    if req.path == "/v1/chat/completions" || req.path == "/v1/embeddings" {
         if let Some(limit) = limiter.as_mut() {
             if !limit.try_acquire() {
                 return Some((
@@ -499,7 +934,9 @@ fn handle_request(
         ("GET", "/health") => Some((200, json!({"status": "ok"}))),
         ("GET", "/v1/models") => {
             let data = match loaded.as_ref() {
-                Some(m) => vec![json!({"id": m.model_dir.display().to_string(), "object": "model"})],
+                Some(m) => {
+                    vec![json!({"id": m.model_dir.display().to_string(), "object": "model"})]
+                }
                 None => vec![],
             };
             Some((200, json!({"data": data})))
@@ -570,7 +1007,8 @@ fn handle_request(
             let prompt_token_count = lm.tokenizer.encode(&prompt).map(|v| v.len()).unwrap_or(0);
             let prompt_tokenize_s = prompt_tokenize_t0.elapsed().as_secs_f64();
 
-            let mut pipeline = GenerationPipeline::new(&mut lm.model, lm.tokenizer.clone(), sampler);
+            let mut pipeline =
+                GenerationPipeline::new(&mut lm.model, lm.tokenizer.clone(), sampler);
             if parsed.stream.unwrap_or(false) {
                 if let Err(e) = write_sse_headers(stream) {
                     return Some((500, error_json("stream_write_error", e.to_string())));
@@ -681,6 +1119,17 @@ fn handle_request(
                 Err(e) => Some((500, error_json("generation_error", e.to_string()))),
             }
         }
+        ("POST", "/v1/embeddings") => {
+            let parsed: EmbeddingsRequest = match serde_json::from_slice(&req.body) {
+                Ok(v) => v,
+                Err(e) => return Some((400, error_json("invalid_json", format!("bad JSON: {e}")))),
+            };
+            Some(handle_embeddings_request(
+                parsed,
+                loaded,
+                embeddings_batch_size,
+            ))
+        }
         _ => Some((404, error_json("not_found", "endpoint not found"))),
     }
 }
@@ -704,6 +1153,7 @@ pub fn run_server(config: ServerConfig) -> Result<()> {
     let mut limiter = config.rate_limit().map(FixedWindowRateLimiter::new);
     let api_key = config.api_key.clone();
     let thinking = config.thinking_enabled();
+    let embeddings_batch_size = config.embeddings_batch_size();
 
     for stream in listener.incoming() {
         let mut stream = match stream {
@@ -724,6 +1174,7 @@ pub fn run_server(config: ServerConfig) -> Result<()> {
             api_key.as_deref(),
             &mut limiter,
             thinking,
+            embeddings_batch_size,
         ) {
             let _ = write_json(&mut stream, status, body);
         }
@@ -735,4 +1186,112 @@ pub fn run_server(config: ServerConfig) -> Result<()> {
 pub fn run_server_from_toml_path(path: impl AsRef<Path>) -> Result<()> {
     let cfg = ServerConfig::from_toml_path(path)?;
     run_server(cfg)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_embeddings_input_accepts_string_and_arrays() {
+        assert_eq!(
+            parse_embeddings_input(json!("hello")).expect("single input"),
+            vec!["hello".to_string()]
+        );
+        assert_eq!(
+            parse_embeddings_input(json!(["hello", "world"])).expect("batch input"),
+            vec!["hello".to_string(), "world".to_string()]
+        );
+    }
+
+    #[test]
+    fn parse_embeddings_input_rejects_token_arrays() {
+        let err = parse_embeddings_input(json!([[1, 2, 3]])).expect_err("token array rejected");
+        assert!(err.to_string().contains("token array"));
+    }
+
+    #[test]
+    fn normalize_embedding_returns_unit_vector() {
+        let embedding = normalize_embedding(vec![3.0, 4.0]).expect("normalized");
+        let norm = embedding.iter().map(|v| v * v).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn mean_pooling_uses_attention_mask() {
+        let pooled = pool_embedding_values(
+            &[1.0, 2.0, 3.0, 4.0, 100.0, 200.0],
+            3,
+            2,
+            EmbeddingPooling::Mean,
+            &[1, 1, 0],
+        )
+        .expect("pooled");
+        assert_eq!(pooled, vec![2.0, 3.0]);
+    }
+
+    #[test]
+    fn last_token_pooling_returns_final_position() {
+        let pooled = pool_embedding_values(
+            &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            3,
+            2,
+            EmbeddingPooling::LastToken,
+            &[1, 1, 1],
+        )
+        .expect("pooled");
+        assert_eq!(pooled, vec![5.0, 6.0]);
+    }
+
+    #[test]
+    fn embeddings_route_requires_loaded_model() {
+        let req: EmbeddingsRequest =
+            serde_json::from_value(json!({"input": "hello"})).expect("request");
+        let mut loaded = None;
+        let res = handle_embeddings_request(req, &mut loaded, 32);
+        assert_eq!(res.0, 400);
+        assert_eq!(res.1["error"]["code"], "model_not_loaded");
+    }
+
+    #[test]
+    fn embeddings_route_rejects_invalid_encoding_format() {
+        let req: EmbeddingsRequest =
+            serde_json::from_value(json!({"input": "hello", "encoding_format": "base64"}))
+                .expect("request");
+        let mut loaded = None;
+
+        let res = handle_embeddings_request(req, &mut loaded, 32);
+        assert_eq!(res.0, 400);
+        assert_eq!(res.1["error"]["code"], "invalid_encoding_format");
+    }
+
+    #[test]
+    fn embeddings_route_rejects_token_arrays() {
+        let req: EmbeddingsRequest =
+            serde_json::from_value(json!({"input": [[1, 2, 3]]})).expect("request");
+        let mut loaded = None;
+
+        let res = handle_embeddings_request(req, &mut loaded, 32);
+        assert_eq!(res.0, 400);
+        assert_eq!(res.1["error"]["code"], "invalid_request");
+    }
+
+    #[test]
+    fn embedding_response_uses_openai_shape() {
+        let body = embedding_response("test-model".into(), vec![vec![0.6, 0.8], vec![1.0, 0.0]], 4);
+        assert_eq!(body["object"], "list");
+        assert_eq!(body["model"], "test-model");
+        assert_eq!(body["data"].as_array().expect("data").len(), 2);
+        assert_eq!(body["usage"]["prompt_tokens"], 4);
+        assert_eq!(body["usage"]["total_tokens"], 4);
+
+        let embedding = body["data"][0]["embedding"]
+            .as_array()
+            .expect("embedding array")
+            .iter()
+            .map(|v| v.as_f64().expect("f64"))
+            .collect::<Vec<_>>();
+        assert!((embedding[0] - 0.6).abs() < 1e-6);
+        assert!((embedding[1] - 0.8).abs() < 1e-6);
+    }
 }

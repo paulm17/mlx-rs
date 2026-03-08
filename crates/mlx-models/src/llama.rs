@@ -3,9 +3,7 @@
 //! Follows candle's llama.rs pattern: Config → Attention → MLP → Block → Llama.
 
 use mlx_core::{Array, Module, Result};
-use mlx_nn::{
-    Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, RopeScaling, VarBuilder,
-};
+use mlx_nn::{Embedding, KvCache, Linear, QuantConfig, RmsNorm, RoPE, RopeScaling, VarBuilder};
 
 // ------------------------------------------------------------------
 // Config
@@ -40,11 +38,21 @@ pub struct QuantizationConfig {
     pub bits: i32,
 }
 
-fn default_eps() -> f32 { 1e-5 }
-fn default_rope_theta() -> f32 { 10_000.0 }
-fn default_max_pos() -> usize { 4096 }
-fn default_group_size() -> i32 { 64 }
-fn default_bits() -> i32 { 4 }
+fn default_eps() -> f32 {
+    1e-5
+}
+fn default_rope_theta() -> f32 {
+    10_000.0
+}
+fn default_max_pos() -> usize {
+    4096
+}
+fn default_group_size() -> i32 {
+    64
+}
+fn default_bits() -> i32 {
+    4
+}
 
 impl LlamaConfig {
     pub fn num_kv_heads(&self) -> usize {
@@ -154,9 +162,11 @@ impl CausalSelfAttention {
         let attn = q.fast_scaled_dot_product_attention(&k, &v, self.scale, mask_mode, None)?;
 
         // Reshape back to [B, seq, hidden]
-        let attn = attn
-            .transpose_axes(&[0, 2, 1, 3])?
-            .reshape(&[b, seq_len, (self.num_heads * self.head_dim) as i32])?;
+        let attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            b,
+            seq_len,
+            (self.num_heads * self.head_dim) as i32,
+        ])?;
 
         self.o_proj.forward(&attn)
     }
@@ -290,6 +300,17 @@ impl Llama {
 
         h = self.norm.forward(&h)?;
         self.lm_head.forward(&h)
+    }
+
+    /// Forward pass. Returns normalized hidden states for all input tokens.
+    pub fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        let mut h = self.embed_tokens.forward(input_ids)?;
+
+        for layer in &mut self.layers {
+            h = layer.forward(&h)?;
+        }
+
+        self.norm.forward(&h)
     }
 
     /// Forward pass. Returns logits for the last token.

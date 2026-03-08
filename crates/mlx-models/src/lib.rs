@@ -3,17 +3,19 @@
 //! Each model follows candle's pattern: Config → Layer → Block → Model.
 //! Models are loaded via `VarBuilder` with `pp()` prefix scoping.
 
-pub mod llama;
+pub mod bert;
 pub mod lfm2_moe;
 pub mod lfm2_moe_python_port;
+pub mod llama;
 pub mod qwen3;
 pub mod qwen3_5;
 pub mod qwen3_moe;
 pub mod qwen3_moe_python_port;
 
-pub use llama::{Llama, LlamaConfig};
+pub use bert::{Bert, BertConfig};
 pub use lfm2_moe::{Lfm2Moe, Lfm2MoeConfig};
 pub use lfm2_moe_python_port::{Lfm2MoePythonPort, Lfm2MoePythonPortConfig};
+pub use llama::{Llama, LlamaConfig};
 pub use qwen3::{Qwen3, Qwen3Config};
 pub use qwen3_5::{Qwen35, Qwen35Config};
 pub use qwen3_moe::{MoeProfileStats, Qwen3Moe, Qwen3MoeConfig};

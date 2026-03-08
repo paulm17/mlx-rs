@@ -30,7 +30,11 @@ impl Default for Sampler {
 
 impl Sampler {
     pub fn new(temperature: f32, top_p: f32) -> Self {
-        Self { temperature, top_p, ..Self::default() }
+        Self {
+            temperature,
+            top_p,
+            ..Self::default()
+        }
     }
 
     pub fn with_greedy_tie_break(mut self, epsilon: f32) -> Self {
@@ -153,8 +157,13 @@ impl Sampler {
         self.sample_raw_last_token_logits_array_at_step(logits, 0)
     }
 
-    pub fn sample_raw_last_token_logits_array_at_step(&self, logits: &Array, generated: usize) -> Result<Array> {
-        if self.greedy_tie_epsilon.is_none() || generated < self.greedy_tie_break_after.unwrap_or(0) {
+    pub fn sample_raw_last_token_logits_array_at_step(
+        &self,
+        logits: &Array,
+        generated: usize,
+    ) -> Result<Array> {
+        if self.greedy_tie_epsilon.is_none() || generated < self.greedy_tie_break_after.unwrap_or(0)
+        {
             let axis = logits.ndim().saturating_sub(1) as i32;
             let idx = logits.argmax(axis)?;
             let idx = Self::squeeze_all_singletons(idx)?;
@@ -190,7 +199,9 @@ impl Sampler {
         if self.is_greedy() {
             // Greedy decoding should be pure argmax (no repetition penalty),
             // and should not apply repetition penalties.
-            if self.greedy_tie_epsilon.is_none() || history.len() < self.greedy_tie_break_after.unwrap_or(0) {
+            if self.greedy_tie_epsilon.is_none()
+                || history.len() < self.greedy_tie_break_after.unwrap_or(0)
+            {
                 let idx = logits.argmax(0)?;
                 return match idx.item_u32() {
                     Ok(v) => Ok(v),
@@ -227,10 +238,7 @@ impl Sampler {
         if logits.is_empty() {
             return Vec::new();
         }
-        let max_v = logits
-            .iter()
-            .copied()
-            .fold(f32::NEG_INFINITY, f32::max);
+        let max_v = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
         let mut exps = Vec::with_capacity(logits.len());
         let mut sum = 0.0f32;
         for &v in logits {
@@ -250,7 +258,10 @@ impl Sampler {
         }
         let penalty = self.repetition_penalty;
         let window_start = history.len().saturating_sub(self.repeat_last_n);
-        let seen: HashSet<usize> = history[window_start..].iter().map(|&t| t as usize).collect();
+        let seen: HashSet<usize> = history[window_start..]
+            .iter()
+            .map(|&t| t as usize)
+            .collect();
         for idx in seen {
             if let Some(v) = logits.get_mut(idx) {
                 if *v > 0.0 {

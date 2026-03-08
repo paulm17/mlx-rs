@@ -31,7 +31,7 @@ pub use array::Array;
 pub use device::Device;
 pub use dtype::DType;
 pub use error::{Error, Result};
-pub use ops::{eval, async_eval};
+pub use ops::{async_eval, eval};
 pub use shape::{IntoShape, Shape};
 pub use stream::{DefaultStreamGuard, Stream};
 
