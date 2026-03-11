@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 import argparse
 import json
+import os
 import time
+import tomllib
 from pathlib import Path
 
 import mlx.core as mx
 import numpy as np
+from huggingface_hub import snapshot_download
 
 from mlx_lm.generate import generate_step
 from mlx_lm.sample_utils import make_sampler
@@ -58,9 +61,63 @@ def get_eos_ids(config: dict):
         return [int(x) for x in eos]
     return [int(eos)]
 
+
+def load_hf_token(root_dir: Path) -> str | None:
+    for env_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
+        value = os.environ.get(env_name, "").strip()
+        if value:
+            return value
+
+    config_path = root_dir / "config.toml"
+    if not config_path.exists():
+        return None
+
+    try:
+        data = tomllib.loads(config_path.read_text())
+    except Exception:
+        return None
+
+    token = ((data.get("huggingface") or {}).get("hf_token") or "").strip()
+    return token or None
+
+
+def find_cached_snapshot(model: str) -> Path | None:
+    expanded = Path(os.path.expanduser(model))
+    if expanded.exists():
+        return expanded
+
+    hub_root = Path.home() / ".cache" / "huggingface" / "hub"
+    candidate = hub_root / f"models--{model.replace('/', '--')}"
+    snapshots = candidate / "snapshots"
+    if not snapshots.is_dir():
+        return None
+
+    dirs = sorted(path for path in snapshots.iterdir() if path.is_dir())
+    if not dirs:
+        return None
+    return dirs[-1]
+
+
+def resolve_model_dir(model: str, root_dir: Path) -> Path:
+    cached = find_cached_snapshot(model)
+    if cached is not None:
+        return cached
+
+    if "/" not in model:
+        return Path(model).expanduser()
+
+    local_dir = snapshot_download(
+        repo_id=model,
+        token=load_hf_token(root_dir),
+        local_dir=None,
+        local_dir_use_symlinks=False,
+    )
+    return Path(local_dir)
+
 def main():
     ap = argparse.ArgumentParser(description="Python generate script comparable to Rust generate")
-    ap.add_argument("--model-dir", required=True)
+    ap.add_argument("--model-dir")
+    ap.add_argument("--model")
     ap.add_argument("--prompt", required=True)
     ap.add_argument("--temperature", type=float, default=0.6)
     ap.add_argument("--top-p", type=float, default=0.9)
@@ -72,7 +129,12 @@ def main():
     ap.add_argument("--topk", type=int, default=8)
     args = ap.parse_args()
 
-    model_dir = Path(args.model_dir)
+    model_arg = args.model_dir or args.model
+    if not model_arg:
+        raise SystemExit("one of --model-dir or --model is required")
+
+    root_dir = Path(__file__).resolve().parents[1]
+    model_dir = resolve_model_dir(model_arg, root_dir)
     print(f'Loading model from "{model_dir}"...')
     model, config = load_model(model_dir, strict=False)
     tokenizer = load_tokenizer(model_dir, eos_token_ids=get_eos_ids(config))
@@ -101,7 +163,7 @@ def main():
     for token_arr, logprobs in generate_step(
         prompt_arr,
         model,
-        max_tokens=(args.max_tokens if args.max_tokens is not None else 256),
+        max_tokens=args.max_tokens,
         sampler=sampler,
     ):
         if args.trace_step is not None and abs(total_generated - args.trace_step) <= args.trace_window:

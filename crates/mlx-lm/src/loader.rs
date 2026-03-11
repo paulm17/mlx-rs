@@ -1,10 +1,74 @@
 use anyhow::Result;
+use hf_hub::api::sync::ApiBuilder;
 use mlx_core::DType;
 use mlx_nn::VarBuilder;
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::generate::ModelRuntime;
+
+#[derive(Debug, Clone, Default, serde::Deserialize)]
+pub struct HuggingFaceOptions {
+    pub hf_token: Option<String>,
+}
+
+fn looks_like_hf_repo_id(model: &str) -> bool {
+    !model.is_empty()
+        && !model.starts_with('.')
+        && !model.starts_with('~')
+        && !Path::new(model).is_absolute()
+        && model.matches('/').count() == 1
+}
+
+pub fn resolve_model_dir(model: &str, hf: Option<&HuggingFaceOptions>) -> Result<PathBuf> {
+    let path = PathBuf::from(model);
+    if path.exists() {
+        return Ok(path);
+    }
+
+    if !looks_like_hf_repo_id(model) {
+        anyhow::bail!("model path does not exist: {model}");
+    }
+
+    let token = hf
+        .and_then(|cfg| cfg.hf_token.as_ref())
+        .map(|token| token.trim())
+        .filter(|token| !token.is_empty())
+        .map(ToOwned::to_owned);
+
+    eprintln!("Resolving model from Hugging Face repo {model} ...");
+    let api = ApiBuilder::from_env()
+        .with_token(token)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to initialize Hugging Face client: {e}"))?;
+    let repo = api.model(model.to_string());
+    let info = repo
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to query Hugging Face repo {model}: {e}"))?;
+
+    for sibling in &info.siblings {
+        let filename = sibling.rfilename.as_str();
+        if filename.ends_with('/') || filename == ".gitattributes" {
+            continue;
+        }
+        repo.download(filename).map_err(|e| {
+            anyhow::anyhow!("failed to download {filename} from Hugging Face repo {model}: {e}")
+        })?;
+    }
+
+    let snapshot_dir = repo
+        .get("config.json")
+        .map_err(|e| anyhow::anyhow!("failed to locate config.json for {model}: {e}"))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("invalid cached snapshot layout for {model}"))?;
+
+    eprintln!(
+        "Resolved Hugging Face repo {} to local snapshot {:?}",
+        model, snapshot_dir
+    );
+    Ok(snapshot_dir)
+}
 
 fn parse_env_usize(name: &str) -> Option<usize> {
     std::env::var(name)

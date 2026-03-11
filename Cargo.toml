@@ -18,6 +18,7 @@ minijinja = { version = "2", features = ["loader"] }
 clap = { version = "4", features = ["derive"] }
 bindgen = "0.69"
 rand = "0.8"
+hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 
 [package]
 name = "mlx-rs"
