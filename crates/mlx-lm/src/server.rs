@@ -11,6 +11,10 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::Duration;
 use std::time::Instant;
 
 struct LoadedModel {
@@ -743,6 +747,30 @@ fn write_json(stream: &mut TcpStream, status: u16, value: serde_json::Value) -> 
     Ok(())
 }
 
+fn write_processing_status(stream: &mut TcpStream) -> Result<()> {
+    stream.write_all(b"HTTP/1.1 102 Processing\r\n\r\n")?;
+    stream.flush()?;
+    Ok(())
+}
+
+fn spawn_load_heartbeat(stream: &TcpStream) -> Result<(Arc<AtomicBool>, thread::JoinHandle<()>)> {
+    let mut heartbeat_stream = stream.try_clone()?;
+    let running = Arc::new(AtomicBool::new(true));
+    let keep_running = Arc::clone(&running);
+    let handle = thread::spawn(move || {
+        while keep_running.load(Ordering::Relaxed) {
+            thread::sleep(Duration::from_secs(2));
+            if !keep_running.load(Ordering::Relaxed) {
+                break;
+            }
+            if write_processing_status(&mut heartbeat_stream).is_err() {
+                break;
+            }
+        }
+    });
+    Ok((running, handle))
+}
+
 fn write_chunk(stream: &mut TcpStream, bytes: &[u8]) -> Result<()> {
     let header = format!("{:X}\r\n", bytes.len());
     stream.write_all(header.as_bytes())?;
@@ -955,16 +983,38 @@ fn handle_request(
                 Ok(v) => v,
                 Err(e) => return Some((400, error_json("invalid_json", format!("bad JSON: {e}")))),
             };
+            if let Err(e) = write_processing_status(stream) {
+                return Some((
+                    500,
+                    error_json(
+                        "load_heartbeat_error",
+                        format!("failed to write initial heartbeat: {e}"),
+                    ),
+                ));
+            }
+            let heartbeat = match spawn_load_heartbeat(stream) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    return Some((
+                        500,
+                        error_json("load_heartbeat_error", format!("failed to start heartbeat: {e}")),
+                    ))
+                }
+            };
             let model_path = match resolve_model_dir(&parsed.model_path, Some(huggingface)) {
                 Ok(path) => path,
                 Err(e) => {
+                    if let Some((running, handle)) = heartbeat {
+                        running.store(false, Ordering::Relaxed);
+                        let _ = handle.join();
+                    }
                     return Some((
                         400,
                         error_json("model_resolve_error", format!("Model resolve error: {e}")),
                     ))
                 }
             };
-            match load_model(&model_path) {
+            let response = match load_model(&model_path) {
                 Ok((model, tokenizer)) => {
                     let next = LoadedModel {
                         model_dir: model_path,
@@ -973,13 +1023,18 @@ fn handle_request(
                     };
                     release_loaded_model(loaded);
                     *loaded = Some(next);
-                    Some((200, json!({"ok": true})))
+                    (200, json!({"ok": true}))
                 }
-                Err(e) => Some((
+                Err(e) => (
                     400,
                     error_json("model_load_error", format!("Model load error: {e}")),
-                )),
+                ),
+            };
+            if let Some((running, handle)) = heartbeat {
+                running.store(false, Ordering::Relaxed);
+                let _ = handle.join();
             }
+            Some(response)
         }
         ("POST", "/llm/unload") => {
             release_loaded_model(loaded);

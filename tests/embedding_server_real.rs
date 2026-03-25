@@ -50,30 +50,35 @@ fn start_server(port: u16, config_path: &PathBuf) -> Child {
 fn read_response(mut stream: TcpStream) -> (u16, Vec<u8>) {
     let mut buf = Vec::new();
     stream.read_to_end(&mut buf).expect("read response");
+    let mut cursor = 0usize;
+    loop {
+        let header_rel_end = buf[cursor..]
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .expect("header terminator");
+        let header_end = cursor + header_rel_end + 4;
+        let header_text = String::from_utf8_lossy(&buf[cursor..header_end]);
+        let status = header_text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|status| status.parse::<u16>().ok())
+            .expect("status code");
+        if (100..200).contains(&status) {
+            cursor = header_end;
+            continue;
+        }
 
-    let header_end = buf
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .expect("header terminator")
-        + 4;
-    let header_text = String::from_utf8_lossy(&buf[..header_end]);
-    let status = header_text
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().nth(1))
-        .and_then(|status| status.parse::<u16>().ok())
-        .expect("status code");
-
-    let body = if header_text
-        .to_ascii_lowercase()
-        .contains("transfer-encoding: chunked")
-    {
-        decode_chunked_body(&buf[header_end..])
-    } else {
-        buf[header_end..].to_vec()
-    };
-
-    (status, body)
+        let body = if header_text
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked")
+        {
+            decode_chunked_body(&buf[header_end..])
+        } else {
+            buf[header_end..].to_vec()
+        };
+        return (status, body);
+    }
 }
 
 fn decode_chunked_body(data: &[u8]) -> Vec<u8> {

@@ -1,9 +1,12 @@
 use anyhow::Result;
 use hf_hub::api::sync::ApiBuilder;
+use hf_hub::Cache;
 use mlx_core::DType;
 use mlx_nn::VarBuilder;
 use serde_json::Value;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::generate::ModelRuntime;
 
@@ -20,6 +23,69 @@ fn looks_like_hf_repo_id(model: &str) -> bool {
         && model.matches('/').count() == 1
 }
 
+fn cached_hf_snapshot_dir(model: &str) -> Option<PathBuf> {
+    if let Some(snapshot_dir) = Cache::from_env()
+        .model(model.to_string())
+        .get("config.json")
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        return Some(snapshot_dir);
+    }
+
+    let cache_root = Cache::from_env().path().clone();
+    let repo_dir = cache_root.join(format!("models--{}", model.replace('/', "--")));
+    let snapshots_dir = repo_dir.join("snapshots");
+    if !snapshots_dir.is_dir() {
+        return None;
+    }
+    let mut snapshots = std::fs::read_dir(&snapshots_dir)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir() && path.join("config.json").is_file())
+        .collect::<Vec<_>>();
+
+    snapshots.sort_by_key(|path| {
+        std::fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or(SystemTime::UNIX_EPOCH)
+    });
+    snapshots.pop()
+}
+
+fn resolved_model_map_path() -> PathBuf {
+    Cache::from_env().path().join("mlx-rs-resolved-models.json")
+}
+
+fn read_resolved_model_map() -> HashMap<String, String> {
+    let path = resolved_model_map_path();
+    std::fs::read_to_string(path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<HashMap<String, String>>(&raw).ok())
+        .unwrap_or_default()
+}
+
+fn read_persisted_snapshot_dir(model: &str) -> Option<PathBuf> {
+    let path = PathBuf::from(read_resolved_model_map().get(model)?.clone());
+    if path.join("config.json").is_file() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn persist_snapshot_dir(model: &str, snapshot_dir: &Path) {
+    let mut resolved = read_resolved_model_map();
+    resolved.insert(model.to_string(), snapshot_dir.display().to_string());
+    let path = resolved_model_map_path();
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(raw) = serde_json::to_vec_pretty(&resolved) {
+        let _ = std::fs::write(path, raw);
+    }
+}
+
 pub fn resolve_model_dir(model: &str, hf: Option<&HuggingFaceOptions>) -> Result<PathBuf> {
     let path = PathBuf::from(model);
     if path.exists() {
@@ -29,6 +95,28 @@ pub fn resolve_model_dir(model: &str, hf: Option<&HuggingFaceOptions>) -> Result
     if !looks_like_hf_repo_id(model) {
         anyhow::bail!("model path does not exist: {model}");
     }
+
+    if let Some(snapshot_dir) = read_persisted_snapshot_dir(model) {
+        eprintln!(
+            "Using persisted Hugging Face snapshot for {} at {:?}",
+            model, snapshot_dir
+        );
+        return Ok(snapshot_dir);
+    }
+
+    if let Some(snapshot_dir) = cached_hf_snapshot_dir(model) {
+        eprintln!(
+            "Using cached Hugging Face snapshot for {} at {:?}",
+            model, snapshot_dir
+        );
+        persist_snapshot_dir(model, &snapshot_dir);
+        return Ok(snapshot_dir);
+    }
+    eprintln!(
+        "No cached Hugging Face snapshot found for {} in {:?}",
+        model,
+        Cache::from_env().path()
+    );
 
     let token = hf
         .and_then(|cfg| cfg.hf_token.as_ref())
@@ -67,6 +155,7 @@ pub fn resolve_model_dir(model: &str, hf: Option<&HuggingFaceOptions>) -> Result
         "Resolved Hugging Face repo {} to local snapshot {:?}",
         model, snapshot_dir
     );
+    persist_snapshot_dir(model, &snapshot_dir);
     Ok(snapshot_dir)
 }
 
@@ -337,6 +426,13 @@ pub fn load_model(
 mod tests {
     use super::*;
     use serde_json::json;
+    use std::fs;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+    }
 
     #[test]
     fn detects_bert_from_model_type() {
@@ -354,5 +450,64 @@ mod tests {
             detect_architecture(&config).unwrap(),
             ModelArch::Bert
         ));
+    }
+
+    #[test]
+    fn finds_cached_hf_snapshot_dir() {
+        let _guard = env_lock();
+        let unique = format!(
+            "mlx-rs-loader-cache-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let snapshot_dir = root
+            .join("hub")
+            .join("models--mlx-community--demo-model")
+            .join("snapshots")
+            .join("snapshot-a");
+        fs::create_dir_all(&snapshot_dir).expect("create snapshot dir");
+        fs::write(snapshot_dir.join("config.json"), "{}").expect("write config");
+        std::env::set_var("HF_HOME", &root);
+
+        let resolved = cached_hf_snapshot_dir("mlx-community/demo-model");
+
+        std::env::remove_var("HF_HOME");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(resolved, Some(snapshot_dir));
+    }
+
+    #[test]
+    fn finds_persisted_snapshot_dir() {
+        let _guard = env_lock();
+        let unique = format!(
+            "mlx-rs-loader-persisted-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        );
+        let root = std::env::temp_dir().join(unique);
+        let snapshot_dir = root
+            .join("hub")
+            .join("models--mlx-community--demo-model")
+            .join("snapshots")
+            .join("snapshot-a");
+        fs::create_dir_all(&snapshot_dir).expect("create snapshot dir");
+        fs::write(snapshot_dir.join("config.json"), "{}").expect("write config");
+        std::env::set_var("HF_HOME", &root);
+
+        persist_snapshot_dir("mlx-community/demo-model", &snapshot_dir);
+        let resolved = read_persisted_snapshot_dir("mlx-community/demo-model");
+
+        std::env::remove_var("HF_HOME");
+        let _ = fs::remove_dir_all(&root);
+
+        assert_eq!(resolved, Some(snapshot_dir));
     }
 }
