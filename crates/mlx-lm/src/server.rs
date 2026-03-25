@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
@@ -314,7 +314,10 @@ fn pool_embedding_values(
 fn mean_pool_embeddings_gpu(hidden_states: &Array, attention_masks: &[Vec<u32>]) -> Result<Array> {
     let shape = hidden_states.shape_raw();
     if shape.len() != 3 {
-        anyhow::bail!("expected rank-3 hidden states for mean pooling, got rank {}", shape.len());
+        anyhow::bail!(
+            "expected rank-3 hidden states for mean pooling, got rank {}",
+            shape.len()
+        );
     }
     let batch = shape[0] as usize;
     let seq_len = shape[1] as usize;
@@ -339,11 +342,7 @@ fn mean_pool_embeddings_gpu(hidden_states: &Array, attention_masks: &[Vec<u32>])
         .as_type(hidden_states.dtype())?;
     let summed = hidden_states.multiply(&mask)?.sum_axis(1, false)?;
     let counts = mask.sum_axis(1, false)?;
-    if counts
-        .to_vec_f32()?
-        .into_iter()
-        .any(|count| count <= 0.0)
-    {
+    if counts.to_vec_f32()?.into_iter().any(|count| count <= 0.0) {
         anyhow::bail!("attention mask excluded every token");
     }
     Ok(summed.divide(&counts)?)
@@ -458,7 +457,11 @@ fn compute_embeddings(
             for chunk in encoded_inputs.chunks(embeddings_batch_size.max(1)) {
                 loaded.model.clear_cache();
                 let batch = chunk.len();
-                let max_seq_len = chunk.iter().map(|encoded| encoded.ids.len()).max().unwrap_or(0);
+                let max_seq_len = chunk
+                    .iter()
+                    .map(|encoded| encoded.ids.len())
+                    .max()
+                    .unwrap_or(0);
                 let mut flat_input_ids = Vec::with_capacity(batch * max_seq_len);
                 let mut flat_attention_mask = Vec::with_capacity(batch * max_seq_len);
                 let mut attention_masks = Vec::with_capacity(batch);
@@ -494,8 +497,9 @@ fn compute_embeddings(
                 embeddings
                     .into_iter()
                     .map(|embedding| {
-                        embedding
-                            .ok_or_else(|| anyhow::anyhow!("missing embedding result after batching"))
+                        embedding.ok_or_else(|| {
+                            anyhow::anyhow!("missing embedding result after batching")
+                        })
                     })
                     .collect::<Result<Vec<_>>>()?,
                 prompt_tokens,
@@ -525,8 +529,8 @@ fn compute_embeddings(
                 flat_input_ids.extend(encoded.ids.iter().map(|v| *v as i32));
                 attention_masks.push(encoded.attention_mask.clone());
             }
-            let input = Array::from_slice_i32(&flat_input_ids)?
-                .reshape(&[batch as i32, seq_len as i32])?;
+            let input =
+                Array::from_slice_i32(&flat_input_ids)?.reshape(&[batch as i32, seq_len as i32])?;
             let hidden_states = loaded
                 .model
                 .forward_hidden_states(&input)
@@ -997,7 +1001,10 @@ fn handle_request(
                 Err(e) => {
                     return Some((
                         500,
-                        error_json("load_heartbeat_error", format!("failed to start heartbeat: {e}")),
+                        error_json(
+                            "load_heartbeat_error",
+                            format!("failed to start heartbeat: {e}"),
+                        ),
                     ))
                 }
             };
@@ -1011,7 +1018,7 @@ fn handle_request(
                     return Some((
                         400,
                         error_json("model_resolve_error", format!("Model resolve error: {e}")),
-                    ))
+                    ));
                 }
             };
             let response = match load_model(&model_path) {

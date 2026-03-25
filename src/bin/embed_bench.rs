@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 use mlx_core::Array;
-use mlx_lm::{EmbeddingPooling, EmbeddingModel, ModelRuntime};
+use mlx_lm::{EmbeddingModel, EmbeddingPooling, ModelRuntime};
 use serde::Serialize;
 use std::fs;
 use std::path::PathBuf;
@@ -193,7 +193,11 @@ fn run_pass(
         totals.forward_s += t1.elapsed().as_secs_f64();
 
         let t2 = Instant::now();
-        let embedding = pool_embedding(&hidden_states, model.embedding_pooling(), &encoded.attention_mask)?;
+        let embedding = pool_embedding(
+            &hidden_states,
+            model.embedding_pooling(),
+            &encoded.attention_mask,
+        )?;
         totals.pool_s += t2.elapsed().as_secs_f64();
 
         let t3 = Instant::now();

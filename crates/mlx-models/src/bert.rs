@@ -284,7 +284,11 @@ impl Bert {
         self.encode_masked(input_ids, None)
     }
 
-    pub fn encode_masked(&self, input_ids: &Array, attention_mask: Option<&Array>) -> Result<Array> {
+    pub fn encode_masked(
+        &self,
+        input_ids: &Array,
+        attention_mask: Option<&Array>,
+    ) -> Result<Array> {
         let mut hidden_states = self.embeddings.forward(input_ids)?;
         for layer in &self.layers {
             hidden_states = layer.forward(&hidden_states, attention_mask)?;

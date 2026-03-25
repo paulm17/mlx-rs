@@ -4,6 +4,7 @@
 //! Models are loaded via `VarBuilder` with `pp()` prefix scoping.
 
 pub mod bert;
+pub mod gemma3;
 pub mod lfm2_moe;
 pub mod lfm2_moe_python_port;
 pub mod llama;
@@ -13,6 +14,7 @@ pub mod qwen3_moe;
 pub mod qwen3_moe_python_port;
 
 pub use bert::{Bert, BertConfig};
+pub use gemma3::{Gemma3, Gemma3Config};
 pub use lfm2_moe::{Lfm2Moe, Lfm2MoeConfig};
 pub use lfm2_moe_python_port::{Lfm2MoePythonPort, Lfm2MoePythonPortConfig};
 pub use llama::{Llama, LlamaConfig};

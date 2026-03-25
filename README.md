@@ -91,6 +91,7 @@ What it does:
 
 Current modules:
 - `bert.rs`
+- `gemma3.rs`
 - `llama.rs`
 - `qwen3.rs`
 - `qwen3_moe.rs` (used for Qwen1.5/Qwen2 MoE style)
@@ -188,6 +189,8 @@ cargo run --bin mlx-server -- \
 
 - Bert encoder / embedding models
   - Example tested: `mlx-community/mxbai-embed-large-v1`
+- Gemma3 text
+  - Example tested: `mlx-community/gemma-3-text-12b-it-4bit`
 - Llama
   - Example tested: `mlx-community/Llama-3.2-1B-Instruct-4bit`
 - Qwen3 dense
@@ -207,6 +210,7 @@ Architecture is inferred from `config.json` using:
 
 Mapped runtime enums:
 - `Bert`
+- `Gemma3`
 - `Llama`
 - `Qwen3`
 - `Qwen35`

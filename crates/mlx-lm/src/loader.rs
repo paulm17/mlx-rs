@@ -197,6 +197,7 @@ fn configure_mlx_cache_policy() {
 #[derive(Debug, Clone)]
 pub enum ModelArch {
     Bert,
+    Gemma3,
     Llama,
     Qwen3,
     Qwen35,
@@ -212,6 +213,7 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
     if let Some(model_type) = config.get("model_type").and_then(|v| v.as_str()) {
         match model_type.to_lowercase().as_str() {
             "bert" => return Ok(ModelArch::Bert),
+            "gemma3" => return Ok(ModelArch::Gemma3),
             "llama" => return Ok(ModelArch::Llama),
             "qwen3_5" | "qwen3.5" => return Ok(ModelArch::Qwen35),
             "qwen3" => {
@@ -236,6 +238,16 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
         }
     }
 
+    if let Some(model_type) = config
+        .get("text_config")
+        .and_then(|v| v.get("model_type"))
+        .and_then(|v| v.as_str())
+    {
+        if model_type.eq_ignore_ascii_case("gemma3_text") {
+            return Ok(ModelArch::Gemma3);
+        }
+    }
+
     // Check architectures field
     if let Some(archs) = config.get("architectures").and_then(|v| v.as_array()) {
         for arch in archs {
@@ -246,6 +258,9 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 }
                 if lower.contains("bertmodel") || lower == "bert" {
                     return Ok(ModelArch::Bert);
+                }
+                if lower.contains("gemma3") {
+                    return Ok(ModelArch::Gemma3);
                 }
                 if lower.contains("llama") {
                     return Ok(ModelArch::Llama);
@@ -319,6 +334,33 @@ fn extend_stop_tokens_from_value(
     }
 }
 
+fn gemma3_text_config(config: &Value) -> Result<Value> {
+    let mut text = config
+        .get("text_config")
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("gemma3 config missing text_config"))?;
+
+    let text_obj = text
+        .as_object_mut()
+        .ok_or_else(|| anyhow::anyhow!("gemma3 text_config must be an object"))?;
+
+    for key in [
+        "quantization",
+        "quantization_config",
+        "eos_token_id",
+        "bos_token_id",
+        "tie_word_embeddings",
+    ] {
+        if let Some(value) = config.get(key) {
+            text_obj
+                .entry(key.to_string())
+                .or_insert_with(|| value.clone());
+        }
+    }
+
+    Ok(text)
+}
+
 fn load_stop_tokens(
     model_dir: &Path,
     tokenizer: crate::tokenizer::Tokenizer,
@@ -381,6 +423,11 @@ pub fn load_model(
             let cfg: mlx_models::BertConfig = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Bert::new(&cfg, &vb)?)
         }
+        ModelArch::Gemma3 => {
+            let cfg: mlx_models::Gemma3Config =
+                serde_json::from_value(gemma3_text_config(&config)?)?;
+            Box::new(mlx_models::Gemma3::new(&cfg, &vb)?)
+        }
         ModelArch::Llama => {
             let cfg: mlx_models::LlamaConfig = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Llama::new(&cfg, &vb)?)
@@ -431,7 +478,9 @@ mod tests {
 
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().expect("env lock")
+        LOCK.get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock")
     }
 
     #[test]
@@ -450,6 +499,54 @@ mod tests {
             detect_architecture(&config).unwrap(),
             ModelArch::Bert
         ));
+    }
+
+    #[test]
+    fn detects_gemma3_from_model_type() {
+        let config = json!({"model_type": "gemma3"});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Gemma3
+        ));
+    }
+
+    #[test]
+    fn detects_gemma3_from_nested_text_model_type() {
+        let config = json!({"text_config": {"model_type": "gemma3_text"}});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Gemma3
+        ));
+    }
+
+    #[test]
+    fn detects_gemma3_from_architecture() {
+        let config = json!({"architectures": ["Gemma3ForConditionalGeneration"]});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Gemma3
+        ));
+    }
+
+    #[test]
+    fn extracts_gemma3_nested_config_with_top_level_quantization() {
+        let config = json!({
+            "model_type": "gemma3",
+            "quantization": {"group_size": 64, "bits": 4},
+            "text_config": {
+                "hidden_size": 3840,
+                "intermediate_size": 15360,
+                "vocab_size": 262208,
+                "num_hidden_layers": 48,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 8
+            }
+        });
+        let nested = gemma3_text_config(&config).unwrap();
+        let cfg: mlx_models::Gemma3Config = serde_json::from_value(nested).unwrap();
+        assert_eq!(cfg.head_dim(), 240);
+        assert_eq!(cfg.sliding_window_pattern, 6);
+        assert_eq!(cfg.quantization.unwrap().bits, 4);
     }
 
     #[test]
@@ -509,5 +606,39 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
 
         assert_eq!(resolved, Some(snapshot_dir));
+    }
+
+    #[test]
+    #[ignore = "requires local MLX/Metal runtime and the Gemma snapshot to be available"]
+    fn loads_local_gemma3_snapshot_and_runs_forward() {
+        if !matches!(
+            std::env::var("MLX_RS_RUN_LOCAL_MODEL_TESTS").as_deref(),
+            Ok("1") | Ok("true") | Ok("TRUE")
+        ) {
+            return;
+        }
+        let model_dir = PathBuf::from("/Volumes/Data/Users/paul/.cache/huggingface/hub/models--mlx-community--gemma-3-text-12b-it-4bit/snapshots/83eda451975103fff6f11e97bf75cd0f1c61af2c");
+        if !model_dir.join("config.json").is_file() {
+            return;
+        }
+
+        let (mut model, _tokenizer) = load_model(&model_dir).expect("load gemma3 snapshot");
+        let prompt = mlx_core::Array::from_slice_i32(&[2, 42, 43])
+            .expect("prompt")
+            .reshape(&[1, 3])
+            .expect("prompt reshape");
+        let logits = model
+            .forward_last_token_logits(&prompt)
+            .expect("prefill forward");
+        assert_eq!(logits.ndim(), 3);
+
+        let decode = mlx_core::Array::from_slice_i32(&[44])
+            .expect("decode")
+            .reshape(&[1, 1])
+            .expect("decode reshape");
+        let next_logits = model
+            .forward_last_token_logits(&decode)
+            .expect("decode forward");
+        assert_eq!(next_logits.ndim(), 3);
     }
 }

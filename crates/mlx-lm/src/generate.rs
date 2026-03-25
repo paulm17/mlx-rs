@@ -176,6 +176,22 @@ impl EmbeddingModel for mlx_models::Llama {
     }
 }
 
+impl CausalLM for mlx_models::Gemma3 {
+    fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
+        self.forward_last_token_logits(input_ids)
+    }
+    fn clear_cache(&mut self) {
+        self.clear_cache();
+    }
+}
+
+impl EmbeddingModel for mlx_models::Gemma3 {
+    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+        self.forward_hidden_states(input_ids)
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+    }
+}
+
 impl CausalLM for mlx_models::Qwen3 {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         self.forward(input_ids)
