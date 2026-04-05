@@ -198,6 +198,7 @@ struct ChatRequest {
     temperature: Option<f32>,
     top_p: Option<f32>,
     stream: Option<bool>,
+    generate_title: Option<bool>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1125,6 +1126,36 @@ fn handle_request(
                         if let Some(e) = stream_error {
                             return Some((500, error_json("stream_write_error", e.to_string())));
                         }
+
+                        let mut title = None;
+                        if parsed.generate_title.unwrap_or(false) {
+                            if let Some(content) =
+                                parsed.messages.iter().find(|m| m.role == "user").map(|m| &m.content)
+                            {
+                                let title_messages = vec![
+                                    LmMessage::system("You are a helpful assistant that generates concise chat titles."),
+                                    LmMessage::user(&format!(
+                                        "Generate a 3 to 5 word title for this message. Reply with only the title, no punctuation or quotes: {}",
+                                        content
+                                    )),
+                                ];
+                                let options = ChatTemplateOptions {
+                                    add_generation_prompt: true,
+                                    continue_final_message: false,
+                                    enable_thinking: false,
+                                };
+                                if let Ok(title_prompt) = ChatTemplate::from_model_dir(&lm.model_dir)
+                                    .and_then(|t| t.apply(&title_messages, &options))
+                                {
+                                    if let Ok((generated_title, _)) =
+                                        pipeline.generate_with_metrics(&title_prompt, Some(12), |_, _| {})
+                                    {
+                                        title = Some(generated_title.trim().trim_matches('"').to_string());
+                                    }
+                                }
+                            }
+                        }
+
                         let finish_reason = if metrics.stop_reason == "length" {
                             "length"
                         } else {
@@ -1139,6 +1170,7 @@ fn handle_request(
                                 "delta": {},
                                 "finish_reason": finish_reason
                             }],
+                            "title": title,
                             "usage": {
                                 "prompt_tokens": prompt_token_count,
                                 "completion_tokens": metrics.tokens,
@@ -1171,6 +1203,35 @@ fn handle_request(
 
             match pipeline.generate_with_metrics(&prompt, max_tokens, |_token, _piece| {}) {
                 Ok((text, metrics)) => {
+                    let mut title = None;
+                    if parsed.generate_title.unwrap_or(false) {
+                        if let Some(content) =
+                            parsed.messages.iter().find(|m| m.role == "user").map(|m| &m.content)
+                        {
+                            let title_messages = vec![
+                                LmMessage::system("You are a helpful assistant that generates concise chat titles."),
+                                LmMessage::user(&format!(
+                                    "Generate a 3 to 5 word title for this message. Reply with only the title, no punctuation or quotes: {}",
+                                    content
+                                )),
+                            ];
+                            let options = ChatTemplateOptions {
+                                add_generation_prompt: true,
+                                continue_final_message: false,
+                                enable_thinking: false,
+                            };
+                            if let Ok(title_prompt) = ChatTemplate::from_model_dir(&lm.model_dir)
+                                .and_then(|t| t.apply(&title_messages, &options))
+                            {
+                                if let Ok((generated_title, _)) =
+                                    pipeline.generate_with_metrics(&title_prompt, Some(12), |_, _| {})
+                                {
+                                    title = Some(generated_title.trim().trim_matches('"').to_string());
+                                }
+                            }
+                        }
+                    }
+
                     let finish_reason = if metrics.stop_reason == "length" {
                         "length"
                     } else {
@@ -1186,6 +1247,7 @@ fn handle_request(
                                 "message": {"role": "assistant", "content": text},
                                 "finish_reason": finish_reason
                             }],
+                            "title": title,
                             "usage": {
                                 "prompt_tokens": prompt_token_count,
                                 "completion_tokens": metrics.tokens,
