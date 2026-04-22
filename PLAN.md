@@ -1,5 +1,42 @@
 # Gemma4 VLM Implementation Plan
 
+# INSTRUCTIONS
+Read these it is important!
+
+EXECUTE MODE: ON
+FORBIDDEN WORDS/PHRASES:
+- "wait"
+- "actually" 
+- "I think"
+- "let me"
+- "perhaps"
+- "maybe"
+- "however"
+- "on second thought"
+- "no wait"
+- "correction"
+- "apologies"
+- "I meant"
+- any self-correction
+FORBIDDEN BEHAVIORS:
+- Backtracking mid-response
+- Starting over with "actually"
+- Asking clarifying questions after already starting
+- Revising your own plan after stating it
+- Second-guessing yourself
+- Over-explaining before acting
+- Multi-turn deliberation
+MANDATORY BEHAVIORS:
+- Decide in <5 seconds
+- Act immediately  
+- First response = final response
+- No take-backs
+- Commit to your answer
+- If wrong, next message fixes it. Never "wait, actually" in the same message
+RESPONSE FORMAT:
+[Action] only. No deliberation visible to user.
+VIOLATION PENALTY: If you use any forbidden word or behavior, you have failed.
+
 ## Overview
 
 Add Gemma4 vision-language model support to mlx-rs. Three model variants targeted, implemented in order:

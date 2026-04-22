@@ -134,6 +134,72 @@ struct NamedTemplate {
 }
 
 // -----------------------------------------------------------------------
+// Helpers
+// -----------------------------------------------------------------------
+
+/// Pre-process a Jinja template to make it compatible with minijinja.
+/// Minijinja does not support `.get()` on maps, but bracket access
+/// with missing keys returns `Undefined`, which behaves similarly in
+/// conditionals.
+fn preprocess_jinja_for_minijinja(template: &str) -> String {
+    let result = template.to_string();
+    // Replace .get('key') with ['key']
+    // Use a simple regex-like approach with manual scanning
+    let mut output = String::with_capacity(result.len());
+    let chars: Vec<char> = result.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        if i + 5 < chars.len()
+            && chars[i] == '.'
+            && chars[i + 1] == 'g'
+            && chars[i + 2] == 'e'
+            && chars[i + 3] == 't'
+            && chars[i + 4] == '('
+        {
+            // Found .get(
+            let start = i;
+            i += 5; // skip .get(
+            // Skip whitespace
+            while i < chars.len() && chars[i].is_whitespace() {
+                i += 1;
+            }
+            // Expect quote
+            if i < chars.len() && (chars[i] == '\'' || chars[i] == '"') {
+                let quote = chars[i];
+                i += 1;
+                let key_start = i;
+                while i < chars.len() && chars[i] != quote {
+                    i += 1;
+                }
+                if i < chars.len() {
+                    let key = &result[key_start..i];
+                    i += 1; // skip closing quote
+                    // Skip whitespace
+                    while i < chars.len() && chars[i].is_whitespace() {
+                        i += 1;
+                    }
+                    if i < chars.len() && chars[i] == ')' {
+                        i += 1; // skip )
+                        output.push('[');
+                        output.push(quote);
+                        output.push_str(key);
+                        output.push(quote);
+                        output.push(']');
+                        continue;
+                    }
+                }
+            }
+            // If we get here, it wasn't a simple .get('key') — copy raw
+            output.push_str(&result[start..i]);
+        } else {
+            output.push(chars[i]);
+            i += 1;
+        }
+    }
+    output
+}
+
+// -----------------------------------------------------------------------
 // ChatTemplate
 // -----------------------------------------------------------------------
 
@@ -161,6 +227,7 @@ impl ChatTemplate {
         });
 
         let tmpl: String = template.into();
+        let tmpl = preprocess_jinja_for_minijinja(&tmpl);
         env.add_template_owned("chat".to_string(), tmpl)
             .map_err(|e| ChatTemplateError::Template(e.to_string()))?;
 
@@ -549,4 +616,6 @@ mod tests {
         let result = template.apply_for_generation(&messages).unwrap();
         assert!(result.contains("user: test"));
     }
+
+
 }

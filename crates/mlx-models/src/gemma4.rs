@@ -600,7 +600,7 @@ fn apply_multidimensional_rope(
 struct Gemma4Attention {
     q_proj: Linear,
     k_proj: Linear,
-    v_proj: Linear,
+    v_proj: Option<Linear>,
     o_proj: Linear,
     q_norm: RmsNormZeroShift,
     k_norm: RmsNormZeroShift,
@@ -615,6 +615,7 @@ struct Gemma4Attention {
     rope_theta: f32,
     partial_rotary_factor: f32,
     sliding_window: usize,
+    k_eq_v: bool,
 }
 
 impl Gemma4Attention {
@@ -630,16 +631,25 @@ impl Gemma4Attention {
 
         let q_proj = Linear::new(&vb_attn.pp("q_proj"), &qc)?;
         let k_proj = Linear::new(&vb_attn.pp("k_proj"), &qc)?;
-        let v_proj = Linear::new(&vb_attn.pp("v_proj"), &qc)?;
+
+        let k_eq_v = cfg.attention_k_eq_v && !is_sliding;
+        let v_proj = if k_eq_v {
+            None
+        } else {
+            Some(Linear::new(&vb_attn.pp("v_proj"), &qc)?)
+        };
+
         let o_proj = Linear::new(&vb_attn.pp("o_proj"), &qc)?;
-
-
 
         let q_norm = RmsNormZeroShift::new(&vb_attn.pp("q_norm"), cfg.rms_norm_eps as f32)?;
         let k_norm = RmsNormZeroShift::new(&vb_attn.pp("k_norm"), cfg.rms_norm_eps as f32)?;
         let v_norm = RmsNormNoScale::new(&vb_attn.pp("v_norm"), cfg.rms_norm_eps as f32)?;
 
-        let n_kv_heads = cfg.num_key_value_heads;
+        let n_kv_heads = if is_sliding {
+            cfg.num_key_value_heads
+        } else {
+            cfg.num_global_key_value_heads.unwrap_or(cfg.num_key_value_heads)
+        };
         let scale = 1.0;
 
         let first_kv_shared_layer_idx = cfg.num_hidden_layers.saturating_sub(cfg.num_kv_shared_layers);
@@ -688,6 +698,7 @@ impl Gemma4Attention {
             rope_theta: rope_params.rope_theta,
             partial_rotary_factor: rope_params.partial_rotary_factor,
             sliding_window: cfg.sliding_window,
+            k_eq_v,
         })
     }
 
@@ -715,8 +726,11 @@ impl Gemma4Attention {
             cache.fetch()?
         } else {
             let k = self.k_proj.forward(x)?;
-            let v = self.v_proj.forward(x)?;
-
+            let v = if self.k_eq_v {
+                self.k_proj.forward(x)?
+            } else {
+                self.v_proj.as_ref().unwrap().forward(x)?
+            };
 
             let k = k
                 .reshape(&[b, seq_len, self.n_kv_heads as i32, self.head_dim as i32])?
@@ -724,7 +738,6 @@ impl Gemma4Attention {
             let v = v
                 .reshape(&[b, seq_len, self.n_kv_heads as i32, self.head_dim as i32])?
                 .transpose_axes(&[0, 2, 1, 3])?;
-
 
             let k = self.k_norm.forward(&k)?;
             let v = self.v_norm.forward(&v)?;
@@ -1494,6 +1507,8 @@ struct VisionModel {
     pooler: VisionPooler,
     layers: Vec<VisionEncoderLayer>,
     norm: Option<VisionRmsNorm>,
+    std_bias: Option<Array>,
+    std_scale: Option<Array>,
 }
 
 impl VisionModel {
@@ -1512,11 +1527,25 @@ impl VisionModel {
             None
         };
 
+        let std_bias = if vb.contains("std_bias") {
+            Some(vb.get("std_bias")?)
+        } else {
+            None
+        };
+
+        let std_scale = if vb.contains("std_scale") {
+            Some(vb.get("std_scale")?)
+        } else {
+            None
+        };
+
         Ok(Self {
             patch_embedder: VisionPatchEmbedder::new(&vb.pp("patch_embedder"), cfg)?,
             pooler: VisionPooler::new(&vb.pp("pooler"), cfg)?,
             layers,
             norm,
+            std_bias,
+            std_scale,
         })
     }
 
@@ -1529,6 +1558,12 @@ impl VisionModel {
         let num_patches = num_patches_h * num_patches_w;
 
         let (mut features, pos_emb) = self.patch_embedder.forward(images)?;
+
+        if let (Some(ref bias), Some(ref scale)) = (&self.std_bias, &self.std_scale) {
+            features = features.subtract(bias)?;
+            features = features.divide(scale)?;
+        }
+
         features = features.add(&pos_emb)?;
 
         let mut pos_h = Vec::with_capacity(num_patches as usize);
