@@ -846,6 +846,214 @@ impl Gemma4Mlp {
 }
 
 // ------------------------------------------------------------------
+// MoE components
+// ------------------------------------------------------------------
+
+struct Router {
+    proj: Linear,
+    scale: Array,
+    per_expert_scale: Array,
+    top_k: usize,
+    root_size: f32,
+}
+
+impl Router {
+    fn load(vb: &VarBuilder, cfg: &Gemma4TextConfig) -> anyhow::Result<Self> {
+        let qc = QuantConfig::default();
+        let proj = Linear::new(&vb.pp("proj"), &qc)?;
+        let scale = vb.get("scale")?;
+        let per_expert_scale = vb.get("per_expert_scale")?;
+        Ok(Self {
+            proj,
+            scale,
+            per_expert_scale,
+            top_k: cfg.top_k_experts.unwrap_or(1),
+            root_size: (cfg.hidden_size as f32).powf(-0.5),
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<(Array, Array)> {
+        let shape = x.shape_raw();
+        let hidden = shape[shape.len() - 1];
+        let flat = x.reshape(&[-1, hidden])?;
+
+        // norm(x) * root_size * scale
+        let mut h = flat.fast_rms_norm(
+            &Array::ones(&[hidden], flat.dtype())?,
+            1e-6,
+        )?;
+        h = h.multiply(&Array::from_float(self.root_size)?)?;
+        h = h.multiply(&self.scale)?;
+
+        let logits = self.proj.forward(&h)?;
+        let probs = logits.softmax(-1)?;
+
+        let kth = (self.top_k - 1) as i32;
+        let neg_logits = logits.negative()?;
+        let partition = neg_logits.argpartition(kth, -1)?;
+        let top_k_indices = partition.slice(&[0, 0], &[partition.shape_raw()[0], self.top_k as i32])?;
+
+        let mut top_k_weights = probs.take_along_axis(&top_k_indices, -1)?;
+        let denom = top_k_weights.sum_axis(-1, true)?;
+        top_k_weights = top_k_weights.divide(&denom)?;
+
+        let expert_scale = self.per_expert_scale.reshape(&[1, self.per_expert_scale.shape_raw()[0]])?
+            .take_along_axis(&top_k_indices, -1)?;
+        top_k_weights = top_k_weights.multiply(&expert_scale)?;
+
+        Ok((top_k_indices, top_k_weights))
+    }
+}
+
+fn infer_bits(weight_shape: &[i32], scales_shape: &[i32], group_size: i32, fallback: i32) -> i32 {
+    let packed = weight_shape.last().copied().unwrap_or(0) as i64;
+    let n_groups = scales_shape.last().copied().unwrap_or(0) as i64;
+    if packed <= 0 || n_groups <= 0 || group_size <= 0 {
+        return fallback;
+    }
+    let unpacked = n_groups * group_size as i64;
+    if unpacked <= 0 {
+        return fallback;
+    }
+    let num = packed * 32;
+    if num % unpacked != 0 {
+        return fallback;
+    }
+    match (num / unpacked) as i32 {
+        2 | 4 | 8 => (num / unpacked) as i32,
+        _ => fallback,
+    }
+}
+
+struct SwitchLinear {
+    weight: Array,
+    scales: Option<Array>,
+    biases: Option<Array>,
+    bias: Option<Array>,
+    group_size: i32,
+    bits: i32,
+}
+
+impl SwitchLinear {
+    fn load(vb: &VarBuilder, _cfg: &Gemma4TextConfig) -> anyhow::Result<Self> {
+        let weight = vb.get("weight")?;
+        let scales = if vb.contains("scales") {
+            Some(vb.get("scales")?)
+        } else {
+            None
+        };
+        let biases = if vb.contains("biases") {
+            Some(vb.get("biases")?)
+        } else {
+            None
+        };
+        let bias = if vb.contains("bias") {
+            Some(vb.get("bias")?)
+        } else {
+            None
+        };
+
+        let group_size = 64;
+        let bits = if let Some(ref s) = scales {
+            infer_bits(&weight.shape_raw(), &s.shape_raw(), group_size, 4)
+        } else {
+            0
+        };
+
+        Ok(Self {
+            weight,
+            scales,
+            biases,
+            bias,
+            group_size,
+            bits,
+        })
+    }
+
+    fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+        let sorted_indices = false;
+        let mut out = if let Some(scales) = &self.scales {
+            x.gather_qmm(
+                &self.weight,
+                scales,
+                self.biases.as_ref(),
+                None,
+                Some(indices),
+                true,
+                self.group_size,
+                self.bits,
+                sorted_indices,
+            )?
+        } else {
+            let wt = self.weight.transpose_axes(&[0, 2, 1])?;
+            x.gather_mm(&wt, None, Some(indices), sorted_indices)?
+        };
+        if let Some(bias) = &self.bias {
+            let gathered = bias.take(indices, 0)?.expand_dims(-2)?;
+            out = out.add(&gathered)?;
+        }
+        Ok(out)
+    }
+}
+
+struct SwitchGlu {
+    gate_proj: SwitchLinear,
+    up_proj: SwitchLinear,
+    down_proj: SwitchLinear,
+}
+
+impl SwitchGlu {
+    fn load(vb: &VarBuilder, cfg: &Gemma4TextConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            gate_proj: SwitchLinear::load(&vb.pp("gate_proj"), cfg)?,
+            up_proj: SwitchLinear::load(&vb.pp("up_proj"), cfg)?,
+            down_proj: SwitchLinear::load(&vb.pp("down_proj"), cfg)?,
+        })
+    }
+
+    fn forward(&self, x: &Array, indices: &Array) -> Result<Array> {
+        let x = x.expand_dims(-2)?.expand_dims(-2)?;
+        let x_up = self.up_proj.forward(&x, indices)?;
+        let x_gate = self.gate_proj.forward(&x, indices)?;
+        let hidden = gelu_approx(&x_gate)?.multiply(&x_up)?;
+        let out = self.down_proj.forward(&hidden, indices)?;
+        out.squeeze(2)
+    }
+}
+
+struct SparseMoeBlock {
+    router: Router,
+    switch_glu: SwitchGlu,
+}
+
+impl SparseMoeBlock {
+    fn load(vb: &VarBuilder, cfg: &Gemma4TextConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            router: Router::load(&vb.pp("router"), cfg)?,
+            switch_glu: SwitchGlu::load(&vb.pp("experts.switch_glu"), cfg)?,
+        })
+    }
+
+    fn forward(&self, x: &Array) -> Result<Array> {
+        let shape = x.shape_raw();
+        let hidden = shape[shape.len() - 1];
+        let orig_shape = shape.clone();
+        let flat = x.reshape(&[-1, hidden])?;
+        let num_tokens = flat.shape_raw()[0] as usize;
+
+        let (top_k_indices, top_k_weights) = self.router.forward(x)?;
+
+        let indices_flat = top_k_indices.reshape(&[-1, self.router.top_k as i32])?;
+        let expert_out = self.switch_glu.forward(&flat, &indices_flat)?;
+
+        let weights = top_k_weights.reshape(&[num_tokens as i32, self.router.top_k as i32, 1])?
+            .as_type(expert_out.dtype())?;
+        let out = expert_out.multiply(&weights)?.sum_axis(1, false)?;
+        out.reshape(&orig_shape)
+    }
+}
+
+// ------------------------------------------------------------------
 // DecoderLayer
 // ------------------------------------------------------------------
 
@@ -856,6 +1064,10 @@ struct Gemma4DecoderLayer {
     post_ffw_layernorm: RmsNormZeroShift,
     self_attn: Gemma4Attention,
     mlp: Gemma4Mlp,
+    moe: Option<SparseMoeBlock>,
+    post_ffw_layernorm_1: Option<RmsNormZeroShift>,
+    post_ffw_layernorm_2: Option<RmsNormZeroShift>,
+    pre_ffw_layernorm_2: Option<RmsNormZeroShift>,
     layer_scalar: Option<Array>,
     is_sliding: bool,
     per_layer_input_gate: Option<Linear>,
@@ -921,6 +1133,27 @@ impl Gemma4DecoderLayer {
             None
         };
 
+        let (moe, post_ffw_layernorm_1, post_ffw_layernorm_2, pre_ffw_layernorm_2) =
+            if cfg.enable_moe_block {
+                (
+                    Some(SparseMoeBlock::load(vb, cfg)?),
+                    Some(RmsNormZeroShift::new(
+                        &vb.pp("post_feedforward_layernorm_1"),
+                        cfg.rms_norm_eps as f32,
+                    )?),
+                    Some(RmsNormZeroShift::new(
+                        &vb.pp("post_feedforward_layernorm_2"),
+                        cfg.rms_norm_eps as f32,
+                    )?),
+                    Some(RmsNormZeroShift::new(
+                        &vb.pp("pre_feedforward_layernorm_2"),
+                        cfg.rms_norm_eps as f32,
+                    )?),
+                )
+            } else {
+                (None, None, None, None)
+            };
+
         Ok(Self {
             input_layernorm: RmsNormZeroShift::new(
                 &vb.pp("input_layernorm"),
@@ -940,6 +1173,10 @@ impl Gemma4DecoderLayer {
             )?,
             self_attn: Gemma4Attention::load(vb, cfg, layer_idx, head_dim, is_sliding)?,
             mlp: Gemma4Mlp::load(vb)?,
+            moe,
+            post_ffw_layernorm_1,
+            post_ffw_layernorm_2,
+            pre_ffw_layernorm_2,
             layer_scalar,
             is_sliding,
             per_layer_input_gate,
@@ -962,12 +1199,26 @@ impl Gemma4DecoderLayer {
         let h = self.post_attn_layernorm.forward(&attn_out)?;
         let h = residual.add(&h)?;
 
-        // MLP sublayer
+        // MLP / MoE sublayer
         let residual = h.clone();
-        let h_norm = self.pre_ffw_layernorm.forward(&h)?;
-        let mlp_out = self.mlp.forward(&h_norm)?;
-        let h = self.post_ffw_layernorm.forward(&mlp_out)?;
-        let mut h = residual.add(&h)?;
+        let mut h = if let Some(ref moe) = self.moe {
+            let h1 = self.pre_ffw_layernorm.forward(&h)?;
+            let h1 = self.mlp.forward(&h1)?;
+            let h1 = self.post_ffw_layernorm_1.as_ref().unwrap().forward(&h1)?;
+
+            let h2 = self.pre_ffw_layernorm_2.as_ref().unwrap().forward(&h)?;
+            let h2 = moe.forward(&h2)?;
+            let h2 = self.post_ffw_layernorm_2.as_ref().unwrap().forward(&h2)?;
+
+            let mut h = h1.add(&h2)?;
+            h = self.post_ffw_layernorm.forward(&h)?;
+            residual.add(&h)?
+        } else {
+            let h_norm = self.pre_ffw_layernorm.forward(&h)?;
+            let mlp_out = self.mlp.forward(&h_norm)?;
+            let h = self.post_ffw_layernorm.forward(&mlp_out)?;
+            residual.add(&h)?
+        };
 
         // Per-layer input gating (after MLP, matching Python)
         if let (Some(ref gate_proj), Some(ref proj_proj), Some(ref post_norm), Some(layer_emb)) =
