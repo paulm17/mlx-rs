@@ -41,15 +41,7 @@ impl Linear {
         };
 
         let (group_size, bits) = if let Some(ref s) = scales {
-            (
-                config.group_size,
-                infer_bits(
-                    &weight.shape_raw(),
-                    &s.shape_raw(),
-                    config.group_size,
-                    config.bits,
-                ),
-            )
+            infer_quant_params(&weight.shape_raw(), &s.shape_raw(), config)
         } else {
             (0, 0)
         };
@@ -162,24 +154,53 @@ impl Default for QuantConfig {
     }
 }
 
-/// Infer the number of quantization bits from weight and scales shapes.
-fn infer_bits(weight_shape: &[i32], scales_shape: &[i32], group_size: i32, fallback: i32) -> i32 {
+/// Infer quantization parameters (group_size, bits) from weight and scales shapes.
+///
+/// Uses config.bits as the primary source of truth to compute group_size,
+/// falling back to inferring bits from config.group_size only when needed.
+/// Supports bits in {2, 3, 4, 6, 8}.
+pub(crate) fn infer_quant_params(
+    weight_shape: &[i32],
+    scales_shape: &[i32],
+    config: &QuantConfig,
+) -> (i32, i32) {
     let packed = weight_shape.last().copied().unwrap_or(0) as i64;
     let n_groups = scales_shape.last().copied().unwrap_or(0) as i64;
-    if packed <= 0 || n_groups <= 0 || group_size <= 0 {
-        return fallback;
+    if packed <= 0 || n_groups <= 0 {
+        return (config.group_size, config.bits);
     }
-    let unpacked = n_groups * group_size as i64;
-    if unpacked <= 0 {
-        return fallback;
+
+    // Collect all valid (group_size, bits) combinations.
+    // The constraint is: packed * 32 / bits = n_groups * group_size
+    // Or: bits * group_size = packed * 32 / n_groups
+    let product = packed * 32 / n_groups;
+    if product <= 0 {
+        return (config.group_size, config.bits);
     }
-    let num = packed * 32;
-    if num % unpacked != 0 {
-        return fallback;
+
+    let mut candidates = Vec::new();
+    for &try_bits in &[2i32, 3, 4, 5, 6, 8] {
+        if product % (try_bits as i64) == 0 {
+            let group_size = (product / (try_bits as i64)) as i32;
+            if group_size > 0 {
+                candidates.push((group_size, try_bits));
+            }
+        }
     }
-    let bits = (num / unpacked) as i32;
-    match bits {
-        2 | 4 | 8 => bits,
-        _ => fallback,
+
+    if candidates.is_empty() {
+        return (config.group_size, config.bits);
     }
+
+    // Prefer the candidate whose group_size is a power of two (common in
+    // practice).  If none are, fall back to the one closest to the config.
+    candidates.sort_by_key(|(gs, bits)| {
+        let is_pow2 = (*gs & (*gs - 1)) == 0;
+        let dist = (gs - config.group_size).abs() + (bits - config.bits).abs();
+        (!is_pow2, dist)
+    });
+
+    candidates[0]
 }
+
+

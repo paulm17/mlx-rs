@@ -176,6 +176,20 @@ impl KvCache {
         self.offset
     }
 
+    /// Fetch the current cached keys and values without updating.
+    /// Returns empty arrays if the cache has not been initialized.
+    pub fn fetch(&self) -> Result<(Array, Array)> {
+        match (&self.k, &self.v) {
+            (Some(k), Some(v)) => Ok((
+                Self::take_prefix(k, self.offset)?,
+                Self::take_prefix(v, self.offset)?,
+            )),
+            _ => Err(Error::Message(
+                "Cannot fetch from an empty KV cache".to_string(),
+            )),
+        }
+    }
+
     /// Reset the cache (e.g. for a new conversation).
     pub fn reset(&mut self) {
         self.k = None;

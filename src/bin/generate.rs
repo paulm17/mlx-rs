@@ -4,25 +4,33 @@ use serde_json::json;
 use std::io::Write;
 use std::path::PathBuf;
 
+fn detect_arch(model_dir: &std::path::Path) -> Option<mlx_lm::loader::ModelArch> {
+    let config_path = model_dir.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path).ok()?;
+    let config: serde_json::Value = serde_json::from_str(&config_str).ok()?;
+    mlx_lm::loader::detect_architecture(&config).ok()
+}
+
 fn sampler_for_model(model_dir: &std::path::Path, temperature: f32, top_p: f32) -> mlx_lm::Sampler {
     let mut sampler = mlx_lm::Sampler::new(temperature, top_p);
-    let config_path = model_dir.join("config.json");
-    if let Ok(config_str) = std::fs::read_to_string(&config_path) {
-        if let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_str) {
-            if let Ok(arch) = mlx_lm::loader::detect_architecture(&config) {
-                if matches!(
-                    arch,
-                    mlx_lm::loader::ModelArch::QwenMoe
-                        | mlx_lm::loader::ModelArch::QwenMoePythonPort
-                ) {
-                    sampler = sampler
-                        .with_greedy_tie_break(0.05)
-                        .with_greedy_tie_break_after(180);
-                }
-            }
+    if let Some(arch) = detect_arch(model_dir) {
+        if matches!(
+            arch,
+            mlx_lm::loader::ModelArch::QwenMoe | mlx_lm::loader::ModelArch::QwenMoePythonPort
+        ) {
+            sampler = sampler
+                .with_greedy_tie_break(0.05)
+                .with_greedy_tie_break_after(180);
         }
     }
     sampler
+}
+
+fn fallback_template_for_arch(arch: Option<mlx_lm::loader::ModelArch>) -> mlx_lm::ChatTemplate {
+    match arch {
+        Some(mlx_lm::loader::ModelArch::Gemma4) => mlx_lm::ChatTemplate::gemma4(),
+        _ => mlx_lm::ChatTemplate::chatml(),
+    }
 }
 
 /// MLX-RS text generation CLI.
@@ -82,6 +90,7 @@ fn main() -> Result<()> {
     };
 
     // Build the prompt — either raw or via chat template
+    let arch = detect_arch(&args.model_dir);
     let prompt = if args.chat {
         let messages = vec![
             mlx_lm::Message::system(&args.system_prompt),
@@ -90,28 +99,29 @@ fn main() -> Result<()> {
         match mlx_lm::ChatTemplate::from_model_dir(&args.model_dir) {
             Ok(template) => match template.apply(&messages, &template_options) {
                 Ok(p) => p,
-                Err(_) => mlx_lm::ChatTemplate::chatml()
+                Err(_) => fallback_template_for_arch(arch)
                     .apply(&messages, &template_options)
                     .or_else(|_| mlx_lm::ChatTemplate::qwen35().apply(&messages, &template_options))
                     .map_err(|e| anyhow::anyhow!("Failed to apply fallback chat template: {e}"))?,
             },
-            Err(_) => mlx_lm::ChatTemplate::chatml()
+            Err(_) => fallback_template_for_arch(arch)
                 .apply(&messages, &template_options)
                 .or_else(|_| mlx_lm::ChatTemplate::qwen35().apply(&messages, &template_options))
                 .map_err(|e| anyhow::anyhow!("Failed to apply fallback chat template: {e}"))?,
         }
     } else {
-        // Auto-apply chat template when present; fall back to ChatML for incompatible Jinja templates.
+        // Auto-apply chat template for instruction-tuned models
         let messages = vec![mlx_lm::Message::user(&args.prompt)];
         match mlx_lm::ChatTemplate::from_model_dir(&args.model_dir) {
             Ok(template) => match template.apply(&messages, &template_options) {
                 Ok(p) => p,
-                Err(_) => mlx_lm::ChatTemplate::chatml()
+                Err(_) => fallback_template_for_arch(arch)
                     .apply(&messages, &template_options)
-                    .or_else(|_| mlx_lm::ChatTemplate::qwen35().apply(&messages, &template_options))
                     .map_err(|e| anyhow::anyhow!("Failed to apply fallback chat template: {e}"))?,
             },
-            Err(_) => args.prompt.clone(),
+            Err(_) => fallback_template_for_arch(arch)
+                .apply(&messages, &template_options)
+                .map_err(|e| anyhow::anyhow!("Failed to apply fallback chat template: {e}"))?,
         }
     };
 

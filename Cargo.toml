@@ -5,6 +5,7 @@ members = [
     "crates/mlx-nn",
     "crates/mlx-models",
     "crates/mlx-lm",
+    "crates/mlx-vlm",
 ]
 resolver = "2"
 
@@ -19,6 +20,7 @@ clap = { version = "4", features = ["derive"] }
 bindgen = "0.69"
 rand = "0.8"
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
+image = "0.25"
 
 [package]
 name = "mlx-rs"

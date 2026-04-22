@@ -1,4 +1,4 @@
-use crate::linear::QuantConfig;
+use crate::linear::{infer_quant_params, QuantConfig};
 use crate::var_builder::VarBuilder;
 use mlx_core::{Array, Module, Result};
 
@@ -31,27 +31,7 @@ impl Embedding {
         };
 
         let (group_size, bits) = if let Some(ref s) = scales {
-            let ws = weight.shape_raw();
-            let ss = s.shape_raw();
-            let packed = ws.last().copied().unwrap_or(0) as i64;
-            let n_groups = ss.last().copied().unwrap_or(0) as i64;
-            let gs = config.group_size as i64;
-            if packed > 0 && n_groups > 0 && gs > 0 {
-                let unpacked = n_groups * gs;
-                let bits_val = if unpacked > 0 && (packed * 32) % unpacked == 0 {
-                    let b = (packed * 32 / unpacked) as i32;
-                    if matches!(b, 2 | 4 | 8) {
-                        b
-                    } else {
-                        config.bits
-                    }
-                } else {
-                    config.bits
-                };
-                (config.group_size, bits_val)
-            } else {
-                (config.group_size, config.bits)
-            }
+            infer_quant_params(&weight.shape_raw(), &s.shape_raw(), config)
         } else {
             (0, 0)
         };
@@ -99,17 +79,54 @@ impl Embedding {
 impl Module for Embedding {
     fn forward(&self, token_ids: &Array) -> Result<Array> {
         if let Some(ref scales) = self.scales {
-            // Quantized embedding lookup: gather then dequantize
-            let q_rows = self.weight.take(token_ids, 0)?;
-            let s_rows = scales.take(token_ids, 0)?;
+            // Quantized embedding lookup: gather then dequantize.
+            // MLX dequantize requires a 2D matrix, so we must ensure the
+            // gathered weight has at least 2 dims. Flatten/squeeze indices
+            // as needed, then reshape back.
+            let orig_ndim = token_ids.ndim();
+            let flat_ids = if orig_ndim == 0 {
+                token_ids.reshape(&[1])?
+            } else if orig_ndim > 1 {
+                token_ids.reshape(&[-1])?
+            } else {
+                token_ids.clone()
+            };
+            let q_rows = self.weight.take(&flat_ids, 0)?;
+            let s_rows = scales.take(&flat_ids, 0)?;
             let b_rows = self
                 .biases
                 .as_ref()
-                .map(|b| b.take(token_ids, 0))
+                .map(|b| b.take(&flat_ids, 0))
                 .transpose()?;
-            q_rows.dequantize(&s_rows, b_rows.as_ref(), self.group_size, self.bits)
+            // MLX dequantize requires at least 2D; ensure q_rows is 2D by
+            // adding a leading dim when flat_ids has only one element.
+            let (q_rows, s_rows, b_rows) = if q_rows.ndim() == 1 {
+                let packed = q_rows.shape_raw().last().copied().unwrap_or(0) as i32;
+                (
+                    q_rows.reshape(&[1, packed])?,
+                    s_rows.reshape(&[1, s_rows.shape_raw().last().copied().unwrap_or(0)])?,
+                    b_rows.map(|b| b.reshape(&[1, b.shape_raw().last().copied().unwrap_or(0)])).transpose()?,
+                )
+            } else {
+                (q_rows, s_rows, b_rows)
+            };
+            let deq = q_rows.dequantize(&s_rows, b_rows.as_ref(), self.group_size, self.bits)?;
+            if orig_ndim == 0 {
+                // Return [hidden] (squeeze the batch dim)
+                let packed = q_rows.shape_raw().last().copied().unwrap_or(0) as i32;
+                let hidden = packed * 32 / self.bits.max(1);
+                deq.reshape(&[hidden])
+            } else if orig_ndim > 1 {
+                let mut out_shape = token_ids.shape_raw();
+                let packed = q_rows.shape_raw().last().copied().unwrap_or(0) as i32;
+                let hidden = packed * 32 / self.bits.max(1);
+                out_shape.push(hidden);
+                deq.reshape(&out_shape)
+            } else {
+                Ok(deq)
+            }
         } else {
-            // Full-precision: simple gather
+            // Full-precision: simple gather (MLX take handles multi-dim indices natively)
             self.weight.take(token_ids, 0)
         }
     }

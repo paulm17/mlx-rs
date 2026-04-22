@@ -330,6 +330,26 @@ impl ChatTemplate {
         Self::new(template, "<bos>", "<eos>").unwrap()
     }
 
+    /// Gemma 4 template.
+    pub fn gemma4() -> Self {
+        let template = r#"
+{{- bos_token }}
+{%- for message in messages %}
+    {%- if message['role'] == 'user' %}
+        {{- '<|turn>user\n' + message['content'] + '<turn|>\n' }}
+    {%- elif message['role'] == 'assistant' %}
+        {{- '<|turn>model\n' + message['content'] + '<turn|>\n' }}
+    {%- elif message['role'] == 'system' %}
+        {{- '<|turn>system\n' + message['content'] + '<turn|>\n' }}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|turn>model\n' }}
+{%- endif %}
+"#;
+        Self::new(template, "<bos>", "<eos>").unwrap()
+    }
+
     /// Mistral Instruct template.
     pub fn mistral() -> Self {
         let template = r#"

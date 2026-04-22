@@ -198,6 +198,7 @@ fn configure_mlx_cache_policy() {
 pub enum ModelArch {
     Bert,
     Gemma3,
+    Gemma4,
     Llama,
     Qwen3,
     Qwen35,
@@ -214,6 +215,7 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
         match model_type.to_lowercase().as_str() {
             "bert" => return Ok(ModelArch::Bert),
             "gemma3" => return Ok(ModelArch::Gemma3),
+            "gemma4" => return Ok(ModelArch::Gemma4),
             "llama" => return Ok(ModelArch::Llama),
             "qwen3_5" | "qwen3.5" => return Ok(ModelArch::Qwen35),
             "qwen3" => {
@@ -258,6 +260,9 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 }
                 if lower.contains("bertmodel") || lower == "bert" {
                     return Ok(ModelArch::Bert);
+                }
+                if lower.contains("gemma4") {
+                    return Ok(ModelArch::Gemma4);
                 }
                 if lower.contains("gemma3") {
                     return Ok(ModelArch::Gemma3);
@@ -414,7 +419,7 @@ pub fn load_model(
     let arch = detect_architecture(&config)?;
     eprintln!("Detected architecture: {:?}", arch);
     // Load weights
-    let vb = VarBuilder::from_dir(model_dir, DType::Float16)?;
+    let vb = VarBuilder::from_dir(model_dir, DType::BFloat16)?;
     eprintln!("Loaded {} tensors", vb.data().len());
 
     // Build model
@@ -427,6 +432,10 @@ pub fn load_model(
             let cfg: mlx_models::Gemma3Config =
                 serde_json::from_value(gemma3_text_config(&config)?)?;
             Box::new(mlx_models::Gemma3::new(&cfg, &vb)?)
+        }
+        ModelArch::Gemma4 => {
+            let cfg: mlx_models::Gemma4Config = serde_json::from_value(config.clone())?;
+            Box::new(mlx_models::Gemma4::new(&vb, &cfg)?)
         }
         ModelArch::Llama => {
             let cfg: mlx_models::LlamaConfig = serde_json::from_value(config.clone())?;
@@ -525,6 +534,24 @@ mod tests {
         assert!(matches!(
             detect_architecture(&config).unwrap(),
             ModelArch::Gemma3
+        ));
+    }
+
+    #[test]
+    fn detects_gemma4_from_model_type() {
+        let config = json!({"model_type": "gemma4"});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Gemma4
+        ));
+    }
+
+    #[test]
+    fn detects_gemma4_from_architecture() {
+        let config = json!({"architectures": ["Gemma4ForConditionalGeneration"]});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Gemma4
         ));
     }
 
