@@ -4,11 +4,14 @@ use mlx_nn::VarBuilder;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
+use crate::processing::Gemma4ImageProcessor;
+
 /// Components loaded for a VLM.
 pub struct VlmComponents {
     pub model: Gemma4,
     pub tokenizer: Tokenizer,
     pub config: Gemma4Config,
+    pub processor: Gemma4ImageProcessor,
 }
 
 /// Load a Gemma4 VLM from a local directory.
@@ -27,9 +30,12 @@ pub fn load_gemma4_vlm(model_dir: &Path) -> Result<VlmComponents> {
     let vb = VarBuilder::from_dir(model_dir, mlx_core::DType::Float16)?;
     let model = Gemma4::new(&vb, &config)?;
 
+    let processor = Gemma4ImageProcessor::new(896);
+
     Ok(VlmComponents {
         model,
         tokenizer,
         config,
+        processor,
     })
 }

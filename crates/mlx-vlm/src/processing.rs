@@ -22,20 +22,35 @@ impl Gemma4ImageProcessor {
 
     /// Load and preprocess an image.
     ///
-    /// Resizes to a square, rescales to [0, 1], and returns channels-first data.
+    /// Resizes preserving aspect ratio to fit within `target_size`, centre-pads
+    /// to a square, rescales to [0, 1], and returns channels-first data.
     pub fn process(&self, image_path: &std::path::Path) -> Result<ProcessedImage> {
         let img = image::open(image_path)?;
-        let resized =
-            img.resize_to_fill(self.target_size, self.target_size, FilterType::Lanczos3);
+        let (orig_w, orig_h) = (img.width() as f32, img.height() as f32);
+
+        // Preserve aspect ratio, fit within target_size
+        let scale =
+            (self.target_size as f32 / orig_w).min(self.target_size as f32 / orig_h);
+        let new_w = (orig_w * scale) as u32;
+        let new_h = (orig_h * scale) as u32;
+
+        let resized = img.resize(new_w, new_h, FilterType::Lanczos3);
         let rgb = resized.to_rgb8();
 
+        // Centre-pad to target_size square
         let mut pixel_values =
-            Vec::with_capacity(3 * self.target_size as usize * self.target_size as usize);
-        for c in 0..3 {
-            for y in 0..self.target_size {
-                for x in 0..self.target_size {
-                    let pixel = rgb.get_pixel(x, y);
-                    pixel_values.push(pixel[c] as f32 / 255.0);
+            vec![0.0f32; 3 * self.target_size as usize * self.target_size as usize];
+        let x_offset = (self.target_size - new_w) / 2;
+        let y_offset = (self.target_size - new_h) / 2;
+
+        for y in 0..new_h {
+            for x in 0..new_w {
+                let pixel = rgb.get_pixel(x, y);
+                for c in 0..3 {
+                    let idx = c * self.target_size as usize * self.target_size as usize
+                        + (y_offset + y) as usize * self.target_size as usize
+                        + (x_offset + x) as usize;
+                    pixel_values[idx] = pixel[c] as f32 / 255.0;
                 }
             }
         }

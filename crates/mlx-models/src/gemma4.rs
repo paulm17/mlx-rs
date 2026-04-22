@@ -368,7 +368,11 @@ struct ClippableLinear {
 
 impl ClippableLinear {
     fn new(vb: &VarBuilder, config: &QuantConfig) -> anyhow::Result<Self> {
-        let linear = Linear::new(&vb.pp("linear"), config)?;
+        let linear = if vb.contains("linear.weight") {
+            Linear::new(&vb.pp("linear"), config)?
+        } else {
+            Linear::new(vb, config)?
+        };
         let input_min = if vb.contains("input_min") {
             Some(vb.get("input_min")?)
         } else {
@@ -1407,25 +1411,29 @@ impl Gemma4TextModel {
     }
 
     fn forward_embeddings(
-        &mut self,
+        layers: &mut [Gemma4DecoderLayer],
+        layer_idx_to_cache_idx: &[usize],
+        norm: &RmsNormZeroShift,
         embeddings: &Array,
         per_layer_inputs: Option<&Array>,
+        caches: &mut [KvCache],
+        sliding_window: usize,
     ) -> Result<Array> {
         let mut h = embeddings.clone();
         let shape = h.shape_raw();
         let seq_len = shape[1] as usize;
         let batch = shape[0] as usize;
 
-        for (i, layer) in self.layers.iter_mut().enumerate() {
-            let cache_idx = self.layer_idx_to_cache_idx[i];
+        for (i, layer) in layers.iter_mut().enumerate() {
+            let cache_idx = layer_idx_to_cache_idx[i];
 
             let mask = if layer.is_sliding {
-                let offset = self.caches[cache_idx].offset();
+                let offset = caches[cache_idx].offset();
                 Some(sliding_window_mask(
                     batch,
                     seq_len,
                     offset,
-                    self.sliding_window,
+                    sliding_window,
                     h.dtype(),
                 )?)
             } else {
@@ -1440,10 +1448,10 @@ impl Gemma4TextModel {
                 pli.slice(&start, &stop)?.squeeze(2)
             }).transpose()?;
 
-            h = layer.forward(&h, mask.as_ref(), &mut self.caches[cache_idx], layer_emb.as_ref())?;
+            h = layer.forward(&h, mask.as_ref(), &mut caches[cache_idx], layer_emb.as_ref())?;
         }
 
-        let out = self.norm.forward(&h)?;
+        let out = norm.forward(&h)?;
         Ok(out)
     }
 
@@ -1457,7 +1465,15 @@ impl Gemma4TextModel {
             None
         };
 
-        self.forward_embeddings(&h, per_layer_inputs.as_ref())
+        Self::forward_embeddings(
+            &mut self.layers,
+            &self.layer_idx_to_cache_idx,
+            &self.norm,
+            &h,
+            per_layer_inputs.as_ref(),
+            &mut self.caches,
+            self.sliding_window,
+        )
     }
 
     fn clear_cache(&mut self) {
@@ -1505,7 +1521,7 @@ impl LanguageModel {
 // ------------------------------------------------------------------
 
 struct VisionPatchEmbedder {
-    input_proj: Linear,
+    input_proj: ClippableLinear,
     position_embedding_table: Embedding,
     patch_size: usize,
 }
@@ -1515,7 +1531,7 @@ impl VisionPatchEmbedder {
         let qc = QuantConfig::default();
         let pos_emb_weight = vb.get("position_embedding_table")?;
         Ok(Self {
-            input_proj: Linear::new(&vb.pp("input_proj"), &qc)?,
+            input_proj: ClippableLinear::new(&vb.pp("input_proj"), &qc)?,
             position_embedding_table: Embedding::from_weight(pos_emb_weight),
             patch_size: cfg.patch_size,
         })
@@ -1902,11 +1918,16 @@ impl Gemma4 {
         &self.config
     }
 
-    pub fn forward_logits(
+    pub fn encode_image(&mut self, pixel_values: &Array) -> Result<Array> {
+        let vision_features = self.vision_tower.forward(pixel_values)?;
+        self.embed_vision.forward(&vision_features)
+    }
+
+    fn compute_embeddings(
         &mut self,
         input_ids: &Array,
         pixel_values: Option<&Array>,
-    ) -> Result<Array> {
+    ) -> Result<(Array, Option<Array>)> {
         let mut h = self.language_model.model.embed_tokens.forward(input_ids)?;
         h = h.multiply(&Array::from_float(self.language_model.model.embed_scale)?)?;
 
@@ -1929,7 +1950,50 @@ impl Gemma4 {
             None
         };
 
-        let h = self.language_model.model.forward_embeddings(&h, per_layer_inputs.as_ref())?;
+        Ok((h, per_layer_inputs))
+    }
+
+    pub fn forward_logits(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: Option<&Array>,
+    ) -> Result<Array> {
+        let (h, per_layer_inputs) = self.compute_embeddings(input_ids, pixel_values)?;
+        let h = Gemma4TextModel::forward_embeddings(
+            &mut self.language_model.model.layers,
+            &self.language_model.model.layer_idx_to_cache_idx,
+            &self.language_model.model.norm,
+            &h,
+            per_layer_inputs.as_ref(),
+            &mut self.language_model.model.caches,
+            self.language_model.model.sliding_window,
+        )?;
+        let mut logits = self.language_model.lm_head.forward(&h)?;
+        if let Some(softcap) = self.language_model.final_logit_softcapping {
+            logits = logits
+                .divide(&Array::from_float(softcap)?)?
+                .tanh()?
+                .multiply(&Array::from_float(softcap)?)?;
+        }
+        Ok(logits)
+    }
+
+    pub fn forward_logits_with_cache(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: Option<&Array>,
+        cache: &mut [KvCache],
+    ) -> Result<Array> {
+        let (h, per_layer_inputs) = self.compute_embeddings(input_ids, pixel_values)?;
+        let h = Gemma4TextModel::forward_embeddings(
+            &mut self.language_model.model.layers,
+            &self.language_model.model.layer_idx_to_cache_idx,
+            &self.language_model.model.norm,
+            &h,
+            per_layer_inputs.as_ref(),
+            cache,
+            self.language_model.model.sliding_window,
+        )?;
         let mut logits = self.language_model.lm_head.forward(&h)?;
         if let Some(softcap) = self.language_model.final_logit_softcapping {
             logits = logits
@@ -1947,6 +2011,25 @@ impl Gemma4 {
     ) -> Result<Array> {
         let seq_len = input_ids.shape_raw()[input_ids.ndim() - 1];
         let mut logits = self.forward_logits(input_ids, pixel_values)?;
+        if seq_len > 1 {
+            let logits_shape = logits.shape_raw();
+            let mut start = vec![0i32; logits_shape.len()];
+            let mut stop = logits_shape.clone();
+            start[logits_shape.len() - 2] = seq_len - 1;
+            stop[logits_shape.len() - 2] = seq_len;
+            logits = logits.slice(&start, &stop)?;
+        }
+        Ok(logits)
+    }
+
+    pub fn forward_last_token_logits_with_cache(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: Option<&Array>,
+        cache: &mut [KvCache],
+    ) -> Result<Array> {
+        let seq_len = input_ids.shape_raw()[input_ids.ndim() - 1];
+        let mut logits = self.forward_logits_with_cache(input_ids, pixel_values, cache)?;
         if seq_len > 1 {
             let logits_shape = logits.shape_raw();
             let mut start = vec![0i32; logits_shape.len()];

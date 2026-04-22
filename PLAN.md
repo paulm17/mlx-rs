@@ -930,3 +930,28 @@ Python's sanitize() splits stacked expert weights:
 | `crates/mlx-vlm/src/generate.rs` | CREATE — VLM generation pipeline |
 | `crates/mlx-vlm/src/processing.rs` | CREATE — image preprocessing |
 | `Cargo.toml` (workspace root) | EDIT — add mlx-vlm to members |
+
+---
+
+## Remaining To-Do Items
+
+| # | Item | Difficulty | Files | Notes |
+|---|------|-----------|-------|-------|
+| R1 | **Vision: `encode_image` public API** | Easy | `gemma4.rs` | Expose `encode_image(&self, pixel_values) -> Result<Array>` on `Gemma4`. Mostly delegates to existing `vision_tower.forward()`. |
+| R4 | **Vision: `VisionPatchEmbedder` → `ClippableLinear`** | Easy | `gemma4.rs` | Change `input_proj` from `Linear` to `ClippableLinear`. Required for 2B clipped vision weights. |
+| R6 | **Image processor: preserve aspect ratio** | Easy | `processing.rs` | Replace `resize_to_fill` with aspect-ratio-preserving resize + patch-size alignment. |
+| R8 | **Add missing `GemmaRmsNorm` (weight+1.0)** | Easy | `gemma4.rs` | Third norm variant. Used for `input_layernorm`, `pre_feedforward_layernorm`, final `norm`. Currently using `RmsNormZeroShift`. |
+| R11 | **Public API: external `cache` parameter** | Easy | `gemma4.rs` | `forward_logits` and `forward_last_token_logits` should accept `cache: &mut [KvCache]` as specified. |
+| R13 | **`loader.rs`: return processor** | Easy | `loader.rs` | Return `Gemma4ImageProcessor` alongside model + tokenizer. |
+
+| R2 | **Vision: `masked_scatter` / proper injection** | Medium | `gemma4.rs` | Replace naive `slice_update` with `masked_scatter` that finds `image_token_id` positions in `input_ids` and replaces exactly those spans. Critical for correctness when text and image tokens are interleaved. |
+| R3 | **Vision: bidirectional valid-positions mask** | Medium | `gemma4.rs` | `VisionAttention` currently attends to all patches including padding. Need to construct and apply a mask from valid patch positions. |
+| R5 | **Vision: `VisionPooler` exactness + padding strip** | Medium | `gemma4.rs` | Pooler must robustly output exactly `default_output_length` tokens and strip padding, not just average pool. |
+| R9 | **Fix per-layer input gating: sigmoid + layer_emb** | Medium | `gemma4.rs` | Gate should use `sigmoid`, not `gelu_approx`, and should operate on projected layer embedding, not hidden state `h`. |
+| R10 | **Fix KV sharing index mapping** | Medium | `gemma4.rs` | Current logic maps shared layers to last concrete full/sliding layer. Spec requires simple `i - num_non_shared` arithmetic. |
+
+| R7 | **Implement `sanitize()` function** | Hard | `gemma4.rs` | Required for MoE weight stacking, stripping clipping params when `use_clipped_linears=false`, and per-layer quantization overrides. |
+| R12 | **`generate.rs`: full autoregressive loop** | Hard | `generate.rs` | Stub returns empty string. Need full sampling loop with image token injection, temperature sampling, and EOS handling. |
+| R14 | **Build + test 2B** | Hard | All | End-to-end weight loading and inference test. |
+| R15 | **Build + test 31B** | Hard | All | End-to-end weight loading and inference test. |
+| R16 | **Build + test 26B MoE** | Hard | All | End-to-end weight loading and inference test. |

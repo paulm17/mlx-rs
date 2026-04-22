@@ -197,7 +197,7 @@ impl CausalLM for mlx_models::Gemma4 {
         self.forward_last_token_logits(input_ids, None)
     }
     fn clear_cache(&mut self) {
-        self.clear_cache();
+        mlx_models::Gemma4::clear_cache(self);
     }
 }
 
