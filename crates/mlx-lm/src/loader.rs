@@ -408,6 +408,10 @@ fn load_stop_tokens(
         "<|eot_id|>",
         "<|im_start|>",
         "<|endoftext|>",
+        "<|end_of_text|>",
+        "<end_of_turn>",
+        "<turn|>",
+        "<eos>",
     ] {
         push_token_id(&tokenizer, &mut stops, tok);
     }

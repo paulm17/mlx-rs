@@ -447,11 +447,35 @@ fn sampled_token_array_to_input(token: &Array) -> Result<Array> {
     }
 }
 
+fn strip_thinking_blocks(text: &str) -> String {
+    let mut result = text.to_string();
+    // Strip complete <think>...</think> blocks (including with attributes like <think type="reasoning">)
+    loop {
+        if let Some(start) = result.find("<think>") {
+            if let Some(end) = result[start..].find("</think>") {
+                result.replace_range(start..start + end + "</think>".len(), "");
+                continue;
+            } else {
+                result.truncate(start);
+                break;
+            }
+        }
+        break;
+    }
+    // Strip any orphaned </think> tags
+    while let Some(start) = result.find("</think>") {
+        result.replace_range(start..start + "</think>".len(), "");
+    }
+    result.trim().to_string()
+}
+
 /// Text generation pipeline.
 pub struct GenerationPipeline<M> {
     model: M,
     tokenizer: Tokenizer,
     sampler: Sampler,
+    strip_thinking: bool,
+    stop_strings: Vec<String>,
 }
 
 impl<M: CausalLM> GenerationPipeline<M> {
@@ -460,7 +484,26 @@ impl<M: CausalLM> GenerationPipeline<M> {
             model,
             tokenizer,
             sampler,
+            strip_thinking: false,
+            stop_strings: Vec::new(),
         }
+    }
+
+    pub fn with_strip_thinking(mut self, strip: bool) -> Self {
+        self.strip_thinking = strip;
+        self
+    }
+
+    pub fn with_stop_strings(mut self, strings: Vec<String>) -> Self {
+        self.stop_strings = strings;
+        self
+    }
+
+    fn check_stop_strings(&self, output: &str) -> Option<usize> {
+        self.stop_strings
+            .iter()
+            .filter_map(|s| output.find(s))
+            .min()
     }
 
     /// Generate text from a prompt.
@@ -499,7 +542,8 @@ impl<M: CausalLM> GenerationPipeline<M> {
     {
         let t0 = Instant::now();
         let mut ttft_s: Option<f64> = None;
-        let mut stop_reason: &'static str = "unknown";
+        #[allow(unused_assignments)]
+        let mut stop_reason: Option<&'static str> = None;
         let profiling = trace_generation_enabled();
         let mut profile = profiling.then(GenerationProfile::new);
 
@@ -600,13 +644,13 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 generated += 1;
 
                 if self.tokenizer.is_stop_token(token) {
-                    stop_reason = "stop";
+                    stop_reason = Some("stop");
                     break;
                 }
 
                 generated_tokens.push(token);
                 if has_runaway_repeat(&generated_tokens) {
-                    stop_reason = "repeat_guard";
+                    stop_reason = Some("repeat_guard");
                     break;
                 }
 
@@ -622,6 +666,11 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 }
                 on_piece(token, &piece);
                 output.push_str(&piece);
+                if let Some(idx) = self.check_stop_strings(&output) {
+                    output.truncate(idx);
+                    stop_reason = Some("stop");
+                    break;
+                }
                 history_tokens.push(token);
                 token_count += 1;
                 if ttft_s.is_none() {
@@ -630,7 +679,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
 
                 if let Some(limit) = max_tokens {
                     if generated >= limit {
-                        stop_reason = "length";
+                        stop_reason = Some("length");
                         break;
                     }
                 }
@@ -642,7 +691,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 token_arr = match next_token_arr {
                     Some(next) => next,
                     None => {
-                        stop_reason = "length";
+                        stop_reason = Some("length");
                         break;
                     }
                 };
@@ -684,12 +733,12 @@ impl<M: CausalLM> GenerationPipeline<M> {
             loop {
                 if let Some(limit) = max_tokens {
                     if generated >= limit {
-                        stop_reason = "length";
+                        stop_reason = Some("length");
                         break;
                     }
                 }
                 if self.tokenizer.is_stop_token(token) {
-                    stop_reason = "stop";
+                    stop_reason = Some("stop");
                     break;
                 }
                 let input = Array::from_int(token as i32)?.reshape(&[1, 1])?;
@@ -718,12 +767,13 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 generated += 1;
 
                 if self.tokenizer.is_stop_token(token) {
+                    stop_reason = Some("stop");
                     break;
                 }
 
                 generated_tokens.push(token);
                 if has_runaway_repeat(&generated_tokens) {
-                    stop_reason = "repeat_guard";
+                    stop_reason = Some("repeat_guard");
                     break;
                 }
 
@@ -735,6 +785,11 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 }
                 on_piece(token, &piece);
                 output.push_str(&piece);
+                if let Some(idx) = self.check_stop_strings(&output) {
+                    output.truncate(idx);
+                    stop_reason = Some("stop");
+                    break;
+                }
                 history_tokens.push(token);
                 token_count += 1;
                 if generated % 32 == 0 {
@@ -754,11 +809,14 @@ impl<M: CausalLM> GenerationPipeline<M> {
             p.moe_device_router_shadow_checks = moe.device_router_shadow_checks;
             p.moe_device_router_shadow_mismatches = moe.device_router_shadow_mismatches;
         }
+        if self.strip_thinking {
+            output = strip_thinking_blocks(&output);
+        }
         let metrics = GenerationMetrics {
             ttft_s: ttft_s.unwrap_or(0.0),
             total_s: t0.elapsed().as_secs_f64(),
             tokens: token_count,
-            stop_reason,
+            stop_reason: stop_reason.unwrap_or("unknown"),
             last_token_id,
             generated_token_ids: generated_tokens.clone(),
             tail_token_ids: generated_tokens
