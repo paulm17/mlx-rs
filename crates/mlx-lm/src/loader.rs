@@ -398,7 +398,12 @@ fn load_stop_tokens(
         }
     }
 
-    for tok in ["<|im_end|>", "<|eot_id|>", "<|im_start|>"] {
+    for tok in [
+        "<|im_end|>",
+        "<|eot_id|>",
+        "<|im_start|>",
+        "<|endoftext|>",
+    ] {
         push_token_id(&tokenizer, &mut stops, tok);
     }
 

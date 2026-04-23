@@ -124,6 +124,46 @@ impl RoPE {
                     freqs: Some(freqs_arr),
                 })
             }
+            "yarn" => {
+                // YaRN: compute adjusted frequencies similar to llama3 but with
+                // YaRN-specific parameters. Scale low frequencies by 1/factor.
+                let head_dim = dims as usize;
+                let factor = scaling.factor;
+                let original_max_pos = scaling.original_max_position_embeddings as f32;
+
+                // YaRN parameters (defaults from paper)
+                let beta_fast = 32.0f32;
+                let beta_slow = 1.0f32;
+
+                let dim = head_dim / 2;
+                let t_fast = original_max_pos / beta_fast;
+                let t_slow = original_max_pos / beta_slow;
+
+                let mut freqs = Vec::with_capacity(dim);
+                for i in (0..head_dim).step_by(2) {
+                    let base_freq = base.powf(i as f32 / head_dim as f32);
+                    let wavelen = 2.0 * std::f32::consts::PI / base_freq;
+
+                    let adjusted = if wavelen < t_fast {
+                        base_freq
+                    } else if wavelen > t_slow {
+                        base_freq / factor
+                    } else {
+                        let ramp = (t_slow - wavelen) / (t_slow - t_fast);
+                        base_freq / (1.0 + ramp * (factor - 1.0))
+                    };
+                    freqs.push(adjusted);
+                }
+
+                let freqs_arr = Array::from_slice_f32(&freqs)?;
+                Ok(Self {
+                    dims,
+                    base,
+                    traditional,
+                    scale: 1.0,
+                    freqs: Some(freqs_arr),
+                })
+            }
             _ => {
                 // Default: apply scale factor
                 Ok(Self {

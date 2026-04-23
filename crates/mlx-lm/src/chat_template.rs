@@ -355,7 +355,10 @@ impl ChatTemplate {
 {{- '<|im_start|>' + message.role + '\n' + message.content | trim + '<|im_end|>\n' }}
 {%- endfor %}
 {%- if add_generation_prompt %}
-{{- '<|im_start|>assistant\n<think>\n\n</think>\n\n' }}
+{{- '<|im_start|>assistant\n' }}
+{%- if enable_thinking %}
+{{- '<think>\n' }}
+{%- endif %}
 {%- endif %}
 "#;
         Self::new(template, "", "<|im_end|>").unwrap()
