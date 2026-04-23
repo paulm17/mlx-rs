@@ -101,6 +101,8 @@ impl Gemma3Config {
             low_freq_factor: 1.0,
             high_freq_factor: 4.0,
             original_max_position_embeddings: self.max_position_embeddings,
+            long_factor: None,
+            short_factor: None,
         });
         if scaling.rope_type.is_none() {
             scaling.rope_type = Some("linear".to_string());

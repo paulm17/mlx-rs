@@ -159,7 +159,7 @@ impl Default for QuantConfig {
 /// Uses config.bits as the primary source of truth to compute group_size,
 /// falling back to inferring bits from config.group_size only when needed.
 /// Supports bits in {2, 3, 4, 6, 8}.
-pub(crate) fn infer_quant_params(
+pub fn infer_quant_params(
     weight_shape: &[i32],
     scales_shape: &[i32],
     config: &QuantConfig,

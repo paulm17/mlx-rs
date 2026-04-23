@@ -26,6 +26,8 @@ pub struct LlamaConfig {
     pub max_position_embeddings: usize,
     #[serde(default)]
     pub tie_word_embeddings: bool,
+    #[serde(default = "default_partial_rotary_factor")]
+    pub partial_rotary_factor: f32,
     // Quantization (from config.json)
     pub quantization: Option<QuantizationConfig>,
 }
@@ -46,6 +48,9 @@ fn default_rope_theta() -> f32 {
 }
 fn default_max_pos() -> usize {
     4096
+}
+fn default_partial_rotary_factor() -> f32 {
+    1.0
 }
 fn default_group_size() -> i32 {
     64
@@ -91,12 +96,125 @@ struct CausalSelfAttention {
     scale: f32,
 }
 
+/// Split a fused `qkv_proj` tensor into separate Q, K, V linear layers.
+fn split_qkv_proj(
+    vb: &VarBuilder,
+    cfg: &LlamaConfig,
+    qc: &mlx_nn::QuantConfig,
+) -> anyhow::Result<(Linear, Linear, Linear)> {
+    let qkv_vb = vb.pp("qkv_proj");
+    let weight = qkv_vb.get("weight")?;
+    let scales = if qkv_vb.contains("scales") {
+        Some(qkv_vb.get("scales")?)
+    } else {
+        None
+    };
+    let biases = if scales.is_some() && qkv_vb.contains("biases") {
+        Some(qkv_vb.get("biases")?)
+    } else {
+        None
+    };
+
+    let head_dim = cfg.head_dim();
+    let num_q = cfg.num_attention_heads * head_dim;
+    let num_kv = cfg.num_kv_heads() * head_dim;
+
+    let (group_size, bits) = if let Some(ref s) = scales {
+        mlx_nn::infer_quant_params(&weight.shape_raw(), &s.shape_raw(), qc)
+    } else {
+        (0, 0)
+    };
+
+    let make_linear = |start: usize, stop: usize| -> anyhow::Result<Linear> {
+        let w = weight.slice(
+            &[start as i32, 0],
+            &[stop as i32, weight.shape_raw()[1]],
+        )?;
+        let s = scales.as_ref().map(|arr| {
+            arr.slice(
+                &[start as i32, 0],
+                &[stop as i32, arr.shape_raw()[1]],
+            )
+        }).transpose()?;
+        let b = biases.as_ref().map(|arr| {
+            arr.slice(
+                &[start as i32, 0],
+                &[stop as i32, arr.shape_raw()[1]],
+            )
+        }).transpose()?;
+        Ok(Linear::from_weights_quantized(w, None, s, b, group_size, bits))
+    };
+
+    Ok((
+        make_linear(0, num_q)?,
+        make_linear(num_q, num_q + num_kv)?,
+        make_linear(num_q + num_kv, num_q + num_kv + num_kv)?,
+    ))
+}
+
+/// Split a fused `gate_up_proj` tensor into separate gate and up linear layers.
+fn split_gate_up_proj(
+    vb: &VarBuilder,
+    cfg: &LlamaConfig,
+    qc: &mlx_nn::QuantConfig,
+) -> anyhow::Result<(Linear, Linear)> {
+    let gu_vb = vb.pp("gate_up_proj");
+    let weight = gu_vb.get("weight")?;
+    let scales = if gu_vb.contains("scales") {
+        Some(gu_vb.get("scales")?)
+    } else {
+        None
+    };
+    let biases = if scales.is_some() && gu_vb.contains("biases") {
+        Some(gu_vb.get("biases")?)
+    } else {
+        None
+    };
+
+    let mid = cfg.intermediate_size;
+    let total = mid * 2;
+
+    let (group_size, bits) = if let Some(ref s) = scales {
+        mlx_nn::infer_quant_params(&weight.shape_raw(), &s.shape_raw(), qc)
+    } else {
+        (0, 0)
+    };
+
+    let make_linear = |start: usize, stop: usize| -> anyhow::Result<Linear> {
+        let w = weight.slice(
+            &[start as i32, 0],
+            &[stop as i32, weight.shape_raw()[1]],
+        )?;
+        let s = scales.as_ref().map(|arr| {
+            arr.slice(
+                &[start as i32, 0],
+                &[stop as i32, arr.shape_raw()[1]],
+            )
+        }).transpose()?;
+        let b = biases.as_ref().map(|arr| {
+            arr.slice(
+                &[start as i32, 0],
+                &[stop as i32, arr.shape_raw()[1]],
+            )
+        }).transpose()?;
+        Ok(Linear::from_weights_quantized(w, None, s, b, group_size, bits))
+    };
+
+    Ok((make_linear(0, mid)?, make_linear(mid, total)?))
+}
+
 impl CausalSelfAttention {
     fn load(vb: &VarBuilder, cfg: &LlamaConfig) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
-        let q_proj = Linear::new(&vb.pp("q_proj"), &qc)?;
-        let k_proj = Linear::new(&vb.pp("k_proj"), &qc)?;
-        let v_proj = Linear::new(&vb.pp("v_proj"), &qc)?;
+        let (q_proj, k_proj, v_proj) = if vb.pp("qkv_proj").contains("weight") {
+            split_qkv_proj(vb, cfg, &qc)?
+        } else {
+            (
+                Linear::new(&vb.pp("q_proj"), &qc)?,
+                Linear::new(&vb.pp("k_proj"), &qc)?,
+                Linear::new(&vb.pp("v_proj"), &qc)?,
+            )
+        };
         let o_proj_vb = if vb.pp("o_proj").contains("weight") {
             vb.pp("o_proj")
         } else {
@@ -105,15 +223,16 @@ impl CausalSelfAttention {
         let o_proj = Linear::new(&o_proj_vb, &qc)?;
 
         let head_dim = cfg.head_dim();
+        let rope_dims = (head_dim as f32 * cfg.partial_rotary_factor) as i32;
         let rope = match &cfg.rope_scaling {
             Some(scaling) => RoPE::with_scaling(
-                head_dim as i32,
+                rope_dims,
                 cfg.rope_theta,
                 false,
                 scaling,
                 cfg.max_position_embeddings,
             )?,
-            None => RoPE::new(head_dim as i32, cfg.rope_theta, false),
+            None => RoPE::new(rope_dims, cfg.rope_theta, false),
         };
 
         Ok(Self {
@@ -189,9 +308,17 @@ struct Mlp {
 impl Mlp {
     fn load(vb: &VarBuilder, cfg: &LlamaConfig) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
+        let (gate_proj, up_proj) = if vb.pp("gate_up_proj").contains("weight") {
+            split_gate_up_proj(vb, cfg, &qc)?
+        } else {
+            (
+                Linear::new(&vb.pp("gate_proj"), &qc)?,
+                Linear::new(&vb.pp("up_proj"), &qc)?,
+            )
+        };
         Ok(Self {
-            gate_proj: Linear::new(&vb.pp("gate_proj"), &qc)?,
-            up_proj: Linear::new(&vb.pp("up_proj"), &qc)?,
+            gate_proj,
+            up_proj,
             down_proj: Linear::new(&vb.pp("down_proj"), &qc)?,
         })
     }

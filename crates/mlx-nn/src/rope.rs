@@ -15,7 +15,7 @@ pub struct RoPE {
 /// Configuration for RoPE scaling variants.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct RopeScaling {
-    #[serde(default)]
+    #[serde(default, alias = "type")]
     pub rope_type: Option<String>,
     #[serde(default = "default_factor")]
     pub factor: f32,
@@ -25,6 +25,10 @@ pub struct RopeScaling {
     pub high_freq_factor: f32,
     #[serde(default = "default_original_max_position_embeddings")]
     pub original_max_position_embeddings: usize,
+    #[serde(default)]
+    pub long_factor: Option<Vec<f32>>,
+    #[serde(default)]
+    pub short_factor: Option<Vec<f32>>,
 }
 
 fn default_factor() -> f32 {
@@ -164,6 +168,31 @@ impl RoPE {
                     freqs: Some(freqs_arr),
                 })
             }
+            "longrope" => {
+                let head_dim = dims as usize;
+                let dim = head_dim / 2;
+                let factors = scaling
+                    .long_factor
+                    .as_ref()
+                    .or(scaling.short_factor.as_ref())
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                let mut freqs = Vec::with_capacity(dim);
+                for i in (0..head_dim).step_by(2) {
+                    let idx = i / 2;
+                    let base_freq = base.powf(i as f32 / head_dim as f32);
+                    let factor = factors.get(idx).copied().unwrap_or(1.0f32);
+                    freqs.push(base_freq * factor);
+                }
+                let freqs_arr = Array::from_slice_f32(&freqs)?;
+                Ok(Self {
+                    dims,
+                    base,
+                    traditional,
+                    scale: 1.0,
+                    freqs: Some(freqs_arr),
+                })
+            }
             _ => {
                 // Default: apply scale factor
                 Ok(Self {
@@ -206,6 +235,8 @@ mod tests {
             low_freq_factor: 1.0,
             high_freq_factor: 4.0,
             original_max_position_embeddings: 8192,
+            long_factor: None,
+            short_factor: None,
         };
         assert_eq!(cfg.low_freq_factor, 1.0);
         assert_eq!(cfg.high_freq_factor, 4.0);

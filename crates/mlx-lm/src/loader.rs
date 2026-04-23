@@ -211,7 +211,7 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
             "bert" => return Ok(ModelArch::Bert),
             "gemma3" => return Ok(ModelArch::Gemma3),
             "gemma4" => return Ok(ModelArch::Gemma4),
-            "llama" => return Ok(ModelArch::Llama),
+            "llama" | "mistral" | "phi3" | "phi4" => return Ok(ModelArch::Llama),
             "qwen2" => return Ok(ModelArch::Qwen2),
             "qwen3_5" | "qwen3.5" => return Ok(ModelArch::Qwen35),
             "qwen3" => {
@@ -263,7 +263,11 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 if lower.contains("gemma3") {
                     return Ok(ModelArch::Gemma3);
                 }
-                if lower.contains("llama") {
+                if lower.contains("llama")
+                    || lower.contains("mistral")
+                    || lower.contains("phi3")
+                    || lower.contains("phi4")
+                {
                     return Ok(ModelArch::Llama);
                 }
                 if lower.contains("qwen2") && !lower.contains("qwen2_moe") && !lower.contains("qwen2moe") {
@@ -523,6 +527,51 @@ mod tests {
     #[test]
     fn detects_llama_from_model_type() {
         let config = json!({"model_type": "llama"});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Llama
+        ));
+    }
+
+    #[test]
+    fn detects_mistral_from_model_type() {
+        let config = json!({"model_type": "mistral"});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Llama
+        ));
+    }
+
+    #[test]
+    fn detects_mistral_from_architecture() {
+        let config = json!({"architectures": ["MistralForCausalLM"]});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Llama
+        ));
+    }
+
+    #[test]
+    fn detects_phi3_from_model_type() {
+        let config = json!({"model_type": "phi3"});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Llama
+        ));
+    }
+
+    #[test]
+    fn detects_phi3_from_architecture() {
+        let config = json!({"architectures": ["Phi3ForCausalLM"]});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Llama
+        ));
+    }
+
+    #[test]
+    fn detects_phi4_from_model_type() {
+        let config = json!({"model_type": "phi4"});
         assert!(matches!(
             detect_architecture(&config).unwrap(),
             ModelArch::Llama
