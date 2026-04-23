@@ -194,6 +194,7 @@ pub enum ModelArch {
     Gemma3,
     Gemma4,
     Llama,
+    Qwen2,
     Qwen3,
     Qwen35,
     QwenMoe,
@@ -211,6 +212,7 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
             "gemma3" => return Ok(ModelArch::Gemma3),
             "gemma4" => return Ok(ModelArch::Gemma4),
             "llama" => return Ok(ModelArch::Llama),
+            "qwen2" => return Ok(ModelArch::Qwen2),
             "qwen3_5" | "qwen3.5" => return Ok(ModelArch::Qwen35),
             "qwen3" => {
                 if config.get("num_experts").is_some()
@@ -263,6 +265,9 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 }
                 if lower.contains("llama") {
                     return Ok(ModelArch::Llama);
+                }
+                if lower.contains("qwen2") && !lower.contains("qwen2_moe") && !lower.contains("qwen2moe") {
+                    return Ok(ModelArch::Qwen2);
                 }
                 if lower.contains("qwen3") {
                     if config.get("num_experts").is_some()
@@ -440,6 +445,10 @@ pub fn load_model(
             let cfg: mlx_models::LlamaConfig = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Llama::new(&cfg, &vb)?)
         }
+        ModelArch::Qwen2 => {
+            let cfg: mlx_models::LlamaConfig = serde_json::from_value(config.clone())?;
+            Box::new(mlx_models::Llama::new(&cfg, &vb)?)
+        }
         ModelArch::Qwen3 => {
             let cfg: mlx_models::Qwen3Config = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Qwen3::new(&cfg, &vb)?)
@@ -510,11 +519,29 @@ mod tests {
     }
 
     #[test]
-    fn detects_gemma3_from_model_type() {
-        let config = json!({"model_type": "gemma3"});
+    fn detects_llama_from_model_type() {
+        let config = json!({"model_type": "llama"});
         assert!(matches!(
             detect_architecture(&config).unwrap(),
-            ModelArch::Gemma3
+            ModelArch::Llama
+        ));
+    }
+
+    #[test]
+    fn detects_qwen2_from_model_type() {
+        let config = json!({"model_type": "qwen2"});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Qwen2
+        ));
+    }
+
+    #[test]
+    fn detects_qwen2_from_architecture() {
+        let config = json!({"architectures": ["Qwen2ForCausalLM"]});
+        assert!(matches!(
+            detect_architecture(&config).unwrap(),
+            ModelArch::Qwen2
         ));
     }
 
