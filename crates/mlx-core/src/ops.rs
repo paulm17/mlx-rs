@@ -143,6 +143,73 @@ impl Array {
         }
     }
 
+    pub fn floor(&self) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_floor(&mut out, self.inner, s), "mlx_floor")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    pub fn ceil(&self) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_ceil(&mut out, self.inner, s), "mlx_ceil")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    pub fn round(&self, decimals: i32) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_round(&mut out, self.inner, decimals, s), "mlx_round")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    /// Element-wise maximum.
+    pub fn maximum(&self, other: &Array) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_maximum(&mut out, self.inner, other.inner, s), "mlx_maximum")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    /// Element-wise minimum.
+    pub fn minimum(&self, other: &Array) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_minimum(&mut out, self.inner, other.inner, s), "mlx_minimum")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    /// Clip values to [min, max].
+    pub fn clip(&self, min: &Array, max: &Array) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_clip(&mut out, self.inner, min.inner, max.inner, s), "mlx_clip")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    /// Logical not.
+    pub fn logical_not(&self) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_logical_not(&mut out, self.inner, s), "mlx_logical_not")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
     // ------------------------------------------------------------------
     // Activation functions
     // ------------------------------------------------------------------
@@ -297,6 +364,18 @@ impl Array {
             Self::check(
                 mlx_expand_dims(&mut out, self.inner, axis, s),
                 "mlx_expand_dims",
+            )?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    pub fn broadcast_to(&self, shape: &[i32]) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(
+                mlx_broadcast_to(&mut out, self.inner, shape.as_ptr(), shape.len(), s),
+                "mlx_broadcast_to",
             )?;
             Ok(Array::from_raw(out))
         }
@@ -849,6 +928,64 @@ impl Array {
         }
     }
 
+    pub fn equal(&self, other: &Array) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_equal(&mut out, self.inner, other.inner, s), "mlx_equal")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    pub fn not_equal(&self, other: &Array) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(mlx_not_equal(&mut out, self.inner, other.inner, s), "mlx_not_equal")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    pub fn greater_equal(&self, other: &Array) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(
+                mlx_greater_equal(&mut out, self.inner, other.inner, s),
+                "mlx_greater_equal",
+            )?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    pub fn less_equal(&self, other: &Array) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(
+                mlx_less_equal(&mut out, self.inner, other.inner, s),
+                "mlx_less_equal",
+            )?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Cumulative ops
+    // ------------------------------------------------------------------
+
+    pub fn cumsum(&self, axis: i32, reverse: bool, inclusive: bool) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(
+                mlx_cumsum(&mut out, self.inner, axis, reverse, inclusive, s),
+                "mlx_cumsum",
+            )?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
     // ------------------------------------------------------------------
     // Argpartition
     // ------------------------------------------------------------------
@@ -874,6 +1011,18 @@ impl Array {
         unsafe {
             let mut out: mlx_array = std::mem::zeroed();
             Self::check(mlx_power(&mut out, self.inner, other.inner, s), "mlx_power")?;
+            Ok(Array::from_raw(out))
+        }
+    }
+
+    pub fn remainder(&self, other: &Array) -> Result<Array> {
+        let s = Self::default_stream();
+        unsafe {
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(
+                mlx_remainder(&mut out, self.inner, other.inner, s),
+                "mlx_remainder",
+            )?;
             Ok(Array::from_raw(out))
         }
     }

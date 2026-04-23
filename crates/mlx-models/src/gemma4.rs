@@ -319,13 +319,49 @@ fn gelu_approx(x: &Array) -> Result<Array> {
     half.multiply(&gated)
 }
 
-#[allow(dead_code)]
-fn cache_index(layer_idx: usize, num_non_shared: usize) -> usize {
-    if num_non_shared > 0 {
-        layer_idx % num_non_shared
+/// Build the layer-index → cache-index mapping used for KV sharing.
+///
+/// Non-shared layers each own a cache. Shared layers reuse the cache of the
+/// last concrete layer with the same attention type (full or sliding).
+fn build_layer_idx_to_cache_idx(
+    num_hidden_layers: usize,
+    num_kv_shared_layers: usize,
+    layer_types: &[String],
+) -> Vec<usize> {
+    let first_kv_shared_layer_idx = if num_kv_shared_layers > 0 {
+        num_hidden_layers - num_kv_shared_layers
     } else {
-        layer_idx
+        num_hidden_layers
+    };
+    let num_caches = first_kv_shared_layer_idx;
+    let mut mapping: Vec<usize> = (0..num_caches).collect();
+
+    if first_kv_shared_layer_idx < num_hidden_layers {
+        let concrete_layers = &layer_types[..first_kv_shared_layer_idx];
+        let shared_full_idx = concrete_layers.len()
+            - 1
+            - concrete_layers
+                .iter()
+                .rev()
+                .position(|t| t == "full_attention")
+                .unwrap_or(0);
+        let shared_sliding_idx = concrete_layers.len()
+            - 1
+            - concrete_layers
+                .iter()
+                .rev()
+                .position(|t| t == "sliding_attention")
+                .unwrap_or(0);
+        for i in first_kv_shared_layer_idx..num_hidden_layers {
+            if layer_types[i] == "full_attention" {
+                mapping.push(shared_full_idx);
+            } else {
+                mapping.push(shared_sliding_idx);
+            }
+        }
     }
+
+    mapping
 }
 
 fn sliding_window_mask(
@@ -1189,6 +1225,25 @@ impl Gemma4DecoderLayer {
         })
     }
 
+    /// Apply per-layer input gating when all gating components are present.
+    ///
+    /// Computes: `residual + post_norm(proj(gelu_approx(gate_proj(h)) * layer_emb))`
+    fn apply_per_layer_gate(&self, h: &Array, layer_emb: &Array) -> Result<Array> {
+        if let (Some(ref gate_proj), Some(ref proj_proj), Some(ref post_norm)) =
+            (&self.per_layer_input_gate, &self.per_layer_projection, &self.post_per_layer_input_norm)
+        {
+            let residual = h.clone();
+            let gate = gate_proj.forward(h)?;
+            let gate = gelu_approx(&gate)?;
+            let gate = gate.multiply(layer_emb)?;
+            let gate = proj_proj.forward(&gate)?;
+            let gate = post_norm.forward(&gate)?;
+            residual.add(&gate)
+        } else {
+            Ok(h.clone())
+        }
+    }
+
     fn forward(
         &mut self,
         x: &Array,
@@ -1225,16 +1280,8 @@ impl Gemma4DecoderLayer {
         };
 
         // Per-layer input gating (after MLP, matching Python)
-        if let (Some(ref gate_proj), Some(ref proj_proj), Some(ref post_norm), Some(layer_emb)) =
-            (&self.per_layer_input_gate, &self.per_layer_projection, &self.post_per_layer_input_norm, layer_emb)
-        {
-            let residual = h.clone();
-            let gate = gate_proj.forward(&h)?;
-            let gate = gelu_approx(&gate)?;
-            let gate = gate.multiply(layer_emb)?;
-            let gate = proj_proj.forward(&gate)?;
-            let gate = post_norm.forward(&gate)?;
-            h = residual.add(&gate)?;
+        if let Some(layer_emb) = layer_emb {
+            h = self.apply_per_layer_gate(&h, layer_emb)?;
         }
 
         // Layer scalar
@@ -1318,40 +1365,13 @@ impl Gemma4TextModel {
             None
         };
 
-        let first_kv_shared_layer_idx = if cfg.num_kv_shared_layers > 0 {
-            cfg.num_hidden_layers - cfg.num_kv_shared_layers
-        } else {
-            cfg.num_hidden_layers
-        };
-        let num_caches = first_kv_shared_layer_idx;
+        let layer_idx_to_cache_idx = build_layer_idx_to_cache_idx(
+            cfg.num_hidden_layers,
+            cfg.num_kv_shared_layers,
+            &cfg.layer_types,
+        );
+        let num_caches = layer_idx_to_cache_idx.iter().copied().max().map_or(0, |m| m + 1);
         let caches = (0..num_caches).map(|_| KvCache::new()).collect();
-
-        // Build layer_idx_to_cache_idx matching Python logic
-        let mut layer_idx_to_cache_idx: Vec<usize> = (0..num_caches).collect();
-        if first_kv_shared_layer_idx < cfg.num_hidden_layers {
-            let concrete_layers = &cfg.layer_types[..first_kv_shared_layer_idx];
-            let shared_full_idx = concrete_layers.len()
-                - 1
-                - concrete_layers
-                    .iter()
-                    .rev()
-                    .position(|t| t == "full_attention")
-                    .unwrap_or(0);
-            let shared_sliding_idx = concrete_layers.len()
-                - 1
-                - concrete_layers
-                    .iter()
-                    .rev()
-                    .position(|t| t == "sliding_attention")
-                    .unwrap_or(0);
-            for i in first_kv_shared_layer_idx..cfg.num_hidden_layers {
-                if cfg.layer_types[i] == "full_attention" {
-                    layer_idx_to_cache_idx.push(shared_full_idx);
-                } else {
-                    layer_idx_to_cache_idx.push(shared_sliding_idx);
-                }
-            }
-        }
 
         Ok(Self {
             embed_tokens,
@@ -1580,28 +1600,92 @@ impl VisionPooler {
         })
     }
 
-    fn forward(&self, features: &Array) -> Result<Array> {
+    fn forward(
+        &self,
+        features: &Array,
+        patch_positions: &Array,
+        padding_positions: &Array,
+    ) -> Result<(Array, Array)> {
         let shape = features.shape_raw();
-        let batch = shape[0];
-        let seq_len = shape[1];
-        let hidden_size = shape[2];
+        let b = shape[0];
+        let seq_len = shape[1] as usize;
+        let hidden_size = shape[2] as usize;
+        let length = self.default_output_length;
 
-        let kernel = self.pooling_kernel_size as i32;
-        let num_pools = seq_len / kernel;
+        // Zero out padding tokens before pooling (matches HF masked_fill)
+        let expanded_padding = padding_positions.expand_dims(-1)?.broadcast_to(&shape)?;
+        let zero = Array::zeros(&shape, features.dtype())?;
+        let features = expanded_padding.where_cond(&zero, features)?;
 
-        if num_pools == 0 {
-            // Not enough tokens, return as-is truncated
-            let start = vec![0i32; 3];
-            let mut stop = shape.clone();
-            stop[1] = self.default_output_length as i32;
-            return features.slice(&start, &stop);
+        if seq_len == length {
+            let scaled = features.multiply(&Array::from_float((hidden_size as f32).sqrt())?)?;
+            let mask = padding_positions.logical_not()?;
+            return Ok((scaled, mask));
         }
 
-        let pooled = features
-            .reshape(&[batch, num_pools, kernel, hidden_size])?
-            .mean_axis(2, true)?;
+        let k = ((seq_len / length) as f32).sqrt() as i32;
+        let k_sq = (k * k) as f32;
 
-        pooled.squeeze(2)
+        // Clamp patch positions to >= 0 (padding positions are -1)
+        let zero_arr = Array::from_int(0)?;
+        let clamped = patch_positions.maximum(&zero_arr)?;
+
+        // max_x = max(clamped[..., 0]) + 1
+        let x_coords = clamped.slice(&[0, 0, 0], &[b, seq_len as i32, 1])?.squeeze(2)?;
+        let max_x = x_coords.max(Some(1), true)?.add(&Array::from_int(1)?)?;
+
+        // kernel_idxs = floor(clamped / k)
+        let k_f32 = Array::from_float(k as f32)?;
+        let kernel_idxs = clamped
+            .as_type(DType::Float32)?
+            .divide(&k_f32)?
+            .floor()?
+            .as_type(DType::Int32)?;
+
+        // kernel_idx = kernel_idxs[..., 0] + (max_x // k) * kernel_idxs[..., 1]
+        let idx_0 = kernel_idxs
+            .slice(&[0, 0, 0], &[b, seq_len as i32, 1])?
+            .squeeze(2)?;
+        let idx_1 = kernel_idxs
+            .slice(&[0, 0, 1], &[b, seq_len as i32, 2])?
+            .squeeze(2)?;
+        let max_x_div_k = max_x
+            .as_type(DType::Float32)?
+            .divide(&k_f32)?
+            .floor()?
+            .as_type(DType::Int32)?;
+        let kernel_idx = idx_0.add(&idx_1.multiply(&max_x_div_k)?)?;
+
+        // one_hot(kernel_idx, length) using equal + broadcast
+        let kernel_idx_3d = kernel_idx.expand_dims(-1)?; // [B, seq_len, 1]
+        let arange = Array::arange_int(length as i32, DType::Int32)?
+            .expand_dims(0)?
+            .expand_dims(0)?; // [1, 1, length]
+        let one_hot = kernel_idx_3d.equal(&arange)?; // [B, seq_len, length]
+
+        // weights = one_hot.astype(float32) / k_squared
+        let weights = one_hot
+            .as_type(DType::Float32)?
+            .divide(&Array::from_float(k_sq)?)?;
+
+        // output = einsum("bLl,bLd->bld", weights, features)
+        let w_exp = weights.expand_dims(-1)?; // [B, seq_len, length, 1]
+        let f_exp = features.expand_dims(2)?; // [B, seq_len, 1, hidden_size]
+        let prod = w_exp.multiply(&f_exp)?; // [B, seq_len, length, hidden_size]
+        let output = prod.sum_axis(1, false)?; // [B, length, hidden_size]
+        let output = output.as_type(features.dtype())?;
+
+        // mask = any(one_hot, axis=1) -> True if any patch maps to this output cell
+        let one_hot_f32 = one_hot.as_type(DType::Float32)?;
+        let has_any = one_hot_f32.max(Some(1), true)?; // [B, 1, length]
+        let mask = has_any
+            .greater(&Array::from_float(0.0)?)?
+            .squeeze(1)?; // [B, length]
+
+        // Scale by sqrt(hidden_size)
+        let scaled = output.multiply(&Array::from_float((hidden_size as f32).sqrt())?)?;
+
+        Ok((scaled, mask))
     }
 }
 
@@ -1659,7 +1743,13 @@ impl VisionAttention {
         })
     }
 
-    fn forward(&mut self, x: &Array, positions_h: &Array, positions_w: &Array) -> Result<Array> {
+    fn forward(
+        &mut self,
+        x: &Array,
+        positions_h: &Array,
+        positions_w: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
         let shape = x.shape_raw();
         let (b, seq_len, _) = (shape[0], shape[1], shape[2]);
 
@@ -1688,7 +1778,11 @@ impl VisionAttention {
         let k = repeat_kv(&k, n_rep)?;
         let v = repeat_kv(&v, n_rep)?;
 
-        let attn = q.fast_scaled_dot_product_attention(&k, &v, self.scale, "", None)?;
+        let attn = if let Some(m) = mask {
+            q.fast_scaled_dot_product_attention(&k, &v, self.scale, "array", Some(m))?
+        } else {
+            q.fast_scaled_dot_product_attention(&k, &v, self.scale, "", None)?
+        };
 
         let attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
             b,
@@ -1754,10 +1848,16 @@ impl VisionEncoderLayer {
         })
     }
 
-    fn forward(&mut self, x: &Array, positions_h: &Array, positions_w: &Array) -> Result<Array> {
+    fn forward(
+        &mut self,
+        x: &Array,
+        positions_h: &Array,
+        positions_w: &Array,
+        mask: Option<&Array>,
+    ) -> Result<Array> {
         let residual = x.clone();
         let h = self.input_layernorm.forward(x)?;
-        let h = self.self_attn.forward(&h, positions_h, positions_w)?;
+        let h = self.self_attn.forward(&h, positions_h, positions_w, mask)?;
         let h = self.post_attention_layernorm.forward(&h)?;
         let h = residual.add(&h)?;
 
@@ -1767,6 +1867,24 @@ impl VisionEncoderLayer {
         let h = self.post_feedforward_layernorm.forward(&h)?;
         residual.add(&h)
     }
+}
+
+pub fn build_vision_attention_mask(
+    num_real: usize,
+    max_patches: usize,
+    dtype: DType,
+) -> Result<Array> {
+    let mut mask_data = vec![0.0f32; max_patches * max_patches];
+    for i in 0..max_patches {
+        for j in 0..max_patches {
+            if i >= num_real || j >= num_real {
+                mask_data[i * max_patches + j] = f32::NEG_INFINITY;
+            }
+        }
+    }
+    Array::from_slice_f32(&mask_data)?
+        .reshape(&[1, 1, max_patches as i32, max_patches as i32])?
+        .as_type(dtype)
 }
 
 struct VisionModel {
@@ -1818,40 +1936,148 @@ impl VisionModel {
 
     fn forward(&mut self, images: &Array) -> Result<Array> {
         let shape = images.shape_raw();
-        let (_b, _c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let (b, _c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
         let patch_size = self.patch_embedder.patch_size as i32;
         let num_patches_h = h / patch_size;
         let num_patches_w = w / patch_size;
-        let num_patches = num_patches_h * num_patches_w;
+        let num_patches = (num_patches_h * num_patches_w) as usize;
 
         let (mut features, pos_emb) = self.patch_embedder.forward(images)?;
-
-        if let (Some(ref bias), Some(ref scale)) = (&self.std_bias, &self.std_scale) {
-            features = features.subtract(bias)?;
-            features = features.divide(scale)?;
-        }
+        let feature_shape = features.shape_raw();
+        let hidden_size = feature_shape[2] as usize;
 
         features = features.add(&pos_emb)?;
 
-        let mut pos_h = Vec::with_capacity(num_patches as usize);
-        let mut pos_w = Vec::with_capacity(num_patches as usize);
+        let max_patches = self.pooler.default_output_length
+            * self.pooler.pooling_kernel_size
+            * self.pooler.pooling_kernel_size;
+        let num_real = num_patches.min(max_patches);
+
+        // Truncate if too many patches
+        if num_patches > max_patches {
+            let start = vec![0i32, 0i32, 0i32];
+            let mut stop = feature_shape.clone();
+            stop[1] = max_patches as i32;
+            features = features.slice(&start, &stop)?;
+        }
+
+        // Build patch_positions [B, max_patches, 2] (x, y); padding = (-1, -1)
+        let mut patch_positions_data = Vec::with_capacity(b as usize * max_patches * 2);
+        for _bi in 0..b as usize {
+            for row in 0..num_patches_h {
+                for col in 0..num_patches_w {
+                    if patch_positions_data.len() >= (_bi + 1) * max_patches * 2 {
+                        break;
+                    }
+                    patch_positions_data.push(col as i32); // x
+                    patch_positions_data.push(row as i32); // y
+                }
+            }
+            while patch_positions_data.len() < (_bi + 1) * max_patches * 2 {
+                patch_positions_data.push(-1i32);
+                patch_positions_data.push(-1i32);
+            }
+        }
+        let patch_positions = Array::from_slice_i32(&patch_positions_data)?
+            .reshape(&[b, max_patches as i32, 2])?;
+
+        // Build padding_positions [B, max_patches] (bool)
+        let mut padding_data = Vec::with_capacity(b as usize * max_patches);
+        for _bi in 0..b as usize {
+            for _ in 0..num_real {
+                padding_data.push(0i32);
+            }
+            for _ in num_real..max_patches {
+                padding_data.push(1i32);
+            }
+        }
+        let padding_positions = Array::from_slice_i32(&padding_data)?
+            .reshape(&[b, max_patches as i32])?
+            .as_type(DType::Bool)?;
+
+        // Pad embeddings to max_patches with zeros
+        let num_padding = max_patches.saturating_sub(num_real);
+        if num_padding > 0 {
+            let pad_data = vec![0.0f32; (b as usize) * num_padding * hidden_size];
+            let pad = Array::from_slice_f32(&pad_data)?
+                .reshape(&[b, num_padding as i32, hidden_size as i32])?;
+            features = Array::concatenate(&[&features, &pad], 1)?;
+        }
+
+        // Build position arrays for max_patches (for RoPE)
+        let mut pos_h = Vec::with_capacity(max_patches);
+        let mut pos_w = Vec::with_capacity(max_patches);
         for row in 0..num_patches_h {
             for col in 0..num_patches_w {
+                if pos_h.len() >= num_real {
+                    break;
+                }
                 pos_h.push(row as i32);
                 pos_w.push(col as i32);
             }
+            if pos_h.len() >= num_real {
+                break;
+            }
+        }
+        while pos_h.len() < max_patches {
+            pos_h.push(0i32);
+            pos_w.push(0i32);
         }
         let positions_h = Array::from_slice_i32(&pos_h)?;
         let positions_w = Array::from_slice_i32(&pos_w)?;
 
+        let mask = build_vision_attention_mask(num_real, max_patches, features.dtype())?;
+
         for layer in &mut self.layers {
-            features = layer.forward(&features, &positions_h, &positions_w)?;
+            features = layer.forward(&features, &positions_h, &positions_w, Some(&mask))?;
         }
 
         if let Some(ref norm) = self.norm {
             features = norm.forward(&features)?;
         }
-        self.pooler.forward(&features)
+
+        // Pool with position-based averaging
+        let (pooled, pool_mask) =
+            self.pooler
+                .forward(&features, &patch_positions, &padding_positions)?;
+
+        // Strip padding: count valid tokens per batch and slice
+        let pool_mask_f32 = pool_mask.as_type(DType::Float32)?;
+        let valid_counts = pool_mask_f32.sum_axis(1, false)?; // [B]
+        let valid_counts_vec: Vec<i32> = valid_counts.to_vec_i32()?;
+
+        let stripped = if b == 1 {
+            let n_valid = valid_counts_vec[0] as usize;
+            let start = vec![0i32, 0i32, 0i32];
+            let mut stop = pooled.shape_raw();
+            stop[1] = n_valid as i32;
+            pooled.slice(&start, &stop)?
+        } else {
+            let mut all_real = Vec::with_capacity(b as usize);
+            for bi in 0..b as usize {
+                let n_valid = valid_counts_vec[bi] as usize;
+                let start = vec![bi as i32, 0i32, 0i32];
+                let mut stop = pooled.shape_raw();
+                stop[0] = bi as i32 + 1;
+                stop[1] = n_valid as i32;
+                let sliced = pooled.slice(&start, &stop)?;
+                all_real.push(sliced);
+            }
+            let concatenated = if all_real.len() == 1 {
+                all_real[0].clone()
+            } else {
+                Array::concatenate(&all_real.iter().collect::<Vec<_>>(), 0)?
+            };
+            concatenated.reshape(&[1, concatenated.dim(0), concatenated.dim(1)])?
+        };
+
+        // Apply standardize if configured (matches Python: after pooling)
+        if let (Some(ref bias), Some(ref scale)) = (&self.std_bias, &self.std_scale) {
+            let h = stripped.subtract(bias)?.multiply(scale)?;
+            Ok(h)
+        } else {
+            Ok(stripped)
+        }
     }
 }
 
@@ -1923,6 +2149,24 @@ impl Gemma4 {
         self.embed_vision.forward(&vision_features)
     }
 
+    pub fn masked_scatter(input_tensor: &Array, mask: &Array, source: &Array) -> Result<Array> {
+        let mask_flat = mask.flatten(0, -1)?.as_type(DType::Int32)?;
+        let indices = mask_flat.cumsum(0, false, true)?.subtract(&Array::from_int(1)?)?;
+
+        let source_flat = source.flatten(0, -1)?;
+        let source_size = source_flat.elem_count() as i32;
+        let mod_indices = if source_size > 0 {
+            indices.remainder(&Array::from_int(source_size)?)?
+        } else {
+            indices
+        };
+        let aligned = source_flat.take(&mod_indices, 0)?;
+
+        let input_flat = input_tensor.flatten(0, -1)?;
+        let result = mask_flat.where_cond(&aligned, &input_flat)?;
+        result.reshape(&input_tensor.shape_raw())
+    }
+
     fn compute_embeddings(
         &mut self,
         input_ids: &Array,
@@ -1935,12 +2179,10 @@ impl Gemma4 {
             let vision_features = self.vision_tower.forward(pixel_values)?;
             let vision_emb = self.embed_vision.forward(&vision_features)?;
 
-            let num_vision_tokens = vision_emb.shape_raw()[1];
-            let start = vec![0i32; 3];
-            let mut stop = h.shape_raw();
-            stop[1] = num_vision_tokens;
-            let strides = vec![1i32; 3];
-            h = h.slice_update(&vision_emb, &start, &stop, &strides)?;
+            let image_token_id_arr = Array::from_int(self.config.image_token_id as i32)?;
+            let image_mask = input_ids.equal(&image_token_id_arr)?;
+            let image_mask_expanded = image_mask.expand_dims(-1)?.broadcast_to(&h.shape_raw())?;
+            h = Self::masked_scatter(&h, &image_mask_expanded, &vision_emb)?;
         }
 
         let per_layer_inputs = if self.language_model.model.embed_tokens_per_layer.is_some() {
@@ -2092,14 +2334,60 @@ mod tests {
     }
 
     #[test]
-    fn cache_index_works() {
-        // 35 layers, 15 non-shared, 20 shared
-        assert_eq!(cache_index(0, 15), 0);
-        assert_eq!(cache_index(14, 15), 14);
-        assert_eq!(cache_index(15, 15), 0);
-        assert_eq!(cache_index(29, 15), 14);
-        assert_eq!(cache_index(30, 15), 0);
-        assert_eq!(cache_index(34, 15), 4);
+    fn kv_sharing_maps_to_last_concrete_layer() {
+        // Simulate a 35-layer 2B model with sliding_window_pattern=5:
+        // 4 sliding, 1 full, repeating.
+        let mut layer_types: Vec<String> = Vec::new();
+        for i in 0..35 {
+            if (i + 1) % 5 == 0 {
+                layer_types.push("full_attention".to_string());
+            } else {
+                layer_types.push("sliding_attention".to_string());
+            }
+        }
+
+        let mapping = build_layer_idx_to_cache_idx(35, 20, &layer_types);
+
+        // 15 non-shared layers each own a cache
+        assert_eq!(mapping[0], 0);
+        assert_eq!(mapping[14], 14);
+
+        // Concrete layers 0-14:
+        //   full at indices: 4, 9, 14   => last = 14
+        //   sliding at indices: 0,1,2,3,5,6,7,8,10,11,12,13 => last = 13
+        // Shared layers 15-34 map to last concrete layer of same type
+        for i in 15..35 {
+            let expected = if layer_types[i] == "full_attention" { 14 } else { 13 };
+            assert_eq!(mapping[i], expected, "layer {i} ({}) should map to cache {expected}", layer_types[i]);
+        }
+    }
+
+    #[test]
+    fn kv_sharing_no_sharing() {
+        let layer_types: Vec<String> = (0..10).map(|i| {
+            if i % 2 == 0 { "full_attention".to_string() } else { "sliding_attention".to_string() }
+        }).collect();
+
+        let mapping = build_layer_idx_to_cache_idx(10, 0, &layer_types);
+
+        // No sharing: each layer has its own cache
+        assert_eq!(mapping, vec![0, 1, 2, 3, 4, 5, 6, 7, 8, 9]);
+    }
+
+    #[test]
+    fn kv_sharing_all_shared() {
+        let layer_types: Vec<String> = (0..6).map(|_| "full_attention".to_string()).collect();
+
+        // 2 non-shared, 4 shared
+        let mapping = build_layer_idx_to_cache_idx(6, 4, &layer_types);
+
+        assert_eq!(mapping[0], 0);
+        assert_eq!(mapping[1], 1);
+        // All shared layers map to last concrete full_attention layer = 1
+        assert_eq!(mapping[2], 1);
+        assert_eq!(mapping[3], 1);
+        assert_eq!(mapping[4], 1);
+        assert_eq!(mapping[5], 1);
     }
 
     #[test]
@@ -2127,5 +2415,302 @@ mod tests {
         .unwrap();
         assert!((params.rope_theta - 10000.0).abs() < 1e-6);
         assert!((params.partial_rotary_factor - 0.25).abs() < 1e-6);
+    }
+
+    #[test]
+    fn vision_pooler_shortcut_zeros_padding() {
+        // seq_len == default_output_length => shortcut path
+        let cfg = Gemma4VisionConfig {
+            hidden_size: 2,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 2,
+            global_head_dim: 2,
+            intermediate_size: 4,
+            patch_size: 2,
+            position_embedding_size: 2,
+            pooling_kernel_size: 2,
+            default_output_length: 2,
+            max_patches: 4,
+            standardize: false,
+            rope_parameters: HashMap::new(),
+            use_clipped_linears: false,
+        };
+        let vb = VarBuilder::from_weights(HashMap::new(), mlx_core::DType::Float32);
+        let pooler = VisionPooler::new(&vb, &cfg).unwrap();
+
+        // features: [1, 2, 3, 4] -> [1, 2, 2]
+        let features = Array::from_slice_f32(&[1.0, 2.0, 3.0, 4.0])
+            .unwrap()
+            .reshape(&[1, 2, 2])
+            .unwrap();
+        // patch positions don't matter on shortcut path
+        let patch_positions = Array::from_slice_i32(&[0, 0, 0, 0])
+            .unwrap()
+            .reshape(&[1, 2, 2])
+            .unwrap();
+        // padding_positions = [false, true] => second token is padding
+        let padding_positions = Array::from_slice_f32(&[0.0, 1.0])
+            .unwrap()
+            .reshape(&[1, 2])
+            .unwrap()
+            .greater(&Array::from_float(0.5).unwrap())
+            .unwrap();
+
+        let (pooled, mask) = pooler.forward(&features, &patch_positions, &padding_positions).unwrap();
+
+        // After zeroing padding and scaling by sqrt(2):
+        // [[1*sqrt(2), 2*sqrt(2)], [0, 0]]
+        let sqrt2 = 2.0f32.sqrt();
+        let pooled_data: Vec<f32> = pooled.to_vec_f32().unwrap();
+        assert_eq!(pooled_data.len(), 4);
+        assert!((pooled_data[0] - 1.0 * sqrt2).abs() < 1e-4);
+        assert!((pooled_data[1] - 2.0 * sqrt2).abs() < 1e-4);
+        assert!((pooled_data[2] - 0.0).abs() < 1e-4);
+        assert!((pooled_data[3] - 0.0).abs() < 1e-4);
+
+        // mask should be [true, false]
+        let mask_data: Vec<i32> = mask.as_type(mlx_core::DType::Int32).unwrap().to_vec_i32().unwrap();
+        assert_eq!(mask_data, vec![1, 0]);
+    }
+
+    #[test]
+    fn vision_pooler_position_based_pooling() {
+        // 2x2 grid of patches -> single pooled token (k=2)
+        let cfg = Gemma4VisionConfig {
+            hidden_size: 1,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 1,
+            global_head_dim: 1,
+            intermediate_size: 4,
+            patch_size: 2,
+            position_embedding_size: 2,
+            pooling_kernel_size: 2,
+            default_output_length: 1,
+            max_patches: 4,
+            standardize: false,
+            rope_parameters: HashMap::new(),
+            use_clipped_linears: false,
+        };
+        let vb = VarBuilder::from_weights(HashMap::new(), mlx_core::DType::Float32);
+        let pooler = VisionPooler::new(&vb, &cfg).unwrap();
+
+        // features: [1, 2, 3, 4] -> [1, 4, 1]
+        let features = Array::from_slice_f32(&[1.0, 2.0, 3.0, 4.0])
+            .unwrap()
+            .reshape(&[1, 4, 1])
+            .unwrap();
+        // patch positions: (0,0), (0,1), (1,0), (1,1)
+        let patch_positions = Array::from_slice_i32(&[0, 0, 0, 1, 1, 0, 1, 1])
+            .unwrap()
+            .reshape(&[1, 4, 2])
+            .unwrap();
+        // no padding
+        let padding_positions = Array::from_slice_f32(&[0.0, 0.0, 0.0, 0.0])
+            .unwrap()
+            .reshape(&[1, 4])
+            .unwrap()
+            .greater(&Array::from_float(0.5).unwrap())
+            .unwrap();
+
+        let (pooled, mask) = pooler.forward(&features, &patch_positions, &padding_positions).unwrap();
+
+        // All 4 patches map to kernel cell 0; average = (1+2+3+4)/4 = 2.5
+        // scaled by sqrt(1) = 1.0
+        let pooled_data: Vec<f32> = pooled.to_vec_f32().unwrap();
+        assert_eq!(pooled_data.len(), 1);
+        assert!((pooled_data[0] - 2.5).abs() < 1e-4);
+
+        let mask_data: Vec<i32> = mask.as_type(mlx_core::DType::Int32).unwrap().to_vec_i32().unwrap();
+        assert_eq!(mask_data, vec![1]);
+    }
+
+    #[test]
+    fn vision_pooler_zeros_padding_before_pooling() {
+        // Same as above but one patch is padding -> should be zeroed before pooling
+        let cfg = Gemma4VisionConfig {
+            hidden_size: 1,
+            num_hidden_layers: 1,
+            num_attention_heads: 1,
+            num_key_value_heads: 1,
+            head_dim: 1,
+            global_head_dim: 1,
+            intermediate_size: 4,
+            patch_size: 2,
+            position_embedding_size: 2,
+            pooling_kernel_size: 2,
+            default_output_length: 1,
+            max_patches: 4,
+            standardize: false,
+            rope_parameters: HashMap::new(),
+            use_clipped_linears: false,
+        };
+        let vb = VarBuilder::from_weights(HashMap::new(), mlx_core::DType::Float32);
+        let pooler = VisionPooler::new(&vb, &cfg).unwrap();
+
+        let features = Array::from_slice_f32(&[1.0, 2.0, 3.0, 4.0])
+            .unwrap()
+            .reshape(&[1, 4, 1])
+            .unwrap();
+        let patch_positions = Array::from_slice_i32(&[0, 0, 0, 1, 1, 0, 1, 1])
+            .unwrap()
+            .reshape(&[1, 4, 2])
+            .unwrap();
+        // third patch is padding
+        let padding_positions = Array::from_slice_f32(&[0.0, 0.0, 1.0, 0.0])
+            .unwrap()
+            .reshape(&[1, 4])
+            .unwrap()
+            .greater(&Array::from_float(0.5).unwrap())
+            .unwrap();
+
+        let (pooled, _mask) = pooler.forward(&features, &patch_positions, &padding_positions).unwrap();
+
+        // After zeroing: [1, 2, 0, 4]; average = (1+2+0+4)/4 = 1.75
+        let pooled_data: Vec<f32> = pooled.to_vec_f32().unwrap();
+        assert_eq!(pooled_data.len(), 1);
+        assert!((pooled_data[0] - 1.75).abs() < 1e-4);
+    }
+
+    #[test]
+    fn per_layer_gate_computation() {
+        // Verify the per-layer gating math: residual + post_norm(proj(gelu_approx(gate_proj(h)) * layer_emb))
+        let hidden_size = 4;
+        let hidden_per_layer = 2;
+
+        // gate_proj: [hidden_per_layer, hidden_size] — extracts first 2 elements
+        let gate_proj_w = Array::from_slice_f32(&[
+            1.0, 0.0, 0.0, 0.0,
+            0.0, 1.0, 0.0, 0.0,
+        ])
+        .unwrap()
+        .reshape(&[hidden_per_layer as i32, hidden_size as i32])
+        .unwrap();
+
+        // proj_proj: [hidden_size, hidden_per_layer] — pads back to 4
+        let proj_proj_w = Array::from_slice_f32(&[
+            1.0, 0.0,
+            0.0, 1.0,
+            0.0, 0.0,
+            0.0, 0.0,
+        ])
+        .unwrap()
+        .reshape(&[hidden_size as i32, hidden_per_layer as i32])
+        .unwrap();
+
+        let layer = Gemma4DecoderLayer {
+            input_layernorm: RmsNormZeroShift {
+                weight: Array::from_slice_f32(&[1.0, 1.0, 1.0, 1.0]).unwrap(),
+                eps: 1e-6,
+            },
+            post_attn_layernorm: RmsNormZeroShift {
+                weight: Array::from_slice_f32(&[1.0, 1.0, 1.0, 1.0]).unwrap(),
+                eps: 1e-6,
+            },
+            pre_ffw_layernorm: RmsNormZeroShift {
+                weight: Array::from_slice_f32(&[1.0, 1.0, 1.0, 1.0]).unwrap(),
+                eps: 1e-6,
+            },
+            post_ffw_layernorm: RmsNormZeroShift {
+                weight: Array::from_slice_f32(&[1.0, 1.0, 1.0, 1.0]).unwrap(),
+                eps: 1e-6,
+            },
+            self_attn: Gemma4Attention {
+                q_proj: Linear::from_weights(
+                    Array::zeros(&[4, 4], DType::Float32).unwrap(),
+                    None,
+                ),
+                k_proj: Linear::from_weights(
+                    Array::zeros(&[4, 4], DType::Float32).unwrap(),
+                    None,
+                ),
+                v_proj: Some(Linear::from_weights(
+                    Array::zeros(&[4, 4], DType::Float32).unwrap(),
+                    None,
+                )),
+                o_proj: Linear::from_weights(
+                    Array::zeros(&[4, 4], DType::Float32).unwrap(),
+                    None,
+                ),
+                q_norm: RmsNormZeroShift {
+                    weight: Array::from_slice_f32(&[1.0, 1.0, 1.0, 1.0]).unwrap(),
+                    eps: 1e-6,
+                },
+                k_norm: RmsNormZeroShift {
+                    weight: Array::from_slice_f32(&[1.0, 1.0, 1.0, 1.0]).unwrap(),
+                    eps: 1e-6,
+                },
+                v_norm: RmsNormNoScale { eps: 1e-6 },
+                n_heads: 1,
+                n_kv_heads: 1,
+                head_dim: 4,
+                scale: 1.0,
+                is_sliding: false,
+                is_kv_shared_layer: false,
+                use_proportional_rope: false,
+                rope_theta: 10000.0,
+                partial_rotary_factor: 0.25,
+                sliding_window: 512,
+                k_eq_v: false,
+            },
+            mlp: Gemma4Mlp {
+                gate_proj: Linear::from_weights(
+                    Array::zeros(&[4, 4], DType::Float32).unwrap(),
+                    None,
+                ),
+                up_proj: Linear::from_weights(
+                    Array::zeros(&[4, 4], DType::Float32).unwrap(),
+                    None,
+                ),
+                down_proj: Linear::from_weights(
+                    Array::zeros(&[4, 4], DType::Float32).unwrap(),
+                    None,
+                ),
+            },
+            moe: None,
+            post_ffw_layernorm_1: None,
+            post_ffw_layernorm_2: None,
+            pre_ffw_layernorm_2: None,
+            layer_scalar: None,
+            is_sliding: false,
+            per_layer_input_gate: Some(Linear::from_weights(gate_proj_w, None)),
+            per_layer_projection: Some(Linear::from_weights(proj_proj_w, None)),
+            post_per_layer_input_norm: Some(RmsNormZeroShift {
+                weight: Array::from_slice_f32(&[1.0, 1.0, 1.0, 1.0]).unwrap(),
+                eps: 1e-6,
+            }),
+        };
+
+        // h = [1, 2, 3, 4]
+        let h = Array::from_slice_f32(&[1.0, 2.0, 3.0, 4.0])
+            .unwrap()
+            .reshape(&[1, 1, hidden_size as i32])
+            .unwrap();
+
+        // layer_emb = [0.5, 0.5]
+        let layer_emb = Array::from_slice_f32(&[0.5, 0.5])
+            .unwrap()
+            .reshape(&[1, 1, hidden_per_layer as i32])
+            .unwrap();
+
+        let result = layer.apply_per_layer_gate(&h, &layer_emb).unwrap();
+
+        // Verify output shape
+        assert_eq!(result.shape_raw(), vec![1, 1, hidden_size as i32]);
+
+        // gate_proj(h) extracts [1, 2]
+        // gelu_approx([1, 2]) ≈ [0.841, 1.935]
+        // multiply by layer_emb [0.5, 0.5] ≈ [0.4205, 0.9675]
+        // proj_proj pads back to [0.4205, 0.9675, 0, 0]
+        // post_norm with weight=1 is approximately identity (with slight RMS scaling)
+        // residual + gate ≈ [1.4205, 2.9675, 3, 4]
+        let data: Vec<f32> = result.to_vec_f32().unwrap();
+        assert!(data[0] > 1.0); // 1 + positive gate
+        assert!(data[1] > 2.0); // 2 + positive gate
+        assert!(data[2] == 3.0); // unchanged (proj pads with zeros)
+        assert!(data[3] == 4.0); // unchanged
     }
 }

@@ -952,6 +952,4 @@ Python's sanitize() splits stacked expert weights:
 
 | R7 | **Implement `sanitize()` function** | Hard | `gemma4.rs` | Required for MoE weight stacking, stripping clipping params when `use_clipped_linears=false`, and per-layer quantization overrides. |
 | R12 | **`generate.rs`: full autoregressive loop** | Hard | `generate.rs` | Stub returns empty string. Need full sampling loop with image token injection, temperature sampling, and EOS handling. |
-| R14 | **Build + test 2B** | Hard | All | End-to-end weight loading and inference test. |
-| R15 | **Build + test 31B** | Hard | All | End-to-end weight loading and inference test. |
-| R16 | **Build + test 26B MoE** | Hard | All | End-to-end weight loading and inference test. |
+

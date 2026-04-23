@@ -119,6 +119,24 @@ impl Array {
         }
     }
 
+    /// Create a 1D range array [start, stop) with given step and dtype.
+    pub fn arange(start: f64, stop: f64, step: f64, dtype: DType) -> Result<Self> {
+        unsafe {
+            let s = Self::default_stream();
+            let mut out: mlx_array = std::mem::zeroed();
+            Self::check(
+                mlx_arange(&mut out, start, stop, step, dtype.to_mlx(), s),
+                "mlx_arange",
+            )?;
+            Ok(Self::from_raw(out))
+        }
+    }
+
+    /// Create a 1D range array [0, stop) with step 1 and given dtype.
+    pub fn arange_int(stop: i32, dtype: DType) -> Result<Self> {
+        Self::arange(0.0, stop as f64, 1.0, dtype)
+    }
+
     /// Create an array from raw data with a given shape and dtype.
     pub fn from_data(data: &[u8], shape: &[i32], dtype: DType) -> Result<Self> {
         unsafe {
