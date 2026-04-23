@@ -339,10 +339,12 @@ fn extend_stop_tokens_from_value(
 }
 
 fn gemma3_text_config(config: &Value) -> Result<Value> {
-    let mut text = config
-        .get("text_config")
-        .cloned()
-        .ok_or_else(|| anyhow::anyhow!("gemma3 config missing text_config"))?;
+    // Text-only Gemma3 models (e.g. gemma-3-1b-it) have config fields at the top level.
+    // Multimodal Gemma3 models nest text config under `text_config`.
+    let mut text = match config.get("text_config") {
+        Some(tc) => tc.clone(),
+        None => return Ok(config.clone()),
+    };
 
     let text_obj = text
         .as_object_mut()

@@ -171,7 +171,21 @@ impl GemmaAttention {
         let q_norm = GemmaRmsNorm::new(cfg.rms_norm_eps, &vb.pp("q_norm"))?;
         let k_norm = GemmaRmsNorm::new(cfg.rms_norm_eps, &vb.pp("k_norm"))?;
 
-        let head_dim = cfg.head_dim();
+        let head_dim = if let Some(hd) = cfg.head_dim {
+            hd
+        } else {
+            // Infer from q_proj weight shape when config omits head_dim.
+            // For quantized weights the packed tensor is [out_features, ...];
+            // for full-precision it's [in_features, out_features].
+            let is_quantized = vb.pp("q_proj").contains("scales");
+            let shape = q_proj.weight().shape_raw();
+            let out_features = if is_quantized {
+                shape[0] as usize
+            } else {
+                shape[1] as usize
+            };
+            out_features / cfg.num_attention_heads
+        };
         let rope_theta = if sliding_window.is_some() {
             cfg.rope_local_base_freq
         } else {
@@ -308,30 +322,54 @@ fn sliding_window_mask(
         .as_type(dtype)
 }
 
+fn gelu_approx(x: &Array) -> Result<Array> {
+    let half = Array::from_float(0.5)?;
+    let one = Array::from_float(1.0)?;
+    let sqrt_2_over_pi = Array::from_float((2.0f32 / std::f32::consts::PI).sqrt())?;
+    let coeff = Array::from_float(0.044715f32)?;
+    let three = Array::from_float(3.0)?;
+
+    let x3 = x.power(&three)?;
+    let inner = x.add(&x3.multiply(&coeff)?)?;
+    let inner = inner.multiply(&sqrt_2_over_pi)?;
+    let tanh_val = inner.tanh()?;
+    let gate = one.add(&tanh_val)?;
+    let gated = x.multiply(&gate)?;
+    half.multiply(&gated)
+}
+
+#[derive(Clone, Copy)]
+enum Activation {
+    Silu,
+    Gelu,
+}
+
 struct GemmaMlp {
     gate_proj: Linear,
     up_proj: Linear,
     down_proj: Linear,
+    activation: Activation,
 }
 
 impl GemmaMlp {
     fn load(vb: &VarBuilder, cfg: &Gemma3Config) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
-        anyhow::ensure!(
-            cfg.mlp_uses_silu(),
-            "only silu hidden activation is supported for Gemma3"
-        );
+        let activation = cfg.mlp_uses_silu().then_some(Activation::Silu).unwrap_or(Activation::Gelu);
         Ok(Self {
             gate_proj: Linear::new(&vb.pp("gate_proj"), &qc)?,
             up_proj: Linear::new(&vb.pp("up_proj"), &qc)?,
             down_proj: Linear::new(&vb.pp("down_proj"), &qc)?,
+            activation,
         })
     }
 
     fn forward(&self, x: &Array) -> Result<Array> {
         let gate = self.gate_proj.forward(x)?;
         let up = self.up_proj.forward(x)?;
-        let gate = gate.multiply(&gate.sigmoid()?)?;
+        let gate = match self.activation {
+            Activation::Silu => gate.multiply(&gate.sigmoid()?)?,
+            Activation::Gelu => gelu_approx(&gate)?,
+        };
         self.down_proj.forward(&gate.multiply(&up)?)
     }
 }
@@ -401,7 +439,16 @@ pub struct Gemma3 {
 impl Gemma3 {
     pub fn new(cfg: &Gemma3Config, vb: &VarBuilder) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
-        let model_vb = vb.pp("language_model").pp("model");
+
+        // Text-only Gemma3 (e.g. gemma-3-1b-it) stores weights at model.* / lm_head.*
+        // Multimodal Gemma3 (e.g. gemma-3-4b-it) nests them under language_model.*
+        let has_language_model = vb.pp("language_model").pp("model").pp("embed_tokens").contains("weight");
+        let (model_vb, lm_head_vb) = if has_language_model {
+            (vb.pp("language_model").pp("model"), vb.pp("language_model").pp("lm_head"))
+        } else {
+            (vb.pp("model"), vb.pp("lm_head"))
+        };
+
         let embed_tokens = Embedding::new(&model_vb.pp("embed_tokens"), &qc)?;
 
         let mut layers = Vec::with_capacity(cfg.num_hidden_layers);
@@ -419,12 +466,10 @@ impl Gemma3 {
         }
 
         let norm = GemmaRmsNorm::new(cfg.rms_norm_eps, &model_vb.pp("norm"))?;
-        let lm_head = if cfg.tie_word_embeddings
-            && !vb.pp("language_model").pp("lm_head").contains("weight")
-        {
+        let lm_head = if !lm_head_vb.contains("weight") {
             embed_tokens.as_linear()
         } else {
-            Linear::new(&vb.pp("language_model").pp("lm_head"), &qc)?
+            Linear::new(&lm_head_vb, &qc)?
         };
         let embed_scale = Array::from_float((cfg.hidden_size as f32).sqrt())?;
 
