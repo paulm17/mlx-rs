@@ -2119,6 +2119,123 @@ pub struct Gemma4 {
     config: Gemma4Config,
 }
 
+/// Sanitize raw safetensors weights before model construction.
+///
+/// Applies the same transformations as Python's `Gemma4.sanitize()`:
+/// 1. Strip clipping params when `use_clipped_linears=false` (vision)
+/// 2. Strip `rotary_emb` params
+/// 3. Strip audio weights when no audio tower
+/// 4. Remap keys (`model.` prefix, `language_model.` → `language_model.model.`)
+/// 5. Transpose conv weights (PyTorch → MLX layout)
+/// 6. Split MoE `experts.gate_up_proj` into separate gate/up weights
+pub fn sanitize_weights(
+    weights: HashMap<String, Array>,
+    config: &Gemma4Config,
+) -> HashMap<String, Array> {
+    let mut sanitized = HashMap::with_capacity(weights.len());
+    let use_clipped = config.vision_config.use_clipped_linears;
+    let has_audio = config.audio_config.is_some();
+
+    for (key, mut value) in weights {
+        // Skip clipping parameters when not used
+        if key.contains("input_max")
+            || key.contains("input_min")
+            || key.contains("output_max")
+            || key.contains("output_min")
+        {
+            if key.contains("vision_tower") && !use_clipped {
+                continue;
+            }
+            if !key.contains("vision_tower") && !key.contains("audio_tower") {
+                continue;
+            }
+        }
+
+        // Skip rotary embedding params
+        if key.contains("rotary_emb.inv_freq") || key.contains("rotary_emb") {
+            continue;
+        }
+
+        // Skip audio weights when no audio tower
+        if !has_audio && (key.contains("audio_tower") || key.contains("embed_audio")) {
+            continue;
+        }
+
+        // Key remapping
+        let mut new_key = if key.starts_with("model.") {
+            key["model.".len()..].to_string()
+        } else {
+            key.clone()
+        };
+
+        if new_key.starts_with("language_model.") && !new_key.starts_with("language_model.model.") {
+            new_key = format!("language_model.model.{}", &new_key["language_model.".len()..]);
+        }
+
+        // Conv2d: PyTorch [out, in, kH, kW] → MLX [out, kH, kW, in]
+        if new_key.contains("subsample_conv_projection")
+            && new_key.contains("conv.weight")
+            && value.ndim() == 4
+        {
+            value = value.transpose_axes(&[0, 2, 3, 1]).unwrap_or(value);
+        }
+
+        // Conv1d: PyTorch [out, in, kW] → MLX [out, kW, in]
+        if new_key.contains("depthwise_conv1d.weight") && value.ndim() == 3 {
+            value = value.transpose_axes(&[0, 2, 1]).unwrap_or(value);
+        }
+
+        // MoE: experts.down_proj → experts.switch_glu.down_proj.weight
+        if new_key.ends_with(".experts.down_proj") {
+            new_key = new_key.replace(".experts.down_proj", ".experts.switch_glu.down_proj.weight");
+        }
+
+        // MoE: experts.gate_up_proj → split into gate_proj + up_proj
+        if new_key.ends_with(".experts.gate_up_proj") {
+            let gate_key = new_key.replace(".experts.gate_up_proj", ".experts.switch_glu.gate_proj.weight");
+            let up_key = new_key.replace(".experts.gate_up_proj", ".experts.switch_glu.up_proj.weight");
+
+            // swapaxes(-1, -2): transpose last two dims
+            let ndim = value.ndim() as i32;
+            let mut perm: Vec<i32> = (0..ndim).collect();
+            perm.swap((ndim - 1) as usize, (ndim - 2) as usize);
+            let value = value.transpose_axes(&perm).unwrap_or(value);
+
+            // Split last dim in half
+            let shape = value.shape_raw();
+            let last_dim = shape.last().copied().unwrap_or(0) as usize;
+            let mid = last_dim / 2;
+
+            // Slice first half for gate
+            let start_gate = vec![0i32; shape.len()];
+            let mut stop_gate = shape.clone();
+            stop_gate[shape.len() - 1] = mid as i32;
+            let gate_val = value.slice(&start_gate, &stop_gate).unwrap_or(value.clone());
+
+            // Swap back
+            let gate_val = gate_val.transpose_axes(&perm).unwrap_or(gate_val);
+            sanitized.insert(gate_key, gate_val);
+
+            // Slice second half for up
+            let mut start_up = vec![0i32; shape.len()];
+            start_up[shape.len() - 1] = mid as i32;
+            let mut stop_up = shape.clone();
+            stop_up[shape.len() - 1] = last_dim as i32;
+            let up_val = value.slice(&start_up, &stop_up).unwrap_or(value.clone());
+
+            // Swap back
+            let up_val = up_val.transpose_axes(&perm).unwrap_or(up_val);
+            sanitized.insert(up_key, up_val);
+
+            continue;
+        }
+
+        sanitized.insert(new_key, value);
+    }
+
+    sanitized
+}
+
 impl Gemma4 {
     pub fn new(vb: &VarBuilder, config: &Gemma4Config) -> anyhow::Result<Self> {
         let language_model = LanguageModel::new(
@@ -2712,5 +2829,246 @@ mod tests {
         assert!(data[1] > 2.0); // 2 + positive gate
         assert!(data[2] == 3.0); // unchanged (proj pads with zeros)
         assert!(data[3] == 4.0); // unchanged
+    }
+
+    fn make_test_config(use_clipped: bool) -> Gemma4Config {
+        Gemma4Config {
+            model_type: "gemma4".to_string(),
+            image_token_id: 258880,
+            audio_token_id: None,
+            boi_token_id: 255999,
+            eoi_token_id: 258882,
+            boa_token_id: None,
+            eoa_token_id: None,
+            vision_soft_tokens_per_image: 280,
+            text_config: Gemma4TextConfig {
+                hidden_size: 4,
+                num_hidden_layers: 2,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 4,
+                global_head_dim: 4,
+                num_global_key_value_heads: None,
+                intermediate_size: 8,
+                vocab_size: 100,
+                sliding_window: 512,
+                sliding_window_pattern: 5,
+                layer_types: vec!["sliding_attention".to_string(), "full_attention".to_string()],
+                rope_parameters: HashMap::new(),
+                final_logit_softcapping: None,
+                tie_word_embeddings: false,
+                rms_norm_eps: 1e-6,
+                hidden_activation: "gelu".to_string(),
+                enable_moe_block: false,
+                num_experts: None,
+                top_k_experts: None,
+                moe_intermediate_size: None,
+                attention_k_eq_v: false,
+                num_kv_shared_layers: 0,
+                hidden_size_per_layer_input: 0,
+                use_double_wide_mlp: false,
+                vocab_size_per_layer_input: 262144,
+            },
+            vision_config: Gemma4VisionConfig {
+                hidden_size: 4,
+                num_hidden_layers: 1,
+                num_attention_heads: 1,
+                num_key_value_heads: 1,
+                head_dim: 4,
+                global_head_dim: 4,
+                intermediate_size: 8,
+                patch_size: 2,
+                position_embedding_size: 2,
+                pooling_kernel_size: 2,
+                default_output_length: 1,
+                max_patches: 4,
+                standardize: false,
+                rope_parameters: HashMap::new(),
+                use_clipped_linears: use_clipped,
+            },
+            audio_config: None,
+        }
+    }
+
+    #[test]
+    fn sanitize_strips_clipping_params_when_not_used() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "vision_tower.some_layer.input_max".to_string(),
+            Array::from_slice_f32(&[1.0]).unwrap(),
+        );
+        weights.insert(
+            "vision_tower.some_layer.weight".to_string(),
+            Array::from_slice_f32(&[2.0]).unwrap(),
+        );
+        weights.insert(
+            "language_model.some_layer.output_min".to_string(),
+            Array::from_slice_f32(&[3.0]).unwrap(),
+        );
+
+        let config = make_test_config(false);
+        let sanitized = sanitize_weights(weights, &config);
+
+        // vision clipping params stripped when use_clipped_linears=false
+        assert!(!sanitized.contains_key("vision_tower.some_layer.input_max"));
+        // non-vision clipping params always stripped
+        assert!(!sanitized.contains_key("language_model.some_layer.output_min"));
+        // normal params kept
+        assert!(sanitized.contains_key("vision_tower.some_layer.weight"));
+    }
+
+    #[test]
+    fn sanitize_keeps_clipping_params_when_used() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "vision_tower.some_layer.input_max".to_string(),
+            Array::from_slice_f32(&[1.0]).unwrap(),
+        );
+        weights.insert(
+            "vision_tower.some_layer.weight".to_string(),
+            Array::from_slice_f32(&[2.0]).unwrap(),
+        );
+
+        let config = make_test_config(true);
+        let sanitized = sanitize_weights(weights, &config);
+
+        // vision clipping params kept when use_clipped_linears=true
+        assert!(sanitized.contains_key("vision_tower.some_layer.input_max"));
+        assert!(sanitized.contains_key("vision_tower.some_layer.weight"));
+    }
+
+    #[test]
+    fn sanitize_remaps_keys() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "model.language_model.layers.0.weight".to_string(),
+            Array::from_slice_f32(&[1.0]).unwrap(),
+        );
+        weights.insert(
+            "model.vision_tower.patch_embed.weight".to_string(),
+            Array::from_slice_f32(&[2.0]).unwrap(),
+        );
+
+        let config = make_test_config(false);
+        let sanitized = sanitize_weights(weights, &config);
+
+        // model. prefix stripped
+        assert!(!sanitized.contains_key("model.language_model.layers.0.weight"));
+        assert!(!sanitized.contains_key("model.vision_tower.patch_embed.weight"));
+
+        // language_model. -> language_model.model.
+        assert!(sanitized.contains_key("language_model.model.layers.0.weight"));
+        // vision_tower unchanged
+        assert!(sanitized.contains_key("vision_tower.patch_embed.weight"));
+    }
+
+    #[test]
+    fn sanitize_strips_rotary_emb() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "language_model.model.layers.0.self_attn.rotary_emb.inv_freq".to_string(),
+            Array::from_slice_f32(&[1.0]).unwrap(),
+        );
+        weights.insert(
+            "language_model.model.layers.0.self_attn.q_proj.weight".to_string(),
+            Array::from_slice_f32(&[2.0]).unwrap(),
+        );
+
+        let config = make_test_config(false);
+        let sanitized = sanitize_weights(weights, &config);
+
+        assert!(!sanitized.contains_key("language_model.model.layers.0.self_attn.rotary_emb.inv_freq"));
+        assert!(sanitized.contains_key("language_model.model.layers.0.self_attn.q_proj.weight"));
+    }
+
+    #[test]
+    fn sanitize_strips_audio_when_no_audio_tower() {
+        let mut weights = HashMap::new();
+        weights.insert(
+            "audio_tower.encoder.weight".to_string(),
+            Array::from_slice_f32(&[1.0]).unwrap(),
+        );
+        weights.insert(
+            "embed_audio.projection.weight".to_string(),
+            Array::from_slice_f32(&[2.0]).unwrap(),
+        );
+        weights.insert(
+            "vision_tower.weight".to_string(),
+            Array::from_slice_f32(&[3.0]).unwrap(),
+        );
+
+        let config = make_test_config(false);
+        let sanitized = sanitize_weights(weights, &config);
+
+        assert!(!sanitized.contains_key("audio_tower.encoder.weight"));
+        assert!(!sanitized.contains_key("embed_audio.projection.weight"));
+        assert!(sanitized.contains_key("vision_tower.weight"));
+    }
+
+    #[test]
+    fn sanitize_splits_moe_gate_up_proj() {
+        // In PyTorch checkpoint, gate_up_proj is [experts, 2*intermediate, hidden].
+        // [2 experts, 2*intermediate=4, hidden=6] => intermediate=2, hidden=6.
+        // After swapaxes(-1,-2): [2, 6, 4]
+        // Split on last dim (4 → 2+2): gate [2, 6, 2], up [2, 6, 2]
+        // After swapaxes back: gate [2, 2, 6], up [2, 2, 6]
+        let data: Vec<f32> = (0..48).map(|i| i as f32).collect();
+        let gate_up = Array::from_slice_f32(&data)
+            .unwrap()
+            .reshape(&[2, 4, 6])
+            .unwrap();
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "language_model.model.layers.0.moe.experts.gate_up_proj".to_string(),
+            gate_up,
+        );
+
+        let config = make_test_config(false);
+        let sanitized = sanitize_weights(weights, &config);
+
+        assert!(!sanitized.contains_key("language_model.model.layers.0.moe.experts.gate_up_proj"));
+        assert!(sanitized.contains_key("language_model.model.layers.0.moe.experts.switch_glu.gate_proj.weight"));
+        assert!(sanitized.contains_key("language_model.model.layers.0.moe.experts.switch_glu.up_proj.weight"));
+
+        let gate = sanitized.get("language_model.model.layers.0.moe.experts.switch_glu.gate_proj.weight").unwrap();
+        let up = sanitized.get("language_model.model.layers.0.moe.experts.switch_glu.up_proj.weight").unwrap();
+
+        assert_eq!(gate.shape_raw(), vec![2, 2, 6]);
+        assert_eq!(up.shape_raw(), vec![2, 2, 6]);
+    }
+
+    #[test]
+    fn sanitize_transposes_conv_weights() {
+        // Use vision_tower keys so they are not stripped (no audio tower in config)
+        // Conv2d: PyTorch [out=2, in=3, kH=4, kW=5] → MLX [2, 4, 5, 3]
+        let conv2d = Array::from_slice_f32(&vec![0.0f32; 120])
+            .unwrap()
+            .reshape(&[2, 3, 4, 5])
+            .unwrap();
+        // Conv1d: PyTorch [out=2, in=3, kW=4] → MLX [2, 4, 3]
+        let conv1d = Array::from_slice_f32(&vec![0.0f32; 24])
+            .unwrap()
+            .reshape(&[2, 3, 4])
+            .unwrap();
+
+        let mut weights = HashMap::new();
+        weights.insert(
+            "vision_tower.subsample_conv_projection.conv.weight".to_string(),
+            conv2d,
+        );
+        weights.insert(
+            "vision_tower.depthwise_conv1d.weight".to_string(),
+            conv1d,
+        );
+
+        let config = make_test_config(false);
+        let sanitized = sanitize_weights(weights, &config);
+
+        let t2d = sanitized.get("vision_tower.subsample_conv_projection.conv.weight").unwrap();
+        let t1d = sanitized.get("vision_tower.depthwise_conv1d.weight").unwrap();
+
+        assert_eq!(t2d.shape_raw(), vec![2, 4, 5, 3]);
+        assert_eq!(t1d.shape_raw(), vec![2, 4, 3]);
     }
 }

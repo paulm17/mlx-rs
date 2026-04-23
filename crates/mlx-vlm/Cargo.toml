@@ -14,3 +14,4 @@ hf-hub = { workspace = true }
 tokenizers = { workspace = true }
 minijinja = { workspace = true }
 image = { workspace = true }
+rand = { workspace = true }

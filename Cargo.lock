@@ -1179,6 +1179,7 @@ dependencies = [
  "mlx-core",
  "mlx-models",
  "mlx-nn",
+ "rand 0.8.5",
  "serde",
  "serde_json",
  "tokenizers",

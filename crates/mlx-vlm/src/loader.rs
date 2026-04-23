@@ -1,6 +1,7 @@
 use anyhow::Result;
-use mlx_models::{Gemma4, Gemma4Config};
+use mlx_models::{sanitize_weights, Gemma4, Gemma4Config};
 use mlx_nn::VarBuilder;
+use std::collections::HashMap;
 use std::path::Path;
 use tokenizers::Tokenizer;
 
@@ -27,7 +28,15 @@ pub fn load_gemma4_vlm(model_dir: &Path) -> Result<VlmComponents> {
     let tokenizer = Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
-    let vb = VarBuilder::from_dir(model_dir, mlx_core::DType::Float16)?;
+    // Load raw weights, sanitize, then build VarBuilder
+    let shards = VarBuilder::discover_shards(model_dir)?;
+    let mut all_weights = HashMap::new();
+    for shard in &shards {
+        let weights = mlx_core::safetensors::load(shard)?;
+        all_weights.extend(weights);
+    }
+    let sanitized = sanitize_weights(all_weights, &config);
+    let vb = VarBuilder::from_weights(sanitized, mlx_core::DType::Float16);
     let model = Gemma4::new(&vb, &config)?;
 
     let processor = Gemma4ImageProcessor::new(896);

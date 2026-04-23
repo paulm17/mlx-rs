@@ -16,7 +16,7 @@ pub mod qwen3_moe_python_port;
 
 pub use bert::{Bert, BertConfig};
 pub use gemma3::{Gemma3, Gemma3Config};
-pub use gemma4::{Gemma4, Gemma4Config};
+pub use gemma4::{sanitize_weights, Gemma4, Gemma4Config};
 pub use lfm2_moe::{Lfm2Moe, Lfm2MoeConfig};
 pub use lfm2_moe_python_port::{Lfm2MoePythonPort, Lfm2MoePythonPortConfig};
 pub use llama::{Llama, LlamaConfig};
