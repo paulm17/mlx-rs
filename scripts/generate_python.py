@@ -62,23 +62,12 @@ def get_eos_ids(config: dict):
     return [int(eos)]
 
 
-def load_hf_token(root_dir: Path) -> str | None:
+def load_hf_token() -> str | None:
     for env_name in ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN"):
         value = os.environ.get(env_name, "").strip()
         if value:
             return value
-
-    config_path = root_dir / "config.toml"
-    if not config_path.exists():
-        return None
-
-    try:
-        data = tomllib.loads(config_path.read_text())
-    except Exception:
-        return None
-
-    token = ((data.get("huggingface") or {}).get("hf_token") or "").strip()
-    return token or None
+    return None
 
 
 def find_cached_snapshot(model: str) -> Path | None:
@@ -108,7 +97,7 @@ def resolve_model_dir(model: str, root_dir: Path) -> Path:
 
     local_dir = snapshot_download(
         repo_id=model,
-        token=load_hf_token(root_dir),
+        token=load_hf_token(),
         local_dir=None,
         local_dir_use_symlinks=False,
     )

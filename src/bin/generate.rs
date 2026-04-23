@@ -41,7 +41,7 @@ struct Args {
     #[arg(long)]
     model: String,
 
-    /// Path to TOML config file (for hf_token)
+    /// Path to TOML config file
     #[arg(long, default_value = "config.toml")]
     config: PathBuf,
 
@@ -79,17 +79,10 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let args = Args::parse();
 
-    let hf = if args.config.exists() {
-        mlx_lm::ServerConfig::from_toml_path(&args.config)
-            .map(|cfg| cfg.huggingface)
-            .unwrap_or_default()
-    } else {
-        mlx_lm::HuggingFaceOptions::default()
-    };
-
-    let model_dir = mlx_lm::resolve_model_dir(&args.model, Some(&hf))?;
+    let model_dir = mlx_lm::resolve_model_dir(&args.model)?;
     eprintln!("Loading model from {:?}...", model_dir);
     let (model, tokenizer) = mlx_lm::load_model(&model_dir)?;
     let dump_tokenizer = tokenizer.clone();

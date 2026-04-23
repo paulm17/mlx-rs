@@ -6,6 +6,3 @@ thinking = false          # optional, controls chat-template thinking mode
 # model_path = "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--Qwen--Qwen3-1.7B-MLX-4bit/snapshots/21457c6f51ed54a7c16e988c0844db973815c137"
 # api_key = "secret"         # optional
 #rate_limit_rpm = 120       # optional, 0 disables
-
-[huggingface]
-hf_token = ""

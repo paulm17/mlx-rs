@@ -38,6 +38,7 @@ struct Args {
 }
 
 fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let args = Args::parse();
     let mut cfg = mlx_lm::ServerConfig::from_toml_path(&args.config)?;
 

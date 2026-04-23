@@ -14,3 +14,4 @@ tokenizers = { workspace = true }
 minijinja = { workspace = true }
 rand = "0.8"
 hf-hub.workspace = true
+dotenvy.workspace = true

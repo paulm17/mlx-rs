@@ -10,11 +10,6 @@ use std::time::SystemTime;
 
 use crate::generate::ModelRuntime;
 
-#[derive(Debug, Clone, Default, serde::Deserialize)]
-pub struct HuggingFaceOptions {
-    pub hf_token: Option<String>,
-}
-
 fn looks_like_hf_repo_id(model: &str) -> bool {
     !model.is_empty()
         && !model.starts_with('.')
@@ -86,7 +81,7 @@ fn persist_snapshot_dir(model: &str, snapshot_dir: &Path) {
     }
 }
 
-pub fn resolve_model_dir(model: &str, hf: Option<&HuggingFaceOptions>) -> Result<PathBuf> {
+pub fn resolve_model_dir(model: &str) -> Result<PathBuf> {
     let path = PathBuf::from(model);
     if path.exists() {
         return Ok(path);
@@ -118,11 +113,10 @@ pub fn resolve_model_dir(model: &str, hf: Option<&HuggingFaceOptions>) -> Result
         Cache::from_env().path()
     );
 
-    let token = hf
-        .and_then(|cfg| cfg.hf_token.as_ref())
-        .map(|token| token.trim())
-        .filter(|token| !token.is_empty())
-        .map(ToOwned::to_owned);
+    let token = std::env::var("HF_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty());
 
     eprintln!("Resolving model from Hugging Face repo {model} ...");
     let api = ApiBuilder::from_env()

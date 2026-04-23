@@ -1,6 +1,6 @@
 use crate::{
     load_model, resolve_model_dir, ChatTemplate, ChatTemplateOptions, EmbeddingPooling,
-    GenerationPipeline, HuggingFaceOptions, Message as LmMessage, ModelRuntime, Sampler, Tokenizer,
+    GenerationPipeline, Message as LmMessage, ModelRuntime, Sampler, Tokenizer,
 };
 use anyhow::Result;
 use mlx_core::Array;
@@ -63,7 +63,6 @@ pub struct ServerConfig {
     pub port: Option<u16>,
     pub model_path: Option<String>,
     pub model: Option<String>,
-    pub huggingface: HuggingFaceOptions,
     pub api_key: Option<String>,
     pub rate_limit_rpm: Option<u32>,
     pub thinking: Option<bool>,
@@ -78,13 +77,11 @@ impl ServerConfig {
 
     pub fn from_toml_str(content: &str) -> Result<Self> {
         let mut in_server = false;
-        let mut in_huggingface = false;
         let mut cfg = ServerConfig {
             bind: None,
             port: None,
             model_path: None,
             model: None,
-            huggingface: HuggingFaceOptions::default(),
             api_key: None,
             rate_limit_rpm: None,
             thinking: None,
@@ -98,10 +95,9 @@ impl ServerConfig {
             }
             if line.starts_with('[') && line.ends_with(']') {
                 in_server = line == "[server]";
-                in_huggingface = line == "[huggingface]";
                 continue;
             }
-            if !in_server && !in_huggingface {
+            if !in_server {
                 continue;
             }
             let (k, v) = match line.split_once('=') {
@@ -139,8 +135,6 @@ impl ServerConfig {
                     }
                     _ => {}
                 }
-            } else if in_huggingface && k == "hf_token" {
-                cfg.huggingface.hf_token = Some(unquote(v));
             }
         }
 
@@ -944,7 +938,6 @@ fn handle_request(
     req: HttpRequest,
     stream: &mut TcpStream,
     loaded: &mut Option<LoadedModel>,
-    huggingface: &HuggingFaceOptions,
     api_key: Option<&str>,
     limiter: &mut Option<FixedWindowRateLimiter>,
     thinking: bool,
@@ -1009,7 +1002,7 @@ fn handle_request(
                     ))
                 }
             };
-            let model_path = match resolve_model_dir(&parsed.model_path, Some(huggingface)) {
+            let model_path = match resolve_model_dir(&parsed.model_path) {
                 Ok(path) => path,
                 Err(e) => {
                     if let Some((running, handle)) = heartbeat {
@@ -1276,14 +1269,14 @@ fn handle_request(
 }
 
 pub fn run_server(config: ServerConfig) -> Result<()> {
+    dotenvy::dotenv().ok();
     let addr = config.addr();
     let listener = TcpListener::bind(&addr)?;
     eprintln!("mlx-server listening on {addr}");
 
     let mut loaded: Option<LoadedModel> = None;
     if let Some(model_path) = config.startup_model_path() {
-        let model_path =
-            resolve_model_dir(&model_path.display().to_string(), Some(&config.huggingface))?;
+        let model_path = resolve_model_dir(&model_path.display().to_string())?;
         eprintln!("Loading startup model from {:?}...", model_path);
         let (model, tokenizer) = load_model(&model_path)?;
         loaded = Some(LoadedModel {
@@ -1297,8 +1290,6 @@ pub fn run_server(config: ServerConfig) -> Result<()> {
     let api_key = config.api_key.clone();
     let thinking = config.thinking_enabled();
     let embeddings_batch_size = config.embeddings_batch_size();
-    let huggingface = config.huggingface.clone();
-
     for stream in listener.incoming() {
         let mut stream = match stream {
             Ok(s) => s,
@@ -1315,7 +1306,6 @@ pub fn run_server(config: ServerConfig) -> Result<()> {
             req,
             &mut stream,
             &mut loaded,
-            &huggingface,
             api_key.as_deref(),
             &mut limiter,
             thinking,

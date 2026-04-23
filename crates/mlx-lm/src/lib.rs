@@ -15,7 +15,7 @@ pub use chat_template::{
 pub use generate::{
     CausalLM, EmbeddingModel, EmbeddingPooling, GenerationMetrics, GenerationPipeline, ModelRuntime,
 };
-pub use loader::{load_model, resolve_model_dir, HuggingFaceOptions};
+pub use loader::{load_model, resolve_model_dir};
 pub use sampler::Sampler;
 pub use server::{run_server, run_server_from_toml_path, ServerConfig};
 pub use tokenizer::Tokenizer;

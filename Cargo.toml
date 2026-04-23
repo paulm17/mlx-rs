@@ -21,6 +21,7 @@ bindgen = "0.69"
 rand = "0.8"
 hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
 image = "0.25"
+dotenvy = "0.15"
 
 [package]
 name = "mlx-rs"
@@ -49,3 +50,4 @@ clap.workspace = true
 tokenizers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+dotenvy.workspace = true

@@ -28,8 +28,6 @@ struct Config {
     harness: HarnessConfig,
     #[serde(default)]
     models: ModelsConfig,
-    #[serde(default)]
-    huggingface: mlx_lm::HuggingFaceOptions,
 }
 
 fn default_temperature() -> f32 {
@@ -144,7 +142,7 @@ fn run_model_test(model_id: &str, config: &Config) -> TestResult {
     let start = Instant::now();
 
     let result = (|| -> Result<(String, usize)> {
-        let model_dir = mlx_lm::resolve_model_dir(model_id, Some(&config.huggingface))?;
+        let model_dir = mlx_lm::resolve_model_dir(model_id)?;
         eprintln!("  Loading model from {:?}...", model_dir);
         let (model, tokenizer) = mlx_lm::load_model(&model_dir)?;
 
@@ -267,6 +265,7 @@ fn print_summary_table(results: &[TestResult]) {
 }
 
 fn main() -> Result<()> {
+    dotenvy::dotenv().ok();
     let config_path = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "config.toml".to_string());

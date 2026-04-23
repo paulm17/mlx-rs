@@ -411,6 +411,7 @@ fn main() -> Result<()> {
         api_key: Some("secret".to_string()),
         rate_limit_rpm: Some(120),
         thinking: Some(false),
+        embeddings_batch_size: Some(32),
     };
     run_server(cfg)
 }
