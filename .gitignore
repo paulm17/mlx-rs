@@ -6,3 +6,4 @@
 /logs
 /tmp_models
 /mlx-vlm
+test_harness/target/

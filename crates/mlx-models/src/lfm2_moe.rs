@@ -8,7 +8,8 @@ use crate::qwen3_moe::MoeProfileStats;
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct Lfm2MoeConfig {
     pub hidden_size: usize,
-    pub intermediate_size: usize,
+    #[serde(default)]
+    pub intermediate_size: Option<usize>,
     pub moe_intermediate_size: Option<usize>,
     pub vocab_size: usize,
     pub num_hidden_layers: usize,
@@ -21,6 +22,8 @@ pub struct Lfm2MoeConfig {
     #[serde(default = "default_max_pos")]
     pub max_position_embeddings: usize,
     pub layer_types: Option<Vec<String>>,
+    #[serde(default)]
+    pub full_attn_idxs: Option<Vec<usize>>,
     #[serde(default = "default_conv_l_cache", rename = "conv_L_cache")]
     pub conv_l_cache: usize,
     #[serde(default)]
@@ -114,7 +117,10 @@ impl Lfm2MoeConfig {
                 .get(idx)
                 .map(|s| s.eq_ignore_ascii_case("full_attention"))
                 .unwrap_or(false),
-            None => false,
+            None => match &self.full_attn_idxs {
+                Some(idxs) => idxs.contains(&idx),
+                None => false,
+            },
         }
     }
 }
@@ -521,10 +527,11 @@ struct DenseMlp {
 impl DenseMlp {
     fn load(vb: &VarBuilder, cfg: &Lfm2MoeConfig) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
+        let use_w = vb.pp("w1").contains("weight");
         Ok(Self {
-            gate_proj: Linear::new(&vb.pp("gate_proj"), &qc)?,
-            up_proj: Linear::new(&vb.pp("up_proj"), &qc)?,
-            down_proj: Linear::new(&vb.pp("down_proj"), &qc)?,
+            gate_proj: Linear::new(&vb.pp(if use_w { "w1" } else { "gate_proj" }), &qc)?,
+            up_proj: Linear::new(&vb.pp(if use_w { "w3" } else { "up_proj" }), &qc)?,
+            down_proj: Linear::new(&vb.pp(if use_w { "w2" } else { "down_proj" }), &qc)?,
         })
     }
 

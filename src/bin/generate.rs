@@ -37,9 +37,13 @@ fn fallback_template_for_arch(arch: Option<mlx_lm::loader::ModelArch>) -> mlx_lm
 #[derive(Parser, Debug)]
 #[command(name = "generate", about = "Generate text with MLX models")]
 struct Args {
-    /// Path to the model directory
+    /// Model identifier: local path or Hugging Face repo ID (e.g. mlx-community/Qwen3.5-0.8B-MLX-4bit)
     #[arg(long)]
-    model_dir: PathBuf,
+    model: String,
+
+    /// Path to TOML config file (for hf_token)
+    #[arg(long, default_value = "config.toml")]
+    config: PathBuf,
 
     /// The prompt to generate from
     #[arg(long, default_value = "Hello")]
@@ -77,11 +81,20 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    eprintln!("Loading model from {:?}...", args.model_dir);
-    let (model, tokenizer) = mlx_lm::load_model(&args.model_dir)?;
+    let hf = if args.config.exists() {
+        mlx_lm::ServerConfig::from_toml_path(&args.config)
+            .map(|cfg| cfg.huggingface)
+            .unwrap_or_default()
+    } else {
+        mlx_lm::HuggingFaceOptions::default()
+    };
+
+    let model_dir = mlx_lm::resolve_model_dir(&args.model, Some(&hf))?;
+    eprintln!("Loading model from {:?}...", model_dir);
+    let (model, tokenizer) = mlx_lm::load_model(&model_dir)?;
     let dump_tokenizer = tokenizer.clone();
 
-    let sampler = sampler_for_model(&args.model_dir, args.temperature, args.top_p);
+    let sampler = sampler_for_model(&model_dir, args.temperature, args.top_p);
     let mut pipeline = mlx_lm::GenerationPipeline::new(model, tokenizer, sampler);
     let template_options = mlx_lm::ChatTemplateOptions {
         add_generation_prompt: true,
@@ -90,13 +103,13 @@ fn main() -> Result<()> {
     };
 
     // Build the prompt — either raw or via chat template
-    let arch = detect_arch(&args.model_dir);
+    let arch = detect_arch(&model_dir);
     let prompt = if args.chat {
         let messages = vec![
             mlx_lm::Message::system(&args.system_prompt),
             mlx_lm::Message::user(&args.prompt),
         ];
-        match mlx_lm::ChatTemplate::from_model_dir(&args.model_dir) {
+        match mlx_lm::ChatTemplate::from_model_dir(&model_dir) {
             Ok(template) => match template.apply(&messages, &template_options) {
                 Ok(p) => p,
                 Err(_) => fallback_template_for_arch(arch)
@@ -112,7 +125,7 @@ fn main() -> Result<()> {
     } else {
         // Auto-apply chat template for instruction-tuned models
         let messages = vec![mlx_lm::Message::user(&args.prompt)];
-        match mlx_lm::ChatTemplate::from_model_dir(&args.model_dir) {
+        match mlx_lm::ChatTemplate::from_model_dir(&model_dir) {
             Ok(template) => match template.apply(&messages, &template_options) {
                 Ok(p) => p,
                 Err(_) => fallback_template_for_arch(arch)
