@@ -77,15 +77,12 @@ fn main() -> Result<()> {
         .squeeze(1)?;
     
     // Get top 10 tokens
-    let sorted = last_logits.argsort(false)?;
-    let top_indices = sorted.slice(&[0i32], &[1i32])?.squeeze(0)?;
-    let top_10 = top_indices.slice(&[0i32], &[10i32])?.to_vec_i32()?;
-    println!("Top 10 predicted token IDs: {:?}", top_10);
-    
-    // Print their logits values
-    for &tid in &top_10 {
-        let val = last_logits.slice(&[tid], &[tid + 1])?.to_vec_f32()?;
-        println!("  Token {} -> logit = {}", tid, val[0]);
+    let logits_vec = last_logits.to_vec_f32()?;
+    let mut indexed: Vec<(usize, f32)> = logits_vec.iter().enumerate().map(|(i, &v)| (i, v)).collect();
+    indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    let top_k = 10usize.min(indexed.len());
+    for (tid, val) in &indexed[..top_k] {
+        println!("  Token {} -> logit = {}", tid, val);
     }
 
     Ok(())

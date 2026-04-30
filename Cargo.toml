@@ -41,10 +41,6 @@ name = "embed_bench"
 path = "src/bin/embed_bench.rs"
 
 [[bin]]
-name = "test_vision_shapes"
-path = "src/bin/test_vision_shapes.rs"
-
-[[bin]]
 name = "simple_vision_test"
 path = "src/bin/simple_vision_test.rs"
 
@@ -60,3 +56,4 @@ tokenizers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 dotenvy.workspace = true
+ctrlc = "3"

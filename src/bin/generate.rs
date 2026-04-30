@@ -3,6 +3,8 @@ use clap::Parser;
 use serde_json::json;
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 fn detect_arch(model_dir: &std::path::Path) -> Option<mlx_lm::loader::ModelArch> {
     let config_path = model_dir.join("config.json");
@@ -88,7 +90,14 @@ fn main() -> Result<()> {
     let dump_tokenizer = tokenizer.clone();
 
     let sampler = sampler_for_model(&model_dir, args.temperature, args.top_p);
-    let mut pipeline = mlx_lm::GenerationPipeline::new(model, tokenizer, sampler);
+    let stop_signal = Arc::new(AtomicBool::new(false));
+    let signal_clone = Arc::clone(&stop_signal);
+    ctrlc::set_handler(move || {
+        eprintln!("\nStopping generation...");
+        signal_clone.store(true, Ordering::Relaxed);
+    })?;
+    let mut pipeline = mlx_lm::GenerationPipeline::new(model, tokenizer, sampler)
+        .with_stop_signal(stop_signal);
     let template_options = mlx_lm::ChatTemplateOptions {
         add_generation_prompt: true,
         continue_final_message: false,

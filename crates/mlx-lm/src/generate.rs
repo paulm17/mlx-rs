@@ -1,6 +1,8 @@
 use anyhow::Result;
 use mlx_core::{async_eval, Array};
 use mlx_nn::{kv_cache_stats, reset_kv_cache_stats, KvCacheStats};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Instant;
 
 use crate::sampler::Sampler;
@@ -476,6 +478,7 @@ pub struct GenerationPipeline<M> {
     sampler: Sampler,
     strip_thinking: bool,
     stop_strings: Vec<String>,
+    stop_signal: Option<Arc<AtomicBool>>,
 }
 
 impl<M: CausalLM> GenerationPipeline<M> {
@@ -486,6 +489,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
             sampler,
             strip_thinking: false,
             stop_strings: Vec::new(),
+            stop_signal: None,
         }
     }
 
@@ -497,6 +501,20 @@ impl<M: CausalLM> GenerationPipeline<M> {
     pub fn with_stop_strings(mut self, strings: Vec<String>) -> Self {
         self.stop_strings = strings;
         self
+    }
+
+    /// Attach a stop signal. When set to `true`, generation aborts at the
+    /// next loop iteration and returns what has been generated so far with
+    /// `stop_reason = "cancelled"`.
+    pub fn with_stop_signal(mut self, signal: Arc<AtomicBool>) -> Self {
+        self.stop_signal = Some(signal);
+        self
+    }
+
+    fn is_stopped(&self) -> bool {
+        self.stop_signal
+            .as_ref()
+            .map_or(false, |s| s.load(Ordering::Relaxed))
     }
 
     fn check_stop_strings(&self, output: &str) -> Option<usize> {
@@ -591,7 +609,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
         let mut output = String::new();
         let mut token_count = 0usize;
         let mut generated_tokens = Vec::new();
-        let mut last_token_id: Option<u32>;
+        let mut last_token_id: Option<u32> = None;
         if self.sampler.is_greedy() {
             let stage_t0 = Instant::now();
             let mut token_arr = self
@@ -605,6 +623,11 @@ impl<M: CausalLM> GenerationPipeline<M> {
 
             let mut generated = 0usize;
             loop {
+                if self.is_stopped() {
+                    stop_reason = Some("cancelled");
+                    break;
+                }
+
                 let can_schedule_next = max_tokens.is_none_or(|limit| generated + 1 < limit);
                 let next_token_arr = if can_schedule_next {
                     let input = sampled_token_array_to_input(&token_arr)?;
@@ -731,6 +754,11 @@ impl<M: CausalLM> GenerationPipeline<M> {
             // Autoregressive decode loop. Uncapped when max_tokens is None.
             let mut generated = 1usize;
             loop {
+                if self.is_stopped() {
+                    stop_reason = Some("cancelled");
+                    break;
+                }
+
                 if let Some(limit) = max_tokens {
                     if generated >= limit {
                         stop_reason = Some("length");

@@ -1080,12 +1080,15 @@ fn handle_request(
             let prompt_token_count = lm.tokenizer.encode(&prompt).map(|v| v.len()).unwrap_or(0);
             let prompt_tokenize_s = prompt_tokenize_t0.elapsed().as_secs_f64();
 
+            let stop_signal = Arc::new(AtomicBool::new(false));
             let mut pipeline =
-                GenerationPipeline::new(&mut lm.model, lm.tokenizer.clone(), sampler);
+                GenerationPipeline::new(&mut lm.model, lm.tokenizer.clone(), sampler)
+                    .with_stop_signal(Arc::clone(&stop_signal));
             if parsed.stream.unwrap_or(false) {
                 if let Err(e) = write_sse_headers(stream) {
                     return Some((500, error_json("stream_write_error", e.to_string())));
                 }
+                let stop = Arc::clone(&stop_signal);
                 let mut stream_error: Option<anyhow::Error> = None;
                 let created = std::time::SystemTime::now()
                     .duration_since(std::time::UNIX_EPOCH)
@@ -1110,6 +1113,7 @@ fn handle_request(
                     });
                     let write_t0 = Instant::now();
                     if let Err(e) = write_sse_event(stream, event) {
+                        stop.store(true, Ordering::Relaxed);
                         stream_error = Some(anyhow::anyhow!(e.to_string()));
                     } else {
                         stream_write_s += write_t0.elapsed().as_secs_f64();

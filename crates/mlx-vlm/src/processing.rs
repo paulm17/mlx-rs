@@ -40,8 +40,6 @@ impl Gemma4ImageProcessor {
         let area = (width as f64) * (height as f64);
         let factor = (target_px as f64 / area).sqrt();
         let side_mult = (self.pooling_kernel_size * self.patch_size) as i32;
-        let max_side_length = (self.max_soft_tokens / (self.pooling_kernel_size * self.pooling_kernel_size))
-            * (self.pooling_kernel_size * self.patch_size);
 
         let mut target_height = ((factor * height as f64 / side_mult as f64).floor() as i32 * side_mult).max(0) as u32;
         let mut target_width = ((factor * width as f64 / side_mult as f64).floor() as i32 * side_mult).max(0) as u32;

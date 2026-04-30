@@ -1099,7 +1099,7 @@ impl SparseMoeBlock {
 // DecoderLayer
 // ------------------------------------------------------------------
 
-struct Gemma4DecoderLayer {
+pub struct Gemma4DecoderLayer {
     input_layernorm: RmsNormZeroShift,
     post_attn_layernorm: RmsNormZeroShift,
     pre_ffw_layernorm: RmsNormZeroShift,
