@@ -179,6 +179,8 @@ pub struct Gemma4VisionConfig {
     pub rope_parameters: HashMap<String, RopeParams>,
     #[serde(default)]
     pub use_clipped_linears: bool,
+    #[serde(default = "default_rms_norm_eps")]
+    pub rms_norm_eps: f64,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -529,46 +531,23 @@ fn apply_proportional_rope(
 // 2D RoPE helpers for vision
 // ------------------------------------------------------------------
 
-fn repeat_interleave(arr: &Array, repeats: usize, axis: i32) -> Result<Array> {
-    let shape = arr.shape_raw();
-    let ndim = shape.len() as i32;
-    let axis_norm = if axis < 0 { ndim + axis } else { axis };
-    let dim = shape[axis_norm as usize];
-    let mut indices = Vec::with_capacity(dim as usize * repeats);
-    for i in 0..dim {
-        for _ in 0..repeats {
-            indices.push(i);
-        }
-    }
-    let idx = Array::from_slice_i32(&indices)?;
-    arr.take(&idx, axis)
-}
-
 fn rotate_half(x: &Array) -> Result<Array> {
     let shape = x.shape_raw();
     let ndim = shape.len();
     let head_dim = shape[ndim - 1];
+    let half_dim = head_dim / 2;
 
-    let mut new_shape = shape[..ndim - 1].to_vec();
-    new_shape.push(head_dim / 2);
-    new_shape.push(2);
-    let x_reshaped = x.reshape(&new_shape)?;
+    let mut start = vec![0i32; ndim];
+    let mut stop = shape.clone();
+    stop[ndim - 1] = half_dim;
+    let x1 = x.slice(&start, &stop)?;
 
-    let mut start = vec![0i32; ndim + 1];
-    let mut stop = new_shape.clone();
-    stop[ndim] = 1;
-    let x0 = x_reshaped.slice(&start, &stop)?;
+    start[ndim - 1] = half_dim;
+    stop[ndim - 1] = head_dim;
+    let x2 = x.slice(&start, &stop)?;
 
-    start[ndim] = 1;
-    stop[ndim] = 2;
-    let x1 = x_reshaped.slice(&start, &stop)?;
-
-    let neg_x1 = x1.negative()?;
-    let rotated = Array::concatenate(&[&neg_x1, &x0], ndim as i32)?;
-
-    let mut final_shape = shape[..ndim - 1].to_vec();
-    final_shape.push(head_dim);
-    rotated.reshape(&final_shape)
+    let neg_x2 = x2.negative()?;
+    Array::concatenate(&[&neg_x2, &x1], (ndim - 1) as i32)
 }
 
 fn apply_1d_rope_with_positions(
@@ -598,8 +577,8 @@ fn apply_1d_rope_with_positions(
     let cos_exp = cos.expand_dims(0)?.expand_dims(0)?;
     let sin_exp = sin.expand_dims(0)?.expand_dims(0)?;
 
-    let cos_rep = repeat_interleave(&cos_exp, 2, -1)?;
-    let sin_rep = repeat_interleave(&sin_exp, 2, -1)?;
+    let cos_rep = Array::concatenate(&[&cos_exp, &cos_exp], -1)?;
+    let sin_rep = Array::concatenate(&[&sin_exp, &sin_exp], -1)?;
 
     let x_rotated = rotate_half(x)?;
 
@@ -1543,7 +1522,7 @@ impl LanguageModel {
 // ------------------------------------------------------------------
 
 struct VisionPatchEmbedder {
-    input_proj: ClippableLinear,
+    input_proj: Linear,
     position_embedding_table: Array,
     patch_size: usize,
     position_embedding_size: usize,
@@ -1554,7 +1533,7 @@ impl VisionPatchEmbedder {
         let qc = QuantConfig::default();
         let pos_emb_weight = vb.get("position_embedding_table")?;
         Ok(Self {
-            input_proj: ClippableLinear::new(&vb.pp("input_proj"), &qc)?,
+            input_proj: Linear::new(&vb.pp("input_proj"), &qc)?,
             position_embedding_table: pos_emb_weight,
             patch_size: cfg.patch_size,
             position_embedding_size: cfg.position_embedding_size,
@@ -1572,7 +1551,7 @@ impl VisionPatchEmbedder {
         // Reshape to patches: [B, C, Hh, Ph, Ww, Pw] -> [B, Hh, Ww, C, Ph, Pw] -> [B, num_patches, C*Ph*Pw]
         let patches = images
             .reshape(&[b, c, num_patches_h, patch_size, num_patches_w, patch_size])?
-            .transpose_axes(&[0, 2, 4, 1, 3, 5])?
+            .transpose_axes(&[0, 2, 4, 3, 5, 1])?
             .reshape(&[b, num_patches, c * patch_size * patch_size])?;
 
         // Normalize patches to match Python: 2 * (patches - 0.5)
@@ -1750,10 +1729,10 @@ impl VisionAttention {
 
         let rope_params = cfg
             .rope_parameters
-            .get("default")
+            .get("rope_theta")
             .cloned()
             .unwrap_or(RopeParams {
-                rope_theta: 10_000.0,
+                rope_theta: 100.0,
                 partial_rotary_factor: 1.0,
             });
 
@@ -1768,7 +1747,7 @@ impl VisionAttention {
             n_heads: cfg.num_attention_heads,
             n_kv_heads: cfg.num_key_value_heads,
             head_dim: cfg.head_dim,
-            scale: 1.0 / (cfg.head_dim as f32).sqrt(),
+            scale: 1.0,
             rope_theta: rope_params.rope_theta,
         })
     }
@@ -1849,29 +1828,30 @@ impl VisionMlp {
 }
 
 struct VisionEncoderLayer {
-    input_layernorm: VisionRmsNorm,
-    post_attention_layernorm: VisionRmsNorm,
-    pre_feedforward_layernorm: VisionRmsNorm,
-    post_feedforward_layernorm: VisionRmsNorm,
+    input_layernorm: RmsNormZeroShift,
+    post_attention_layernorm: RmsNormZeroShift,
+    pre_feedforward_layernorm: RmsNormZeroShift,
+    post_feedforward_layernorm: RmsNormZeroShift,
     self_attn: VisionAttention,
     mlp: VisionMlp,
 }
 
 impl VisionEncoderLayer {
     fn new(vb: &VarBuilder, cfg: &Gemma4VisionConfig) -> anyhow::Result<Self> {
+        let eps = cfg.rms_norm_eps as f32;
         Ok(Self {
-            input_layernorm: VisionRmsNorm::new(&vb.pp("input_layernorm"), 1e-6)?,
-            post_attention_layernorm: VisionRmsNorm::new(
+            input_layernorm: RmsNormZeroShift::new(&vb.pp("input_layernorm"), eps)?,
+            post_attention_layernorm: RmsNormZeroShift::new(
                 &vb.pp("post_attention_layernorm"),
-                1e-6,
+                eps,
             )?,
-            pre_feedforward_layernorm: VisionRmsNorm::new(
+            pre_feedforward_layernorm: RmsNormZeroShift::new(
                 &vb.pp("pre_feedforward_layernorm"),
-                1e-6,
+                eps,
             )?,
-            post_feedforward_layernorm: VisionRmsNorm::new(
+            post_feedforward_layernorm: RmsNormZeroShift::new(
                 &vb.pp("post_feedforward_layernorm"),
-                1e-6,
+                eps,
             )?,
             self_attn: VisionAttention::new(vb, cfg)?,
             mlp: VisionMlp::new(vb, cfg)?,
@@ -2040,8 +2020,8 @@ impl VisionModel {
                 if pos_h.len() >= num_real {
                     break;
                 }
-                pos_h.push(row as i32);
-                pos_w.push(col as i32);
+                pos_h.push(col as i32);
+                pos_w.push(row as i32);
             }
             if pos_h.len() >= num_real {
                 break;

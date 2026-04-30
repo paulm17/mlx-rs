@@ -16,6 +16,16 @@ fn compare(name: &str, rust: &Array, py_path: &str, py_key: &str) -> Result<()> 
         println!("LENGTH MISMATCH: {} vs {}", rust_f.len(), py_f.len());
         return Ok(());
     }
+
+    // Stats
+    let rust_min = rust_f.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+    let rust_max = rust_f.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let rust_mean = rust_f.iter().map(|&f| f as f64).sum::<f64>() / rust_f.len() as f64;
+    let py_min = py_f.iter().fold(f32::INFINITY, |a, &b| a.min(b));
+    let py_max = py_f.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let py_mean = py_f.iter().map(|&f| f as f64).sum::<f64>() / py_f.len() as f64;
+    println!("Rust: min={:.4} max={:.4} mean={:.4}", rust_min, rust_max, rust_mean);
+    println!("Py:   min={:.4} max={:.4} mean={:.4}", py_min, py_max, py_mean);
     
     let mut mse = 0.0f64;
     let mut max_diff = 0.0f32;

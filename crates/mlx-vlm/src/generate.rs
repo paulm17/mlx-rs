@@ -259,6 +259,7 @@ mod tests {
                 standardize: false,
                 rope_parameters: HashMap::new(),
                 use_clipped_linears: false,
+                rms_norm_eps: 1e-6,
             },
             audio_config: None,
         }
@@ -324,7 +325,7 @@ mod tests {
         let vh = config.vision_config.hidden_size as i32;
         let vpos = config.vision_config.position_embedding_size as i32;
         weights.insert(
-            "vision_tower.patch_embedder.input_proj.linear.weight".to_string(),
+            "vision_tower.patch_embedder.input_proj.weight".to_string(),
             Array::zeros(&[vh, 3 * vp * vp], DType::Float32).unwrap(),
         );
         weights.insert(

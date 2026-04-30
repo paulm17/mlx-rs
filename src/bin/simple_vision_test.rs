@@ -10,7 +10,11 @@ fn test_generation(model_dir: &str, image_path: Option<&Path>, label: &str) -> R
 
     let config = vlm.config;
     let num_image_tokens = config.vision_soft_tokens_per_image;
-    let image_placeholder = "<|image|>".repeat(num_image_tokens);
+    let image_placeholder = if image_path.is_some() {
+        "<|image|>".repeat(num_image_tokens)
+    } else {
+        String::new()
+    };
     let user_message = format!("{}Describe this image in one sentence.", image_placeholder);
 
     let template_options = mlx_lm::ChatTemplateOptions {
@@ -56,7 +60,7 @@ fn test_generation(model_dir: &str, image_path: Option<&Path>, label: &str) -> R
 
 fn main() -> Result<()> {
     let model_dir = "/Volumes/Data/Users/paul/.cache/huggingface/hub/models--unsloth--gemma-4-E2B-it-UD-MLX-4bit/snapshots/3236b6b700bae91f3045cf0f4f0c12595530f182";
-    let image_path = Path::new("./red_sqaure.png");
+    let image_path = Path::new("./red_square.png");
 
     // Test 1: With image
     test_generation(model_dir, Some(image_path), "WITH IMAGE")?;
