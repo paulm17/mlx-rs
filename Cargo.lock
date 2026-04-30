@@ -1164,6 +1164,7 @@ dependencies = [
  "mlx-lm",
  "mlx-models",
  "mlx-nn",
+ "mlx-vlm",
  "serde",
  "serde_json",
  "tokenizers",

@@ -1,12 +1,19 @@
 use anyhow::Result;
 use serde::Deserialize;
 use std::collections::HashSet;
+use std::path::Path;
 use std::time::{Duration, Instant};
+
+// ------------------------------------------------------------------
+// Config
+// ------------------------------------------------------------------
 
 #[derive(Debug, Deserialize, Default)]
 struct HarnessConfig {
     #[serde(default)]
     prompt: String,
+    #[serde(default = "default_vision_prompt")]
+    vision_prompt: String,
     #[serde(default)]
     max_tokens: Option<usize>,
     #[serde(default = "default_temperature")]
@@ -17,6 +24,8 @@ struct HarnessConfig {
     system_prompt: String,
     #[serde(default = "default_expected_answer")]
     expected_answer: String,
+    #[serde(default = "default_vision_expected_answer")]
+    vision_expected_answer: String,
     #[serde(default = "default_run_tokenizer_roundtrip")]
     run_tokenizer_roundtrip: bool,
     #[serde(default = "default_run_reasoning_check")]
@@ -25,12 +34,59 @@ struct HarnessConfig {
     run_moe_performance_check: bool,
     #[serde(default = "default_moe_min_tokens_per_sec")]
     moe_min_tokens_per_sec: f64,
+    #[serde(default = "default_vision_image")]
+    vision_image: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ModelEntry {
+    Plain(String),
+    Typed {
+        id: String,
+        #[serde(default = "default_text_type")]
+        r#type: String,
+        #[serde(default)]
+        image: Option<String>,
+    },
+}
+
+impl ModelEntry {
+    fn id(&self) -> &str {
+        match self {
+            ModelEntry::Plain(s) => s,
+            ModelEntry::Typed { id, .. } => id,
+        }
+    }
+
+    fn model_type(&self) -> ModelType {
+        match self {
+            ModelEntry::Plain(_) => ModelType::Text,
+            ModelEntry::Typed { r#type, .. } => match r#type.as_str() {
+                "vision" => ModelType::Vision,
+                _ => ModelType::Text,
+            },
+        }
+    }
+
+    fn image_path(&self) -> Option<&str> {
+        match self {
+            ModelEntry::Plain(_) => None,
+            ModelEntry::Typed { image, .. } => image.as_deref(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ModelType {
+    Text,
+    Vision,
 }
 
 #[derive(Debug, Deserialize, Default)]
 struct ModelsConfig {
     #[serde(default)]
-    models: Vec<String>,
+    models: Vec<ModelEntry>,
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -53,6 +109,9 @@ fn default_system_prompt() -> String {
 fn default_expected_answer() -> String {
     "4".to_string()
 }
+fn default_vision_expected_answer() -> String {
+    String::new()
+}
 fn default_run_tokenizer_roundtrip() -> bool {
     true
 }
@@ -65,6 +124,19 @@ fn default_run_moe_performance_check() -> bool {
 fn default_moe_min_tokens_per_sec() -> f64 {
     1.0
 }
+fn default_vision_prompt() -> String {
+    "Describe this image in one sentence.".to_string()
+}
+fn default_vision_image() -> String {
+    "test_image.png".to_string()
+}
+fn default_text_type() -> String {
+    "text".to_string()
+}
+
+// ------------------------------------------------------------------
+// Test result types
+// ------------------------------------------------------------------
 
 #[derive(Debug, Clone)]
 enum TestStatus {
@@ -90,6 +162,7 @@ struct QualityMetrics {
 #[allow(dead_code)]
 struct TestResult {
     model: String,
+    model_type: ModelType,
     status: TestStatus,
     duration: Duration,
     tokens_generated: usize,
@@ -104,6 +177,7 @@ struct TestResult {
 impl TestResult {
     fn pass(
         model: String,
+        model_type: ModelType,
         duration: Duration,
         tokens: usize,
         output: String,
@@ -121,6 +195,7 @@ impl TestResult {
         };
         Self {
             model,
+            model_type,
             status: TestStatus::Passed,
             duration,
             tokens_generated: tokens,
@@ -133,9 +208,10 @@ impl TestResult {
         }
     }
 
-    fn fail(model: String, duration: Duration, error: String) -> Self {
+    fn fail(model: String, model_type: ModelType, duration: Duration, error: String) -> Self {
         Self {
             model,
+            model_type,
             status: TestStatus::Failed(error),
             duration,
             tokens_generated: 0,
@@ -157,8 +233,11 @@ impl TestResult {
             stop_reason: String::new(),
         }
     }
-
 }
+
+// ------------------------------------------------------------------
+// Helpers
+// ------------------------------------------------------------------
 
 fn detect_arch(model_dir: &std::path::Path) -> Option<mlx_lm::loader::ModelArch> {
     let config_path = model_dir.join("config.json");
@@ -184,7 +263,6 @@ fn is_moe_model(arch: Option<&mlx_lm::loader::ModelArch>) -> bool {
 
 fn is_base_text_model(model_id: &str) -> bool {
     let lower = model_id.to_lowercase();
-    // Google's "text" models are base (not instruction-tuned)
     lower.contains("gemma-3-text-")
         || lower.contains("gemma-2-text-")
         || lower.contains("gemma-1-text-")
@@ -252,7 +330,6 @@ fn build_prompt(
 fn verify_tokenizer_roundtrip(tokenizer: &mlx_lm::Tokenizer, test_str: &str) -> Result<()> {
     let encoded = tokenizer.encode(test_str)?;
     let decoded = tokenizer.decode(&encoded)?;
-    // Not exact equality (BOS/EOS), but the core text should survive
     let prefix = &test_str[..test_str.len().min(20)];
     if !decoded.contains(prefix) {
         anyhow::bail!(
@@ -272,7 +349,6 @@ fn analyse_output(
     tokenizer_roundtrip_ok: bool,
     duration_secs: f64,
 ) -> QualityMetrics {
-    // Check for runaway repetition via sliding window on words
     let words: Vec<&str> = output.split_whitespace().collect();
     let has_repetition = if words.len() >= 20 {
         let ngrams: Vec<String> = words.windows(5).map(|w| w.join(" ")).collect();
@@ -310,7 +386,75 @@ fn analyse_output(
     }
 }
 
-fn run_model_test(model_id: &str, config: &Config) -> TestResult {
+fn gather_warnings(
+    model_id: &str,
+    arch: Option<&mlx_lm::loader::ModelArch>,
+    quality: &QualityMetrics,
+    config: &Config,
+    tokenizer_roundtrip_ok: bool,
+) -> Vec<String> {
+    let mut warnings = Vec::new();
+
+    if quality.has_repetition {
+        warnings.push("repetition detected".to_string());
+    }
+    if quality.has_unicode_replacement {
+        warnings.push("unicode replacement chars".to_string());
+    }
+    if quality.hit_max_tokens {
+        warnings.push("hit max_tokens".to_string());
+    }
+    if quality.thinking_leaked {
+        warnings.push("thinking tokens leaked".to_string());
+    }
+    if quality.unique_token_ratio < 0.1 && !quality.response_length == 0 {
+        warnings.push(format!(
+            "degenerate output (unique ratio {:.2})",
+            quality.unique_token_ratio
+        ));
+    }
+    if !quality.expected_answer_found && !config.harness.expected_answer.is_empty() {
+        warnings.push(format!(
+            "expected answer '{}' not found",
+            config.harness.expected_answer
+        ));
+    }
+    if !tokenizer_roundtrip_ok {
+        warnings.push("tokenizer roundtrip failed".to_string());
+    }
+
+    if config.harness.run_reasoning_check && is_reasoning_model(model_id, arch) {
+        if quality.thinking_leaked {
+            warnings.push(
+                "REASONING: <think> blocks present with enable_thinking=false".to_string(),
+            );
+        }
+    }
+
+    if is_base_text_model(model_id) {
+        warnings.push(
+            "BASE MODEL: not instruction-tuned, chat template results are unreliable"
+                .to_string(),
+        );
+    }
+
+    if config.harness.run_moe_performance_check && is_moe_model(arch) {
+        if quality.tokens_per_sec < config.harness.moe_min_tokens_per_sec {
+            warnings.push(format!(
+                "MOE PERFORMANCE: {:.2} tok/s below threshold {:.2}",
+                quality.tokens_per_sec, config.harness.moe_min_tokens_per_sec
+            ));
+        }
+    }
+
+    warnings
+}
+
+// ------------------------------------------------------------------
+// Text model test
+// ------------------------------------------------------------------
+
+fn run_text_model_test(model_id: &str, config: &Config) -> TestResult {
     let start = Instant::now();
 
     let result = (|| -> Result<(String, String, usize, String, QualityMetrics, Vec<String>)> {
@@ -320,7 +464,6 @@ fn run_model_test(model_id: &str, config: &Config) -> TestResult {
 
         let arch = detect_arch(&model_dir);
 
-        // Tokenizer roundtrip check
         let tokenizer_roundtrip_ok = if config.harness.run_tokenizer_roundtrip {
             let roundtrip_str = "What is 2 + 2? Answer with just the number.";
             match verify_tokenizer_roundtrip(&tokenizer, roundtrip_str) {
@@ -376,8 +519,135 @@ fn run_model_test(model_id: &str, config: &Config) -> TestResult {
             duration_secs,
         );
 
-        let mut warnings = Vec::new();
+        let warnings = gather_warnings(model_id, arch.as_ref(), &quality, config, tokenizer_roundtrip_ok);
 
+        Ok((output, prompt, metrics.tokens, metrics.stop_reason.to_string(), quality, warnings))
+    })();
+
+    let duration = start.elapsed();
+
+    match result {
+        Ok((output, prompt, tokens, stop_reason, quality, warnings)) => {
+            TestResult::pass(
+                model_id.to_string(),
+                ModelType::Text,
+                duration,
+                tokens,
+                output,
+                prompt,
+                quality,
+                warnings,
+                stop_reason,
+            )
+        }
+        Err(e) => TestResult::fail(model_id.to_string(), ModelType::Text, duration, format!("{e:?}")),
+    }
+}
+
+// ------------------------------------------------------------------
+// Vision model test
+// ------------------------------------------------------------------
+
+fn run_vision_model_test(model_id: &str, image_path: &Path, config: &Config) -> TestResult {
+    let start = Instant::now();
+
+    let result = (|| -> Result<(String, String, usize, String, QualityMetrics, Vec<String>)> {
+        let model_dir = mlx_lm::resolve_model_dir(model_id)?;
+        eprintln!("  Loading vision model from {:?}...", model_dir);
+
+        let vlm = mlx_vlm::load_gemma4_vlm(&model_dir)?;
+        let tokenizer = vlm.tokenizer.clone();
+        let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, tokenizer.clone());
+
+        let template_options = mlx_lm::ChatTemplateOptions {
+            add_generation_prompt: true,
+            continue_final_message: false,
+            enable_thinking: false,
+        };
+
+        // Build prompt with image token placeholder for vision models.
+        // The chat template will place it in the correct position.
+        let vision_prompt_with_placeholder = format!("<|image|>{}", config.harness.vision_prompt);
+        let prompt_text = build_prompt(
+            &model_dir,
+            &vision_prompt_with_placeholder,
+            &config.harness.system_prompt,
+            &template_options,
+        )?;
+
+        // Tokenize base prompt
+        let encoding = tokenizer
+            .encode(prompt_text.clone(), false)
+            .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
+        let token_ids = encoding.get_ids().to_vec();
+
+        // Process image to determine actual num_soft_tokens
+        eprintln!("  Processing image {:?}...", image_path);
+        let processed = vlm.processor.process(image_path)?;
+        let pixel_values = vlm.processor.to_array(&processed)?;
+        let num_soft_tokens = processed.num_soft_tokens;
+
+        // Expand single image token to match Python Gemma4Processor behavior:
+        // <|image> + <|image|> * num_soft_tokens + <image|>
+        let image_token_id = vlm.config.image_token_id as u32;
+        let image_open_token_id = tokenizer.token_to_id("<|image>").unwrap_or(image_token_id);
+        let image_close_token_id = tokenizer.token_to_id("<image|>").unwrap_or(image_token_id);
+        let mut expanded = Vec::new();
+        let mut found_image = false;
+        for &tid in &token_ids {
+            if tid == image_token_id && !found_image {
+                expanded.push(image_open_token_id);
+                for _ in 0..num_soft_tokens {
+                    expanded.push(image_token_id);
+                }
+                expanded.push(image_close_token_id);
+                found_image = true;
+            } else {
+                expanded.push(tid);
+            }
+        }
+
+        let prompt_i32: Vec<i32> = expanded.iter().map(|&x| x as i32).collect();
+        let input_ids = mlx_core::Array::from_slice_i32(&prompt_i32)?
+            .reshape(&[1, prompt_i32.len() as i32])?;
+
+        eprintln!("  Generating with image...");
+        let opts = mlx_vlm::VlmGenerateOptions {
+            max_tokens: config.harness.max_tokens.unwrap_or(128),
+            temperature: config.harness.temperature,
+        };
+
+        let tokens = pipeline.generate_tokens(&input_ids, Some(&pixel_values), &opts)?;
+        let output = tokenizer
+            .decode(&tokens, true)
+            .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+
+        let token_count = tokens.len();
+
+        let eos_token_id = tokenizer
+            .token_to_id("</s>")
+            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
+            .or_else(|| tokenizer.token_to_id("<|im_end|>"))
+            .unwrap_or(2);
+        let stop_reason = if tokens.last() == Some(&eos_token_id) {
+            "stop"
+        } else {
+            "length"
+        }
+        .to_string();
+
+        let duration_secs = start.elapsed().as_secs_f64();
+
+        let quality = analyse_output(
+            &output,
+            token_count,
+            config.harness.max_tokens,
+            &config.harness.vision_expected_answer,
+            true,
+            duration_secs,
+        );
+
+        let mut warnings = Vec::new();
         if quality.has_repetition {
             warnings.push("repetition detected".to_string());
         }
@@ -396,44 +666,14 @@ fn run_model_test(model_id: &str, config: &Config) -> TestResult {
                 quality.unique_token_ratio
             ));
         }
-        if !quality.expected_answer_found && !config.harness.expected_answer.is_empty() {
+        if !quality.expected_answer_found && !config.harness.vision_expected_answer.is_empty() {
             warnings.push(format!(
                 "expected answer '{}' not found",
-                config.harness.expected_answer
+                config.harness.vision_expected_answer
             ));
         }
-        if !tokenizer_roundtrip_ok {
-            warnings.push("tokenizer roundtrip failed".to_string());
-        }
 
-        // Reasoning model check: <think> blocks should be absent when enable_thinking=false
-        if config.harness.run_reasoning_check && is_reasoning_model(model_id, arch.as_ref()) {
-            if quality.thinking_leaked {
-                warnings.push(
-                    "REASONING: <think> blocks present with enable_thinking=false".to_string(),
-                );
-            }
-        }
-
-        // Base model check: models with "text" in their name are not instruction-tuned
-        if is_base_text_model(model_id) {
-            warnings.push(
-                "BASE MODEL: not instruction-tuned, chat template results are unreliable"
-                    .to_string(),
-            );
-        }
-
-        // MoE performance check
-        if config.harness.run_moe_performance_check && is_moe_model(arch.as_ref()) {
-            if quality.tokens_per_sec < config.harness.moe_min_tokens_per_sec {
-                warnings.push(format!(
-                    "MOE PERFORMANCE: {:.2} tok/s below threshold {:.2}",
-                    quality.tokens_per_sec, config.harness.moe_min_tokens_per_sec
-                ));
-            }
-        }
-
-        Ok((output, prompt, metrics.tokens, metrics.stop_reason.to_string(), quality, warnings))
+        Ok((output, prompt_text, token_count, stop_reason, quality, warnings))
     })();
 
     let duration = start.elapsed();
@@ -442,6 +682,7 @@ fn run_model_test(model_id: &str, config: &Config) -> TestResult {
         Ok((output, prompt, tokens, stop_reason, quality, warnings)) => {
             TestResult::pass(
                 model_id.to_string(),
+                ModelType::Vision,
                 duration,
                 tokens,
                 output,
@@ -451,9 +692,18 @@ fn run_model_test(model_id: &str, config: &Config) -> TestResult {
                 stop_reason,
             )
         }
-        Err(e) => TestResult::fail(model_id.to_string(), duration, format!("{e:?}")),
+        Err(e) => TestResult::fail(
+            model_id.to_string(),
+            ModelType::Vision,
+            duration,
+            format!("{e:?}"),
+        ),
     }
 }
+
+// ------------------------------------------------------------------
+// UI
+// ------------------------------------------------------------------
 
 fn print_banner() {
     println!();
@@ -482,19 +732,20 @@ fn print_summary_table(results: &[TestResult]) {
 
     println!();
     println!(
-        "┌{}┬──────────┬──────────┬─────────────────────────────────────────────┐",
+        "┌{}┬──────────┬──────────┬──────────┬─────────────────────────────────────────────┐",
         "─".repeat(model_width + 2)
     );
     println!(
-        "│ {:<model_width$} │ {:<8} │ {:<8} │ {:<43} │",
+        "│ {:<model_width$} │ {:<8} │ {:<8} │ {:<8} │ {:<43} │",
         "Model",
+        "Type",
         "Status",
         "Time",
         "Details",
         model_width = model_width
     );
     println!(
-        "├{}┼──────────┼──────────┼─────────────────────────────────────────────┤",
+        "├{}┼──────────┼──────────┼──────────┼─────────────────────────────────────────────┤",
         "─".repeat(model_width + 2)
     );
 
@@ -526,12 +777,17 @@ fn print_summary_table(results: &[TestResult]) {
                 };
                 ("FAIL".to_string(), err)
             }
+        };
 
+        let type_str = match result.model_type {
+            ModelType::Text => "text",
+            ModelType::Vision => "vision",
         };
 
         println!(
-            "│ {:<model_width$} │ {:<8} │ {:>6.2}s │ {:<43} │",
+            "│ {:<model_width$} │ {:<8} │ {:<8} │ {:>6.2}s │ {:<43} │",
             result.model,
+            type_str,
             status_str,
             result.duration.as_secs_f64(),
             details,
@@ -540,7 +796,7 @@ fn print_summary_table(results: &[TestResult]) {
     }
 
     println!(
-        "└{}┴──────────┴──────────┴─────────────────────────────────────────────┘",
+        "└{}┴──────────┴──────────┴──────────┴─────────────────────────────────────────────┘",
         "─".repeat(model_width + 2)
     );
 
@@ -554,7 +810,6 @@ fn print_summary_table(results: &[TestResult]) {
     }
     println!();
 
-    // Print detailed warnings for each model
     let models_with_warnings: Vec<_> = results
         .iter()
         .filter(|r| !r.warnings.is_empty())
@@ -570,12 +825,21 @@ fn print_summary_table(results: &[TestResult]) {
         println!();
     }
 
-    // Print full outputs for all models
     println!("Full Outputs:");
     for result in results {
         println!("  ──────────────────────────────────────────────────────────────────────────────");
         println!("  Model: {}", result.model);
-        println!("  Tokens: {} | Stop reason: {} | Duration: {:.2}s", result.tokens_generated, result.stop_reason, result.duration.as_secs_f64());
+        let type_str = match result.model_type {
+            ModelType::Text => "text",
+            ModelType::Vision => "vision",
+        };
+        println!("  Type: {}", type_str);
+        println!(
+            "  Tokens: {} | Stop reason: {} | Duration: {:.2}s",
+            result.tokens_generated,
+            result.stop_reason,
+            result.duration.as_secs_f64()
+        );
         if !result.warnings.is_empty() {
             println!("  Warnings: {}", result.warnings.join(", "));
         }
@@ -594,11 +858,38 @@ fn print_summary_table(results: &[TestResult]) {
     println!("  ──────────────────────────────────────────────────────────────────────────────");
 }
 
+// ------------------------------------------------------------------
+// Main
+// ------------------------------------------------------------------
+
 fn main() -> Result<()> {
     dotenvy::dotenv().ok();
-    let config_path = std::env::args()
-        .nth(1)
-        .unwrap_or_else(|| "config.toml".to_string());
+
+    let args: Vec<String> = std::env::args().collect();
+
+    // Parse args: config path and optional --type filter
+    let mut config_path = "config.toml".to_string();
+    let mut type_filter: Option<ModelType> = None;
+
+    let mut i = 1;
+    while i < args.len() {
+        if args[i] == "--type" || args[i] == "-t" {
+            i += 1;
+            if i < args.len() {
+                type_filter = match args[i].as_str() {
+                    "text" => Some(ModelType::Text),
+                    "vision" => Some(ModelType::Vision),
+                    _ => {
+                        eprintln!("Warning: unknown type filter '{}', ignoring", args[i]);
+                        None
+                    }
+                };
+            }
+        } else if !args[i].starts_with('-') {
+            config_path = args[i].clone();
+        }
+        i += 1;
+    }
 
     let config_str = std::fs::read_to_string(&config_path)
         .map_err(|e| anyhow::anyhow!("Failed to read config '{}': {}", config_path, e))?;
@@ -612,7 +903,23 @@ fn main() -> Result<()> {
     print_banner();
     println!("Configuration: {}", config_path);
     println!("Models to test: {}", config.models.models.len());
-    println!("Prompt: {}", config.harness.prompt);
+    if let Some(filter) = type_filter {
+        let filter_str = match filter {
+            ModelType::Text => "text",
+            ModelType::Vision => "vision",
+        };
+        println!("Type filter: {}", filter_str);
+    }
+    // Determine which types will actually be tested
+    let will_test_text = type_filter.map_or(true, |f| f == ModelType::Text);
+    let will_test_vision = type_filter.map_or(true, |f| f == ModelType::Vision);
+
+    if will_test_text {
+        println!("Prompt (text): {}", config.harness.prompt);
+    }
+    if will_test_vision {
+        println!("Prompt (vision): {}", config.harness.vision_prompt);
+    }
     if let Some(max) = config.harness.max_tokens {
         println!("Max tokens: {}", max);
     } else {
@@ -620,10 +927,18 @@ fn main() -> Result<()> {
     }
     println!("Temperature: {}", config.harness.temperature);
     println!("Top-p: {}", config.harness.top_p);
-    println!(
-        "Expected answer: '{}'",
-        config.harness.expected_answer
-    );
+    if will_test_text && !config.harness.expected_answer.is_empty() {
+        println!(
+            "Expected answer (text): '{}'",
+            config.harness.expected_answer
+        );
+    }
+    if will_test_vision && !config.harness.vision_expected_answer.is_empty() {
+        println!(
+            "Expected answer (vision): '{}'",
+            config.harness.vision_expected_answer
+        );
+    }
     println!(
         "Tokenizer roundtrip: {}",
         if config.harness.run_tokenizer_roundtrip {
@@ -652,17 +967,42 @@ fn main() -> Result<()> {
 
     let mut results = Vec::new();
 
-    for (i, model_id) in config.models.models.iter().enumerate() {
+    for (i, entry) in config.models.models.iter().enumerate() {
+        let model_id = entry.id();
+        let model_type = entry.model_type();
+
+        // Apply type filter
+        if let Some(filter) = type_filter {
+            if model_type != filter {
+                continue;
+            }
+        }
+
+        let type_str = match model_type {
+            ModelType::Text => "text",
+            ModelType::Vision => "vision",
+        };
+
         println!(
-            "[{}/{}] Testing: {}",
+            "[{}/{}] Testing: {} ({})",
             i + 1,
             config.models.models.len(),
-            model_id
+            model_id,
+            type_str
         );
-        let result = run_model_test(model_id, &config);
+
+        let result = match model_type {
+            ModelType::Text => run_text_model_test(model_id, &config),
+            ModelType::Vision => {
+                let image_path = entry
+                    .image_path()
+                    .map(Path::new)
+                    .unwrap_or_else(|| Path::new(&config.harness.vision_image));
+                run_vision_model_test(model_id, image_path, &config)
+            }
+        };
         results.push(result.clone());
 
-        // Print immediate status
         match &result.status {
             TestStatus::Passed => {
                 let mut msg = format!(
@@ -683,7 +1023,6 @@ fn main() -> Result<()> {
                     err
                 );
             }
-
         }
         println!();
     }

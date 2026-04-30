@@ -40,11 +40,20 @@ path = "src/bin/mlx-server.rs"
 name = "embed_bench"
 path = "src/bin/embed_bench.rs"
 
+[[bin]]
+name = "test_vision_shapes"
+path = "src/bin/test_vision_shapes.rs"
+
+[[bin]]
+name = "simple_vision_test"
+path = "src/bin/simple_vision_test.rs"
+
 [dependencies]
 mlx-lm = { path = "crates/mlx-lm" }
 mlx-models = { path = "crates/mlx-models" }
 mlx-nn = { path = "crates/mlx-nn" }
 mlx-core = { path = "crates/mlx-core" }
+mlx-vlm = { path = "crates/mlx-vlm" }
 anyhow.workspace = true
 clap.workspace = true
 tokenizers.workspace = true

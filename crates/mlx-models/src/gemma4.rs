@@ -224,7 +224,7 @@ impl Module for RmsNormNoScale {
     }
 }
 
-struct RmsNormZeroShift {
+pub struct RmsNormZeroShift {
     weight: Array,
     eps: f32,
 }
@@ -531,7 +531,9 @@ fn apply_proportional_rope(
 
 fn repeat_interleave(arr: &Array, repeats: usize, axis: i32) -> Result<Array> {
     let shape = arr.shape_raw();
-    let dim = shape[axis as usize];
+    let ndim = shape.len() as i32;
+    let axis_norm = if axis < 0 { ndim + axis } else { axis };
+    let dim = shape[axis_norm as usize];
     let mut indices = Vec::with_capacity(dim as usize * repeats);
     for i in 0..dim {
         for _ in 0..repeats {
@@ -1297,21 +1299,21 @@ impl Gemma4DecoderLayer {
 // TextModel
 // ------------------------------------------------------------------
 
-struct Gemma4TextModel {
-    embed_tokens: Embedding,
-    layers: Vec<Gemma4DecoderLayer>,
-    norm: RmsNormZeroShift,
-    embed_scale: f32,
-    embed_tokens_per_layer: Option<Embedding>,
-    embed_tokens_per_layer_scale: f32,
-    per_layer_model_projection: Option<Linear>,
-    per_layer_projection_norm: Option<RmsNormZeroShift>,
-    per_layer_input_scale: f32,
-    num_hidden_layers: usize,
-    hidden_size_per_layer_input: usize,
-    sliding_window: usize,
-    caches: Vec<KvCache>,
-    layer_idx_to_cache_idx: Vec<usize>,
+pub struct Gemma4TextModel {
+    pub embed_tokens: Embedding,
+    pub layers: Vec<Gemma4DecoderLayer>,
+    pub norm: RmsNormZeroShift,
+    pub embed_scale: f32,
+    pub embed_tokens_per_layer: Option<Embedding>,
+    pub embed_tokens_per_layer_scale: f32,
+    pub per_layer_model_projection: Option<Linear>,
+    pub per_layer_projection_norm: Option<RmsNormZeroShift>,
+    pub per_layer_input_scale: f32,
+    pub num_hidden_layers: usize,
+    pub hidden_size_per_layer_input: usize,
+    pub sliding_window: usize,
+    pub caches: Vec<KvCache>,
+    pub layer_idx_to_cache_idx: Vec<usize>,
 }
 
 impl Gemma4TextModel {
@@ -1507,10 +1509,10 @@ impl Gemma4TextModel {
 // LanguageModel wrapper
 // ------------------------------------------------------------------
 
-struct LanguageModel {
-    model: Gemma4TextModel,
-    lm_head: Linear,
-    final_logit_softcapping: Option<f32>,
+pub struct LanguageModel {
+    pub model: Gemma4TextModel,
+    pub lm_head: Linear,
+    pub final_logit_softcapping: Option<f32>,
 }
 
 impl LanguageModel {
@@ -1542,8 +1544,9 @@ impl LanguageModel {
 
 struct VisionPatchEmbedder {
     input_proj: ClippableLinear,
-    position_embedding_table: Embedding,
+    position_embedding_table: Array,
     patch_size: usize,
+    position_embedding_size: usize,
 }
 
 impl VisionPatchEmbedder {
@@ -1552,12 +1555,13 @@ impl VisionPatchEmbedder {
         let pos_emb_weight = vb.get("position_embedding_table")?;
         Ok(Self {
             input_proj: ClippableLinear::new(&vb.pp("input_proj"), &qc)?,
-            position_embedding_table: Embedding::from_weight(pos_emb_weight),
+            position_embedding_table: pos_emb_weight,
             patch_size: cfg.patch_size,
+            position_embedding_size: cfg.position_embedding_size,
         })
     }
 
-    fn forward(&self, images: &Array) -> Result<(Array, Array)> {
+    fn forward(&self, images: &Array) -> Result<Array> {
         let shape = images.shape_raw();
         let (b, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
         let patch_size = self.patch_size as i32;
@@ -1571,19 +1575,45 @@ impl VisionPatchEmbedder {
             .transpose_axes(&[0, 2, 4, 1, 3, 5])?
             .reshape(&[b, num_patches, c * patch_size * patch_size])?;
 
+        // Normalize patches to match Python: 2 * (patches - 0.5)
+        let half = Array::from_float(0.5f32)?;
+        let two = Array::from_float(2.0f32)?;
+        let patches = patches.subtract(&half)?.multiply(&two)?;
+
         let features = self.input_proj.forward(&patches)?;
 
-        // Position embeddings
-        let mut pos_indices = Vec::with_capacity(num_patches as usize);
+        // Position embeddings: table has shape [2, position_embedding_size, hidden_size]
+        // We take embeddings for x (table[0]) and y (table[1]) separately and sum them.
+        let mut x_positions = Vec::with_capacity(num_patches as usize);
+        let mut y_positions = Vec::with_capacity(num_patches as usize);
         for row in 0..num_patches_h {
             for col in 0..num_patches_w {
-                pos_indices.push((row * num_patches_w + col) as i32);
+                x_positions.push(col as i32);
+                y_positions.push(row as i32);
             }
         }
-        let pos_indices_arr = Array::from_slice_i32(&pos_indices)?;
-        let pos_emb = self.position_embedding_table.forward(&pos_indices_arr)?;
+        let x_pos_arr = Array::from_slice_i32(&x_positions)?;
+        let y_pos_arr = Array::from_slice_i32(&y_positions)?;
 
-        Ok((features, pos_emb))
+        let pos_size = self.position_embedding_size as i32;
+        let hidden_size = self.position_embedding_table.dim(2) as i32;
+        let table_0 = self
+            .position_embedding_table
+            .slice(&[0, 0, 0], &[1, pos_size, hidden_size])?
+            .squeeze(0)?;
+        let table_1 = self
+            .position_embedding_table
+            .slice(&[1, 0, 0], &[2, pos_size, hidden_size])?
+            .squeeze(0)?;
+
+        let x_emb = table_0.take(&x_pos_arr, 0)?;
+        let y_emb = table_1.take(&y_pos_arr, 0)?;
+        let pos_emb = x_emb.add(&y_emb)?;
+
+        // Broadcast to batch dimension
+        let pos_emb = pos_emb.expand_dims(0)?.broadcast_to(&features.shape_raw())?;
+
+        features.add(&pos_emb)
     }
 }
 
@@ -1887,7 +1917,7 @@ pub fn build_vision_attention_mask(
         .as_type(dtype)
 }
 
-struct VisionModel {
+pub struct VisionModel {
     patch_embedder: VisionPatchEmbedder,
     pooler: VisionPooler,
     layers: Vec<VisionEncoderLayer>,
@@ -1934,7 +1964,7 @@ impl VisionModel {
         })
     }
 
-    fn forward(&mut self, images: &Array) -> Result<Array> {
+    pub fn forward(&mut self, images: &Array) -> Result<Array> {
         let shape = images.shape_raw();
         let (b, _c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
         let patch_size = self.patch_embedder.patch_size as i32;
@@ -1942,11 +1972,9 @@ impl VisionModel {
         let num_patches_w = w / patch_size;
         let num_patches = (num_patches_h * num_patches_w) as usize;
 
-        let (mut features, pos_emb) = self.patch_embedder.forward(images)?;
+        let mut features = self.patch_embedder.forward(images)?;
         let feature_shape = features.shape_raw();
         let hidden_size = feature_shape[2] as usize;
-
-        features = features.add(&pos_emb)?;
 
         let max_patches = self.pooler.default_output_length
             * self.pooler.pooling_kernel_size
@@ -2042,8 +2070,7 @@ impl VisionModel {
                 .forward(&features, &patch_positions, &padding_positions)?;
 
         // Strip padding: count valid tokens per batch and slice
-        let pool_mask_f32 = pool_mask.as_type(DType::Float32)?;
-        let valid_counts = pool_mask_f32.sum_axis(1, false)?; // [B]
+        let valid_counts = pool_mask.as_type(DType::Int32)?.sum_axis(1, false)?; // [B]
         let valid_counts_vec: Vec<i32> = valid_counts.to_vec_i32()?;
 
         let stripped = if b == 1 {
@@ -2085,7 +2112,7 @@ impl VisionModel {
 // Multimodal embedder
 // ------------------------------------------------------------------
 
-struct MultimodalEmbedder {
+pub struct MultimodalEmbedder {
     embedding_pre_projection_norm: RmsNormNoScale,
     embedding_projection: Linear,
 }
@@ -2102,7 +2129,7 @@ impl MultimodalEmbedder {
         })
     }
 
-    fn forward(&self, features: &Array) -> Result<Array> {
+    pub fn forward(&self, features: &Array) -> Result<Array> {
         let h = self.embedding_pre_projection_norm.forward(features)?;
         self.embedding_projection.forward(&h)
     }
@@ -2113,9 +2140,9 @@ impl MultimodalEmbedder {
 // ------------------------------------------------------------------
 
 pub struct Gemma4 {
-    language_model: LanguageModel,
-    vision_tower: VisionModel,
-    embed_vision: MultimodalEmbedder,
+    pub language_model: LanguageModel,
+    pub vision_tower: VisionModel,
+    pub embed_vision: MultimodalEmbedder,
     config: Gemma4Config,
 }
 
@@ -2273,7 +2300,7 @@ impl Gemma4 {
         let source_flat = source.flatten(0, -1)?;
         let source_size = source_flat.elem_count() as i32;
         let mod_indices = if source_size > 0 {
-            indices.remainder(&Array::from_int(source_size)?)?
+            indices.remainder(&Array::from_int(source_size)?)?.as_type(DType::Int32)?
         } else {
             indices
         };

@@ -39,7 +39,11 @@ pub fn load_gemma4_vlm(model_dir: &Path) -> Result<VlmComponents> {
     let vb = VarBuilder::from_weights(sanitized, mlx_core::DType::Float16);
     let model = Gemma4::new(&vb, &config)?;
 
-    let processor = Gemma4ImageProcessor::new(896);
+    let processor = Gemma4ImageProcessor::new(
+        config.vision_config.patch_size,
+        config.vision_soft_tokens_per_image,
+        config.vision_config.pooling_kernel_size,
+    );
 
     Ok(VlmComponents {
         model,
