@@ -1,10 +1,10 @@
 use anyhow::Result;
+use mlx_lm::Tokenizer;
 use mlx_models::{sanitize_weights, Gemma4, Gemma4Config};
 use mlx_nn::VarBuilder;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::Path;
-use tokenizers::Tokenizer;
 
 use crate::processing::Gemma4ImageProcessor;
 
@@ -27,11 +27,14 @@ pub fn load_gemma4_vlm(model_dir: &Path) -> Result<VlmComponents> {
     let config: Gemma4Config = serde_json::from_str(&config_str)?;
 
     let tokenizer_path = model_dir.join("tokenizer.json");
-    let tokenizer = Tokenizer::from_file(&tokenizer_path)
+    let raw_tokenizer = tokenizers::Tokenizer::from_file(&tokenizer_path)
         .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
 
     // Determine EOS token ID from config and tokenizer_config
-    let eos_token_id = load_eos_token_id(model_dir, &config_str)?;
+    let eos_token_id = load_eos_token_id(model_dir, &config_str, &raw_tokenizer)?;
+
+    // Wrap in mlx-lm's Tokenizer with the correct EOS
+    let tokenizer = Tokenizer::from_raw(raw_tokenizer).with_eos(eos_token_id);
 
     // Load raw weights, sanitize, then build VarBuilder
     let shards = VarBuilder::discover_shards(model_dir)?;
@@ -59,7 +62,7 @@ pub fn load_gemma4_vlm(model_dir: &Path) -> Result<VlmComponents> {
     })
 }
 
-fn load_eos_token_id(model_dir: &Path, config_str: &str) -> Result<u32> {
+fn load_eos_token_id(model_dir: &Path, config_str: &str, tokenizer: &tokenizers::Tokenizer) -> Result<u32> {
     let config: Value = serde_json::from_str(config_str)?;
 
     // 1. Check config.json top-level eos_token_id
@@ -81,8 +84,6 @@ fn load_eos_token_id(model_dir: &Path, config_str: &str) -> Result<u32> {
             }
             // Also check eos_token string -> token ID via tokenizer
             if let Some(eos_str) = tk_cfg.get("eos_token").and_then(|v| v.as_str()) {
-                let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"))
-                    .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
                 if let Some(id) = tokenizer.token_to_id(eos_str) {
                     return Ok(id);
                 }
@@ -90,8 +91,6 @@ fn load_eos_token_id(model_dir: &Path, config_str: &str) -> Result<u32> {
         }
     }
     // 4. Fallback: try common EOS token strings
-    let tokenizer = Tokenizer::from_file(&model_dir.join("tokenizer.json"))
-        .map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))?;
     for tok in &["</s>", "<eos>", "<|endoftext|>", "<|im_end|>"] {
         if let Some(id) = tokenizer.token_to_id(tok) {
             return Ok(id);

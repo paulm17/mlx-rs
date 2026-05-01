@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 mlx-core = { path = "../mlx-core" }
 mlx-nn = { path = "../mlx-nn" }
+mlx-lm = { path = "../mlx-lm" }
 mlx-models = { path = "../mlx-models" }
 anyhow = { workspace = true }
 serde = { workspace = true }

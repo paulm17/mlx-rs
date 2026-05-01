@@ -556,8 +556,7 @@ fn run_vision_model_test(model_id: &str, image_path: &Path, config: &Config) -> 
         eprintln!("  Loading vision model from {:?}...", model_dir);
 
         let vlm = mlx_vlm::load_gemma4_vlm(&model_dir)?;
-        let tokenizer = vlm.tokenizer.clone();
-        let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, tokenizer.clone(), vlm.eos_token_id);
+        let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, vlm.tokenizer.clone());
 
         let template_options = mlx_lm::ChatTemplateOptions {
             add_generation_prompt: true,
@@ -576,7 +575,7 @@ fn run_vision_model_test(model_id: &str, image_path: &Path, config: &Config) -> 
         )?;
 
         // Tokenize base prompt
-        let encoding = tokenizer
+        let encoding = vlm.tokenizer.inner()
             .encode(prompt_text.clone(), false)
             .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
         let token_ids = encoding.get_ids().to_vec();
@@ -590,8 +589,8 @@ fn run_vision_model_test(model_id: &str, image_path: &Path, config: &Config) -> 
         // Expand single image token to match Python Gemma4Processor behavior:
         // <|image> + <|image|> * num_soft_tokens + <image|>
         let image_token_id = vlm.config.image_token_id as u32;
-        let image_open_token_id = tokenizer.token_to_id("<|image>").unwrap_or(image_token_id);
-        let image_close_token_id = tokenizer.token_to_id("<image|>").unwrap_or(image_token_id);
+        let image_open_token_id = vlm.tokenizer.inner().token_to_id("<|image>").unwrap_or(image_token_id);
+        let image_close_token_id = vlm.tokenizer.inner().token_to_id("<image|>").unwrap_or(image_token_id);
         let mut expanded = Vec::new();
         let mut found_image = false;
         for &tid in &token_ids {
@@ -618,17 +617,13 @@ fn run_vision_model_test(model_id: &str, image_path: &Path, config: &Config) -> 
         };
 
         let tokens = pipeline.generate_tokens(&input_ids, Some(&pixel_values), &opts)?;
-        let output = tokenizer
-            .decode(&tokens, true)
+        let output = vlm.tokenizer
+            .decode(&tokens)
             .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
 
         let token_count = tokens.len();
 
-        let eos_token_id = tokenizer
-            .token_to_id("</s>")
-            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
-            .or_else(|| tokenizer.token_to_id("<|im_end|>"))
-            .unwrap_or(2);
+        let eos_token_id = vlm.eos_token_id;
         let stop_reason = if tokens.last() == Some(&eos_token_id) {
             "stop"
         } else {

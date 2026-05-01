@@ -1225,6 +1225,7 @@ dependencies = [
  "image",
  "minijinja",
  "mlx-core",
+ "mlx-lm",
  "mlx-models",
  "mlx-nn",
  "rand 0.8.5",

@@ -5,8 +5,7 @@ fn test_generation(model_dir: &str, image_path: Option<&Path>, label: &str) -> R
     println!("\n=== {} ===", label);
     
     let vlm = mlx_vlm::load_gemma4_vlm(Path::new(model_dir))?;
-    let tokenizer = vlm.tokenizer.clone();
-    let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, tokenizer.clone(), vlm.eos_token_id);
+    let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, vlm.tokenizer.clone());
 
     let config = vlm.config;
     let num_image_tokens = config.vision_soft_tokens_per_image;
@@ -26,7 +25,7 @@ fn test_generation(model_dir: &str, image_path: Option<&Path>, label: &str) -> R
     let prompt_text = mlx_lm::ChatTemplate::from_model_dir(Path::new(model_dir))?
         .apply(&[mlx_lm::Message::user(&user_message)], &template_options)?;
 
-    let encoding = tokenizer.encode(prompt_text.clone(), false)
+    let encoding = vlm.tokenizer.inner().encode(prompt_text.clone(), false)
         .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
     let token_ids = encoding.get_ids().to_vec();
 
@@ -51,8 +50,7 @@ fn test_generation(model_dir: &str, image_path: Option<&Path>, label: &str) -> R
     };
 
     let tokens = pipeline.generate_tokens(&input_ids, pixel_values.as_ref(), &opts)?;
-    let text = tokenizer.decode(&tokens, true)
-        .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
+    let text = vlm.tokenizer.decode(&tokens)?;
 
     println!("OUTPUT: {}", text);
     Ok(())

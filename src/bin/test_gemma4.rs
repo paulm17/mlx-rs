@@ -8,7 +8,7 @@ fn main() -> Result<()> {
     println!("Loading model: {}", model_id);
     let model_dir = mlx_lm::resolve_model_dir(model_id)?;
     let vlm = mlx_vlm::load_gemma4_vlm(&model_dir)?;
-    let tokenizer = vlm.tokenizer.clone();
+    let raw_tokenizer = vlm.tokenizer.inner().clone();
 
     // Process image
     let processed = vlm.processor.process(image_path)?;
@@ -26,14 +26,14 @@ fn main() -> Result<()> {
     let prompt = mlx_lm::ChatTemplate::from_model_dir(&model_dir)?
         .apply(&messages, &template_options)?;
 
-    let encoding = tokenizer.encode(prompt.clone(), false)
+    let encoding = raw_tokenizer.encode(prompt.clone(), false)
         .map_err(|e| anyhow::anyhow!("tokenizer encode failed: {e}"))?;
     let token_ids = encoding.get_ids().to_vec();
 
     // Expand image token
     let image_token_id = vlm.config.image_token_id as u32;
-    let image_open_token_id = tokenizer.token_to_id("<|image>").unwrap_or(image_token_id);
-    let image_close_token_id = tokenizer.token_to_id("<image|>").unwrap_or(image_token_id);
+    let image_open_token_id = raw_tokenizer.token_to_id("<|image>").unwrap_or(image_token_id);
+    let image_close_token_id = raw_tokenizer.token_to_id("<image|>").unwrap_or(image_token_id);
     let num_soft_tokens = processed.num_soft_tokens;
     let mut expanded = Vec::new();
     let mut found_image = false;

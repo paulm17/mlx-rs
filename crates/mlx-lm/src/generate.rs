@@ -109,6 +109,17 @@ impl GenerationProfile {
 pub trait CausalLM {
     /// Forward pass: given input token IDs, return last-token logits.
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array>;
+
+    /// Multimodal forward pass. Defaults to text-only forward.
+    /// `pixel_values` shape: [1, 3, H, W], or `None` for text-only.
+    fn forward_last_token_logits_multimodal(
+        &mut self,
+        input_ids: &Array,
+        _pixel_values: Option<&Array>,
+    ) -> mlx_core::Result<Array> {
+        self.forward_last_token_logits(input_ids)
+    }
+
     /// Clear the KV cache.
     fn clear_cache(&mut self);
 }
@@ -197,6 +208,13 @@ impl EmbeddingModel for mlx_models::Gemma3 {
 impl CausalLM for mlx_models::Gemma4 {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         self.forward_last_token_logits(input_ids, None)
+    }
+    fn forward_last_token_logits_multimodal(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: Option<&Array>,
+    ) -> mlx_core::Result<Array> {
+        self.forward_last_token_logits(input_ids, pixel_values)
     }
     fn clear_cache(&mut self) {
         mlx_models::Gemma4::clear_cache(self);
@@ -347,6 +365,13 @@ impl CausalLM for Box<dyn CausalLM> {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         (**self).forward_last_token_logits(input_ids)
     }
+    fn forward_last_token_logits_multimodal(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: Option<&Array>,
+    ) -> mlx_core::Result<Array> {
+        (**self).forward_last_token_logits_multimodal(input_ids, pixel_values)
+    }
     fn clear_cache(&mut self) {
         (**self).clear_cache();
     }
@@ -355,6 +380,13 @@ impl CausalLM for Box<dyn CausalLM> {
 impl CausalLM for Box<dyn ModelRuntime> {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         (**self).forward_last_token_logits(input_ids)
+    }
+    fn forward_last_token_logits_multimodal(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: Option<&Array>,
+    ) -> mlx_core::Result<Array> {
+        (**self).forward_last_token_logits_multimodal(input_ids, pixel_values)
     }
     fn clear_cache(&mut self) {
         (**self).clear_cache();
@@ -386,6 +418,13 @@ impl EmbeddingModel for Box<dyn ModelRuntime> {
 impl<T: CausalLM + ?Sized> CausalLM for &mut T {
     fn forward_last_token_logits(&mut self, input_ids: &Array) -> mlx_core::Result<Array> {
         (**self).forward_last_token_logits(input_ids)
+    }
+    fn forward_last_token_logits_multimodal(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: Option<&Array>,
+    ) -> mlx_core::Result<Array> {
+        (**self).forward_last_token_logits_multimodal(input_ids, pixel_values)
     }
     fn clear_cache(&mut self) {
         (**self).clear_cache();
@@ -553,6 +592,41 @@ impl<M: CausalLM> GenerationPipeline<M> {
         &mut self,
         prompt: &str,
         max_tokens: Option<usize>,
+        on_piece: F,
+    ) -> Result<(String, GenerationMetrics)>
+    where
+        F: FnMut(u32, &str),
+    {
+        let tokenize_t0 = Instant::now();
+        let input_ids = self.tokenizer.encode(prompt)?;
+        let tokenize_s = tokenize_t0.elapsed().as_secs_f64();
+        let prompt_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
+        let input = Array::from_slice_i32(&prompt_i32)?
+            .reshape(&[1, prompt_i32.len() as i32])?;
+        let (output, mut metrics) =
+            self.generate_from_ids_with_metrics(&input, None, max_tokens, on_piece)?;
+        metrics.total_s += tokenize_s;
+        if metrics.ttft_s > 0.0 {
+            metrics.ttft_s += tokenize_s;
+        }
+        if let Some(p) = metrics.profile.as_mut() {
+            p.tokenize_s = tokenize_s;
+        }
+        Ok((output, metrics))
+    }
+
+    /// Generate from pre-tokenized input IDs with optional pixel values for
+    /// multimodal (vision-language) models.
+    ///
+    /// During prefill, uses multimodal forward if `pixel_values` is `Some`.
+    /// During decode, always uses text-only forward.
+    ///
+    /// If `max_tokens` is `None`, generation is uncapped and stops only on EOS.
+    pub fn generate_from_ids_with_metrics<F>(
+        &mut self,
+        input_ids: &Array,
+        pixel_values: Option<&Array>,
+        max_tokens: Option<usize>,
         mut on_piece: F,
     ) -> Result<(String, GenerationMetrics)>
     where
@@ -575,24 +649,21 @@ impl<M: CausalLM> GenerationPipeline<M> {
             p.clear_cache_s += stage_t0.elapsed().as_secs_f64();
         }
         trace_memory("after_clear_cache", 0);
-        let stage_t0 = Instant::now();
-        let input_ids = self.tokenizer.encode(prompt)?;
-        if let Some(p) = profile.as_mut() {
-            p.tokenize_s += stage_t0.elapsed().as_secs_f64();
-        }
+
         // Repetition controls should apply only to generated tokens, not prompt tokens.
         let mut history_tokens: Vec<u32> = Vec::new();
 
-        // Create input array [1, seq_len]
-        let prompt_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
-        let input = Array::from_slice_i32(&prompt_i32)?.reshape(&[1, prompt_i32.len() as i32])?;
-
-        // Prefill: run the full prompt through the model
+        // Prefill: run the full prompt through the model, with optional pixel values
         let stage_t0 = Instant::now();
-        let logits = self
-            .model
-            .forward_last_token_logits(&input)
-            .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?;
+        let logits = if let Some(pv) = pixel_values {
+            self.model
+                .forward_last_token_logits_multimodal(input_ids, Some(pv))
+                .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?
+        } else {
+            self.model
+                .forward_last_token_logits(input_ids)
+                .map_err(|e| anyhow::anyhow!("forward failed: {e}"))?
+        };
         if let Some(p) = profile.as_mut() {
             p.prefill_forward_s += stage_t0.elapsed().as_secs_f64();
         }

@@ -110,4 +110,24 @@ impl Tokenizer {
     pub fn inner(&self) -> &tokenizers::Tokenizer {
         &self.inner
     }
+
+    /// Look up a token string in the vocabulary, returning its ID.
+    pub fn token_to_id(&self, token: &str) -> Option<u32> {
+        self.inner.token_to_id(token)
+    }
+
+    /// Create a Tokenizer from an already-loaded `tokenizers::Tokenizer`.
+    pub fn from_raw(raw: tokenizers::Tokenizer) -> Self {
+        let eos_token_id = raw
+            .token_to_id("</s>")
+            .or_else(|| raw.token_to_id("<|endoftext|>"))
+            .or_else(|| raw.token_to_id("<|im_end|>"))
+            .unwrap_or(2);
+        let stop_token_ids = vec![eos_token_id];
+        Self {
+            inner: raw,
+            eos_token_id,
+            stop_token_ids,
+        }
+    }
 }

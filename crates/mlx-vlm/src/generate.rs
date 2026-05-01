@@ -1,13 +1,12 @@
 use anyhow::Result;
 use mlx_core::Array;
+use mlx_lm::{GenerationPipeline, Sampler, Tokenizer};
 use mlx_models::Gemma4;
-use tokenizers::Tokenizer;
 
 /// Vision-language generation pipeline.
 pub struct VlmGenerationPipeline {
-    pub model: Gemma4,
-    pub tokenizer: Tokenizer,
-    eos_token_id: u32,
+    model: Gemma4,
+    tokenizer: Tokenizer,
 }
 
 /// Generation options for VLM.
@@ -28,12 +27,8 @@ impl Default for VlmGenerateOptions {
 
 impl VlmGenerationPipeline {
     /// Create a new VLM generation pipeline.
-    pub fn new(model: Gemma4, tokenizer: Tokenizer, eos_token_id: u32) -> Self {
-        Self {
-            model,
-            tokenizer,
-            eos_token_id,
-        }
+    pub fn new(model: Gemma4, tokenizer: Tokenizer) -> Self {
+        Self { model, tokenizer }
     }
 
     /// Generate token IDs given input token IDs and optional pixel values.
@@ -49,33 +44,16 @@ impl VlmGenerationPipeline {
         pixel_values: Option<&Array>,
         opts: &VlmGenerateOptions,
     ) -> Result<Vec<u32>> {
-        self.model.clear_cache();
-
-        // Prefill
-        let logits = self
-            .model
-            .forward_last_token_logits(input_ids, pixel_values)
-            .map_err(|e| anyhow::anyhow!("prefill forward failed: {e}"))?;
-
-        let mut generated = Vec::new();
-        let mut next_token = self.sample_token(&logits, opts)?;
-
-        for _ in 0..opts.max_tokens {
-            if next_token == self.eos_token_id {
-                break;
-            }
-            generated.push(next_token);
-
-            // Decode step: forward only the new token
-            let input = Array::from_int(next_token as i32)?.reshape(&[1, 1])?;
-            let logits = self
-                .model
-                .forward_last_token_logits(&input, None)
-                .map_err(|e| anyhow::anyhow!("decode forward failed: {e}"))?;
-            next_token = self.sample_token(&logits, opts)?;
-        }
-
-        Ok(generated)
+        let sampler = Sampler::new(opts.temperature, 1.0);
+        let tokenizer = self.tokenizer.clone();
+        let mut pipeline = GenerationPipeline::new(&mut self.model, tokenizer, sampler);
+        let (_text, metrics) = pipeline.generate_from_ids_with_metrics(
+            input_ids,
+            pixel_values,
+            Some(opts.max_tokens),
+            |_, _| {},
+        )?;
+        Ok(metrics.generated_token_ids)
     }
 
     /// Generate text given input token IDs and optional pixel values.
@@ -88,98 +66,15 @@ impl VlmGenerationPipeline {
         opts: &VlmGenerateOptions,
     ) -> Result<String> {
         let tokens = self.generate_tokens(input_ids, pixel_values, opts)?;
-        let text = self
-            .tokenizer
-            .decode(&tokens, true)
-            .map_err(|e| anyhow::anyhow!("decode failed: {e}"))?;
-        Ok(text)
+        self.tokenizer.decode(&tokens)
     }
-
-    fn sample_token(&self, logits: &Array, opts: &VlmGenerateOptions) -> Result<u32> {
-        if opts.temperature <= 0.0 {
-            // Greedy
-            let logits = squeeze_last_token_logits(logits)?;
-            let idx = logits.argmax(0)?;
-            match idx.item_u32() {
-                Ok(v) => Ok(v),
-                Err(_) => Ok(idx.item_i32()? as u32),
-            }
-        } else {
-            // Temperature sampling
-            let logits = squeeze_last_token_logits(logits)?;
-            let mut logits_vec = logits.to_vec_f32()?;
-            let inv_temp = 1.0 / opts.temperature;
-            for v in &mut logits_vec {
-                *v *= inv_temp;
-            }
-            let probs = softmax(&logits_vec);
-            categorical_sample(&probs)
-        }
-    }
-}
-
-fn squeeze_last_token_logits(logits: &Array) -> Result<Array> {
-    let logits = match logits.ndim() {
-        3 => logits.squeeze(0)?.squeeze(0)?.contiguous()?,
-        2 => logits.squeeze(0)?.contiguous()?,
-        _ => logits.contiguous()?,
-    };
-    Ok(squeeze_all_singletons(logits)?)
-}
-
-fn squeeze_all_singletons(mut arr: Array) -> Result<Array> {
-    loop {
-        let shape = arr.shape_raw();
-        let mut squeezed = false;
-        for axis in (0..shape.len()).rev() {
-            if shape[axis] == 1 {
-                arr = arr.squeeze(axis as i32)?;
-                squeezed = true;
-                break;
-            }
-        }
-        if !squeezed {
-            return Ok(arr);
-        }
-    }
-}
-
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    if logits.is_empty() {
-        return Vec::new();
-    }
-    let max_v = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut exps = Vec::with_capacity(logits.len());
-    let mut sum = 0.0f32;
-    for &v in logits {
-        let e = (v - max_v).exp();
-        exps.push(e);
-        sum += e;
-    }
-    if sum <= 0.0 {
-        return vec![0.0; logits.len()];
-    }
-    exps.into_iter().map(|e| e / sum).collect()
-}
-
-fn categorical_sample(probs: &[f32]) -> Result<u32> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-    let r: f32 = rng.gen();
-    let mut cumsum = 0.0;
-    for (i, &p) in probs.iter().enumerate() {
-        cumsum += p;
-        if cumsum > r {
-            return Ok(i as u32);
-        }
-    }
-    Ok((probs.len().saturating_sub(1)) as u32)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mlx_core::DType;
+    use mlx_lm::Tokenizer;
     use mlx_models::{Gemma4, Gemma4Config};
     use mlx_models::gemma4::{Gemma4TextConfig, Gemma4VisionConfig};
     use mlx_nn::VarBuilder;
@@ -197,7 +92,7 @@ mod tests {
             .unk_token("<pad>".to_string())
             .build()
             .unwrap();
-        Tokenizer::new(model)
+        Tokenizer::from_raw(tokenizers::Tokenizer::new(model))
     }
 
     fn make_tiny_config() -> Gemma4Config {
@@ -370,8 +265,7 @@ mod tests {
         let vb = VarBuilder::from_weights(weights, DType::Float32);
         let model = Gemma4::new(&vb, &config).unwrap();
         let tokenizer = build_tiny_tokenizer();
-        // EOS is token 3 (</s>) in tiny tokenizer
-        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer, 3);
+        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer);
 
         // Prompt with a single token (id=1)
         let input_ids = Array::from_slice_i32(&[1]).unwrap().reshape(&[1, 1]).unwrap();
@@ -405,8 +299,7 @@ mod tests {
         let vb = VarBuilder::from_weights(weights, DType::Float32);
         let model = Gemma4::new(&vb, &config).unwrap();
         let tokenizer = build_tiny_tokenizer();
-        // EOS is token 3 (</s>) in tiny tokenizer
-        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer, 3);
+        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer);
 
         let input_ids = Array::from_slice_i32(&[1]).unwrap().reshape(&[1, 1]).unwrap();
         let opts = VlmGenerateOptions {
@@ -426,8 +319,7 @@ mod tests {
         let vb = VarBuilder::from_weights(weights, DType::Float32);
         let model = Gemma4::new(&vb, &config).unwrap();
         let tokenizer = build_tiny_tokenizer();
-        // EOS is token 3 (</s>) in tiny tokenizer
-        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer, 3);
+        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer);
 
         let input_ids = Array::from_slice_i32(&[1]).unwrap().reshape(&[1, 1]).unwrap();
         let opts = VlmGenerateOptions {
