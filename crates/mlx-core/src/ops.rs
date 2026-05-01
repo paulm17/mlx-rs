@@ -826,6 +826,7 @@ impl Array {
     // Gather quantized matmul
     // ------------------------------------------------------------------
 
+    #[allow(clippy::too_many_arguments)]
     pub fn gather_qmm(
         &self,
         w: &Array,

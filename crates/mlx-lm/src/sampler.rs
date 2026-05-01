@@ -83,7 +83,7 @@ impl Sampler {
             2 => logits.squeeze(0)?.contiguous()?,
             _ => logits.contiguous()?,
         };
-        Ok(Self::squeeze_all_singletons(logits)?)
+        Self::squeeze_all_singletons(logits)
     }
 
     fn greedy_token_with_tie_break(

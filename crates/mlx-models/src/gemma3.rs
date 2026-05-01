@@ -356,7 +356,7 @@ struct GemmaMlp {
 impl GemmaMlp {
     fn load(vb: &VarBuilder, cfg: &Gemma3Config) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
-        let activation = cfg.mlp_uses_silu().then_some(Activation::Silu).unwrap_or(Activation::Gelu);
+        let activation = if cfg.mlp_uses_silu() { Activation::Silu } else { Activation::Gelu };
         Ok(Self {
             gate_proj: Linear::new(&vb.pp("gate_proj"), &qc)?,
             up_proj: Linear::new(&vb.pp("up_proj"), &qc)?,

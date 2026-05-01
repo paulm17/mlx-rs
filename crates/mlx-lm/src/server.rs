@@ -1131,7 +1131,7 @@ fn handle_request(
                             {
                                 let title_messages = vec![
                                     LmMessage::system("You are a helpful assistant that generates concise chat titles."),
-                                    LmMessage::user(&format!(
+                                    LmMessage::user(format!(
                                         "Generate a 3 to 5 word title for this message. Reply with only the title, no punctuation or quotes: {}",
                                         content
                                     )),
@@ -1207,7 +1207,7 @@ fn handle_request(
                         {
                             let title_messages = vec![
                                 LmMessage::system("You are a helpful assistant that generates concise chat titles."),
-                                LmMessage::user(&format!(
+                                LmMessage::user(format!(
                                     "Generate a 3 to 5 word title for this message. Reply with only the title, no punctuation or quotes: {}",
                                     content
                                 )),

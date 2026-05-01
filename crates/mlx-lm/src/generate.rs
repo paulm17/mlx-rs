@@ -1,6 +1,7 @@
 use anyhow::Result;
 use mlx_core::{async_eval, Array};
 use mlx_nn::{kv_cache_stats, reset_kv_cache_stats, KvCacheStats};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
@@ -510,6 +511,99 @@ fn strip_thinking_blocks(text: &str) -> String {
     result.trim().to_string()
 }
 
+/// Build a reverse ByteLevel mapping (Unicode character → raw byte value).
+/// For GPT-2-style BPE tokenizers, token strings use a specific character-to-byte
+/// encoding where some byte values map to Latin-1 Supplement / Extended-A chars.
+fn build_byte_reverse_map() -> HashMap<char, u8> {
+    // Printable ASCII (0x21-0x7E) and Latin-1 Supplement (0xA1-0xAC, 0xAE-0xFF) map directly.
+    let bs: Vec<u32> = (0x21u32..=0x7Eu32)
+        .chain(0xA1u32..=0xACu32)
+        .chain(0xAEu32..=0xFFu32)
+        .collect();
+
+    let mut byte_to_char = [0u32; 256];
+    let mut n = 0u32;
+    for b in 0u32..256u32 {
+        if bs.contains(&b) {
+            byte_to_char[b as usize] = b;
+        } else {
+            byte_to_char[b as usize] = 256 + n;
+            n += 1;
+        }
+    }
+
+    let mut map = HashMap::new();
+    for b in 0u32..256u32 {
+        if let Some(ch) = char::from_u32(byte_to_char[b as usize]) {
+            map.insert(ch, b as u8);
+        }
+    }
+    map
+}
+
+/// Convert a token string to raw bytes using the ByteLevel reverse mapping.
+/// Returns `None` if any character is not in the map (non-ByteLevel tokenizer).
+fn token_str_to_bytes(token_str: &str, reverse_map: &HashMap<char, u8>) -> Option<Vec<u8>> {
+    let mut bytes = Vec::new();
+    for ch in token_str.chars() {
+        if let Some(&byte) = reverse_map.get(&ch) {
+            bytes.push(byte);
+        } else {
+            return None;
+        }
+    }
+    Some(bytes)
+}
+
+/// Extract valid UTF-8 prefixes from a byte buffer, leaving incomplete trailing bytes.
+fn flush_valid_utf8(buf: &mut Vec<u8>) -> String {
+    if buf.is_empty() {
+        return String::new();
+    }
+    match std::str::from_utf8(buf) {
+        Ok(_) => {
+            let taken = std::mem::take(buf);
+            String::from_utf8(taken).unwrap()
+        }
+        Err(e) => {
+            let valid_up_to = e.valid_up_to();
+            if valid_up_to == 0 {
+                String::new()
+            } else {
+                let valid: Vec<u8> = buf.drain(..valid_up_to).collect();
+                String::from_utf8(valid).unwrap()
+            }
+        }
+    }
+}
+
+/// Decode a single token incrementally using ByteLevel byte buffering.
+///
+/// For GPT-2-style ByteLevel BPE tokenizers, single tokens can represent partial
+/// multi-byte UTF-8 sequences. Decoding them in isolation produces replacement
+/// characters (U+FFFD). This function accumulates raw bytes across calls and emits
+/// only completed UTF-8 sequences.
+fn incremental_decode_token(
+    tokenizer: &tokenizers::Tokenizer,
+    token_id: u32,
+    reverse_map: &HashMap<char, u8>,
+    byte_buf: &mut Vec<u8>,
+) -> String {
+    if let Some(token_str) = tokenizer.id_to_token(token_id) {
+        if let Some(raw_bytes) = token_str_to_bytes(&token_str, reverse_map) {
+            byte_buf.extend_from_slice(&raw_bytes);
+            return flush_valid_utf8(byte_buf);
+        }
+        // Not a ByteLevel token — use the token string directly.
+        // Flush any pending bytes first.
+        let mut text = flush_valid_utf8(byte_buf);
+        text.push_str(&token_str);
+        return text;
+    }
+    // Token not in vocabulary (shouldn't happen during normal generation).
+    flush_valid_utf8(byte_buf)
+}
+
 /// Text generation pipeline.
 pub struct GenerationPipeline<M> {
     model: M,
@@ -553,7 +647,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
     fn is_stopped(&self) -> bool {
         self.stop_signal
             .as_ref()
-            .map_or(false, |s| s.load(Ordering::Relaxed))
+            .is_some_and(|s| s.load(Ordering::Relaxed))
     }
 
     fn check_stop_strings(&self, output: &str) -> Option<usize> {
@@ -681,6 +775,8 @@ impl<M: CausalLM> GenerationPipeline<M> {
         let mut token_count = 0usize;
         let mut generated_tokens = Vec::new();
         let mut last_token_id: Option<u32> = None;
+        let reverse_map = build_byte_reverse_map();
+        let mut byte_buf: Vec<u8> = Vec::new();
         if self.sampler.is_greedy() {
             let stage_t0 = Instant::now();
             let mut token_arr = self
@@ -749,7 +845,12 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 }
 
                 let stage_t0 = Instant::now();
-                let piece = self.tokenizer.decode(&[token])?;
+                let piece = incremental_decode_token(
+                    self.tokenizer.inner(),
+                    token,
+                    &reverse_map,
+                    &mut byte_buf,
+                );
                 if let Some(p) = profile.as_mut() {
                     if generated == 1 {
                         p.first_decode_s += stage_t0.elapsed().as_secs_f64();
@@ -778,7 +879,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
                     }
                 }
 
-                if generated % 32 == 0 {
+                if generated.is_multiple_of(32) {
                     trace_memory("decode", generated);
                 }
 
@@ -806,7 +907,12 @@ impl<M: CausalLM> GenerationPipeline<M> {
             }
             if !self.tokenizer.is_stop_token(token) {
                 let stage_t0 = Instant::now();
-                let piece = self.tokenizer.decode(&[token])?;
+                let piece = incremental_decode_token(
+                    self.tokenizer.inner(),
+                    token,
+                    &reverse_map,
+                    &mut byte_buf,
+                );
                 if let Some(p) = profile.as_mut() {
                     p.first_decode_s += stage_t0.elapsed().as_secs_f64();
                     p.decoded_pieces += 1;
@@ -877,7 +983,12 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 }
 
                 let stage_t0 = Instant::now();
-                let piece = self.tokenizer.decode(&[token])?;
+                let piece = incremental_decode_token(
+                    self.tokenizer.inner(),
+                    token,
+                    &reverse_map,
+                    &mut byte_buf,
+                );
                 if let Some(p) = profile.as_mut() {
                     p.decode_text_s += stage_t0.elapsed().as_secs_f64();
                     p.decoded_pieces += 1;
@@ -891,12 +1002,19 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 }
                 history_tokens.push(token);
                 token_count += 1;
-                if generated % 32 == 0 {
+                if generated.is_multiple_of(32) {
                     trace_memory("decode", generated);
                 }
             }
         }
         trace_memory("end", token_count);
+        // Flush any remaining bytes in the buffer (incomplete UTF-8 sequences
+        // from the final tokens, if any).
+        let leftover = String::from_utf8_lossy(&byte_buf).into_owned();
+        if !leftover.is_empty() {
+            on_piece(last_token_id.unwrap_or(0), &leftover);
+            output.push_str(&leftover);
+        }
         if let Some(p) = profile.as_mut() {
             p.finish_kv_stats(kv_cache_stats());
             let moe = mlx_models::moe_profile_stats();

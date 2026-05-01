@@ -354,8 +354,8 @@ fn build_layer_idx_to_cache_idx(
                 .rev()
                 .position(|t| t == "sliding_attention")
                 .unwrap_or(0);
-        for i in first_kv_shared_layer_idx..num_hidden_layers {
-            if layer_types[i] == "full_attention" {
+        for layer_type in &layer_types[first_kv_shared_layer_idx..num_hidden_layers] {
+            if layer_type == "full_attention" {
                 mapping.push(shared_full_idx);
             } else {
                 mapping.push(shared_sliding_idx);
@@ -1577,15 +1577,15 @@ impl VisionPatchEmbedder {
         let mut y_positions = Vec::with_capacity(num_patches as usize);
         for row in 0..num_patches_h {
             for col in 0..num_patches_w {
-                x_positions.push(col as i32);
-                y_positions.push(row as i32);
+                x_positions.push(col);
+                y_positions.push(row);
             }
         }
         let x_pos_arr = Array::from_slice_i32(&x_positions)?;
         let y_pos_arr = Array::from_slice_i32(&y_positions)?;
 
         let pos_size = self.position_embedding_size as i32;
-        let hidden_size = self.position_embedding_table.dim(2) as i32;
+        let hidden_size = self.position_embedding_table.dim(2);
         let table_0 = self
             .position_embedding_table
             .slice(&[0, 0, 0], &[1, pos_size, hidden_size])?
@@ -1987,8 +1987,8 @@ impl VisionModel {
                     if patch_positions_data.len() >= (_bi + 1) * max_patches * 2 {
                         break;
                     }
-                    patch_positions_data.push(col as i32); // x
-                    patch_positions_data.push(row as i32); // y
+                    patch_positions_data.push(col); // x
+                    patch_positions_data.push(row); // y
                 }
             }
             while patch_positions_data.len() < (_bi + 1) * max_patches * 2 {
@@ -2002,12 +2002,8 @@ impl VisionModel {
         // Build padding_positions [B, max_patches] (bool)
         let mut padding_data = Vec::with_capacity(b as usize * max_patches);
         for _bi in 0..b as usize {
-            for _ in 0..num_real {
-                padding_data.push(0i32);
-            }
-            for _ in num_real..max_patches {
-                padding_data.push(1i32);
-            }
+            padding_data.extend(std::iter::repeat_n(0i32, num_real));
+            padding_data.extend(std::iter::repeat_n(1i32, max_patches - num_real));
         }
         let padding_positions = Array::from_slice_i32(&padding_data)?
             .reshape(&[b, max_patches as i32])?
@@ -2030,8 +2026,8 @@ impl VisionModel {
                 if pos_h.len() >= num_real {
                     break;
                 }
-                pos_h.push(col as i32);
-                pos_w.push(row as i32);
+                pos_h.push(col);
+                pos_w.push(row);
             }
             if pos_h.len() >= num_real {
                 break;
@@ -2071,8 +2067,8 @@ impl VisionModel {
             pooled.slice(&start, &stop)?
         } else {
             let mut all_real = Vec::with_capacity(b as usize);
-            for bi in 0..b as usize {
-                let n_valid = valid_counts_vec[bi] as usize;
+            for (bi, &count) in valid_counts_vec.iter().enumerate() {
+                let n_valid = count as usize;
                 let start = vec![bi as i32, 0i32, 0i32];
                 let mut stop = pooled.shape_raw();
                 stop[0] = bi as i32 + 1;
@@ -2179,8 +2175,8 @@ pub fn sanitize_weights(
         }
 
         // Key remapping
-        let mut new_key = if key.starts_with("model.") {
-            key["model.".len()..].to_string()
+        let mut new_key = if let Some(stripped) = key.strip_prefix("model.") {
+            stripped.to_string()
         } else {
             key.clone()
         };

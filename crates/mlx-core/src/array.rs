@@ -178,8 +178,8 @@ impl Array {
         unsafe {
             let ndim = self.ndim();
             let mut dims = vec![0i32; ndim];
-            for i in 0..ndim {
-                dims[i] = mlx_array_dim(self.inner, i as i32);
+            for (i, dim) in dims.iter_mut().enumerate() {
+                *dim = mlx_array_dim(self.inner, i as i32);
             }
             dims
         }

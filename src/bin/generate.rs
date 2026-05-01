@@ -48,7 +48,7 @@ struct Args {
     config: PathBuf,
 
     /// The prompt to generate from
-    #[arg(long, default_value = "Hello")]
+    #[arg(long, default_value = "Hello, how are you?")]
     prompt: String,
 
     /// Maximum number of tokens to generate (unset = no cap, stop on EOS)

@@ -6,10 +6,12 @@ use mlx_core::{Array, Module, Result};
 /// composably in model definitions.
 #[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum Activation {
     #[serde(alias = "gelu")]
     Gelu,
     Relu,
+    #[default]
     Silu,
     Sigmoid,
     Tanh,
@@ -62,8 +64,3 @@ impl Module for Activation {
     }
 }
 
-impl Default for Activation {
-    fn default() -> Self {
-        Activation::Silu
-    }
-}

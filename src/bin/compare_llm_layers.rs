@@ -65,12 +65,12 @@ fn main() -> Result<()> {
     let py_layers = mlx_core::safetensors::load(Path::new("/tmp/python_llm_layers.safetensors"))?;
 
     // Load input tensors (safetensors stores them as float32, cast to int32)
-    let input_ids = mlx_core::safetensors::load(&ref_dir.join("python_input_ids.safetensors"))?
+    let input_ids = mlx_core::safetensors::load(ref_dir.join("python_input_ids.safetensors"))?
         .remove("input_ids")
         .unwrap()
         .as_type(mlx_core::DType::Int32)?;
     let pixel_values =
-        mlx_core::safetensors::load(&ref_dir.join("python_pixel_values.safetensors"))?
+        mlx_core::safetensors::load(ref_dir.join("python_pixel_values.safetensors"))?
             .remove("pixel_values")
             .unwrap();
 

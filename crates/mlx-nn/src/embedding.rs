@@ -101,7 +101,7 @@ impl Module for Embedding {
             // MLX dequantize requires at least 2D; ensure q_rows is 2D by
             // adding a leading dim when flat_ids has only one element.
             let (q_rows, s_rows, b_rows) = if q_rows.ndim() == 1 {
-                let packed = q_rows.shape_raw().last().copied().unwrap_or(0) as i32;
+                let packed = q_rows.shape_raw().last().copied().unwrap_or(0);
                 (
                     q_rows.reshape(&[1, packed])?,
                     s_rows.reshape(&[1, s_rows.shape_raw().last().copied().unwrap_or(0)])?,
@@ -113,12 +113,12 @@ impl Module for Embedding {
             let deq = q_rows.dequantize(&s_rows, b_rows.as_ref(), self.group_size, self.bits)?;
             if orig_ndim == 0 {
                 // Return [hidden] (squeeze the batch dim)
-                let packed = q_rows.shape_raw().last().copied().unwrap_or(0) as i32;
+                let packed = q_rows.shape_raw().last().copied().unwrap_or(0);
                 let hidden = packed * 32 / self.bits.max(1);
                 deq.reshape(&[hidden])
             } else if orig_ndim > 1 {
                 let mut out_shape = token_ids.shape_raw();
-                let packed = q_rows.shape_raw().last().copied().unwrap_or(0) as i32;
+                let packed = q_rows.shape_raw().last().copied().unwrap_or(0);
                 let hidden = packed * 32 / self.bits.max(1);
                 out_shape.push(hidden);
                 deq.reshape(&out_shape)

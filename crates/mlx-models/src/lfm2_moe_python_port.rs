@@ -601,7 +601,7 @@ impl MoeFeedForward {
                 let probs = top_scores.to_vec_f32()?;
                 let mut device_top: Vec<(usize, f32)> = idxs
                     .into_iter()
-                    .zip(probs.into_iter())
+                    .zip(probs)
                     .map(|(idx, prob)| (idx as usize, prob))
                     .collect();
                 sort_top_pairs(&mut device_top);
@@ -765,6 +765,7 @@ impl DenseMlp {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum LayerOperator {
     Attention(FullAttention),
     ShortConv(ShortConv),

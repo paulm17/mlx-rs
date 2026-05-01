@@ -121,7 +121,7 @@ fn validate_qwen3_moe_python_port_shadow_top_k(
     let probs = top_probs.to_vec_f32()?;
     let mut device_top: Vec<(usize, f32)> = idxs
         .into_iter()
-        .zip(probs.into_iter())
+        .zip(probs)
         .map(|(idx, prob)| (idx as usize, prob))
         .collect();
     sort_top_pairs(&mut device_top);
@@ -191,7 +191,7 @@ impl Qwen3MoePythonPortConfig {
 
     pub fn is_moe_layer(&self, layer_idx: usize) -> bool {
         match self.decoder_sparse_step {
-            Some(step) if step > 0 => (layer_idx + 1) % step == 0,
+            Some(step) if step > 0 => (layer_idx + 1).is_multiple_of(step),
             _ => true, // Default: all layers are MoE
         }
     }
@@ -559,6 +559,7 @@ impl DenseMlp {
 // Feed-forward: either dense MLP or sparse MoE
 // ------------------------------------------------------------------
 
+#[allow(clippy::large_enum_variant)]
 enum FeedForward {
     Dense(DenseMlp),
     Moe(SparseMoeBlock),

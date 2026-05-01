@@ -86,8 +86,7 @@ impl VarBuilder {
     pub fn get(&self, name: &str) -> anyhow::Result<Array> {
         let path = self.full_path(name);
         self.data
-            .get(&path)
-            .map(|a| a.clone())
+            .get(&path).cloned()
             .ok_or_else(|| anyhow::anyhow!("tensor not found: {path}"))
     }
 

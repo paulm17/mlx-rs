@@ -543,6 +543,7 @@ impl DenseMlp {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum LayerOperator {
     Attention(FullAttention),
     ShortConv(ShortConv),
