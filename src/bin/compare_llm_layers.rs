@@ -124,6 +124,10 @@ fn main() -> Result<()> {
 
     // Compare layer_input (before any LLM layers)
     compare_tensor("layer_input", &h, &py_layers)?;
+    // Compare per_layer_inputs
+    if let Some(ref pli) = per_layer_inputs {
+        compare_tensor("per_layer_inputs", pli, &py_layers)?;
+    }
     println!("Layer input compared OK. Running layers...");
 
     // Run each layer and compare output
@@ -163,8 +167,59 @@ fn main() -> Result<()> {
         compare_tensor(&format!("layer_{i}_output"), &h, &py_layers)?;
     }
 
-    // Final norm
-    eprintln!("  final norm...");
+    // Final norm — compare norm output with diagnostics
+    let l34_f32 = h.to_vec_f32()?;
+    let l34_shape = h.shape_raw();
+    let batch = l34_shape[0] as usize;
+    let seq = l34_shape[1] as usize;
+    let dim = l34_shape[2] as usize;
+
+    let norm_weight = &model.language_model.model.norm.weight;
+    let norm_eps = model.language_model.model.norm.eps;
+    let nw_f32 = norm_weight.to_vec_f32()?;
+    if let Some(py_w) = py_layers.get("norm_weight") {
+        let py_w_f32 = py_w.to_vec_f32()?;
+        let n = nw_f32.len().min(py_w_f32.len());
+        let mut mse = 0.0f64;
+        let mut max_d = 0.0f64;
+        for j in 0..n {
+            let d = (nw_f32[j] as f64 - py_w_f32[j] as f64).abs();
+            mse += d * d;
+            if d > max_d { max_d = d; }
+        }
+        mse /= n as f64;
+        eprintln!("  norm.weight MSE={mse} max_diff={max_d} eps={norm_eps}");
+    }
+
+    // Per-position RMS analysis to find amplification source
+    let py_l34 = py_layers.get("layer_34_output").unwrap().to_vec_f32()?;
+    let py_norm_out = py_layers.get("final_norm_output").unwrap().to_vec_f32()?;
+    let mut rms_diffs = Vec::with_capacity(batch * seq);
+    for bi in 0..batch {
+        for si in 0..seq {
+            let base = (bi * seq + si) * dim;
+            // RMS of layer_34
+            let mut sq_r = 0.0f64;
+            let mut sq_p = 0.0f64;
+            for di in 0..dim {
+                let ri = l34_f32[base + di] as f64;
+                let pi = py_l34[base + di] as f64;
+                sq_r += ri * ri;
+                sq_p += pi * pi;
+            }
+            let rms_r = (sq_r / dim as f64 + norm_eps as f64).sqrt();
+            let rms_p = (sq_p / dim as f64 + norm_eps as f64).sqrt();
+            // Absolute RMS difference
+            let diff = (rms_r - rms_p).abs();
+            rms_diffs.push((bi, si, rms_r, rms_p, diff));
+        }
+    }
+    rms_diffs.sort_by(|a, b| b.4.partial_cmp(&a.4).unwrap());
+    eprintln!("  Top 5 RMS diffs (batch, seq, rms_rust, rms_py, diff):");
+    for (bi, si, rms_r, rms_p, diff) in rms_diffs.iter().take(5) {
+        eprintln!("    [{bi},{si}] r={rms_r:.4} p={rms_p:.4} diff={diff:.4} rel={:.4}%", 100.0*diff/rms_p);
+    }
+
     let h_norm = model.language_model.model.norm.forward(&h)?;
     compare_tensor("final_norm_output", &h_norm, &py_layers)?;
 

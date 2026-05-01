@@ -45,6 +45,7 @@ def patched_call(self, inputs=None, inputs_embeds=None, mask=None, cache=None,
                 per_layer_inputs = per_layer_inputs[:, start : start + target_len]
         if per_layer_inputs is not None or inputs is not None:
             per_layer_inputs = self.project_per_layer_inputs(h, per_layer_inputs)
+        captured["per_layer_inputs"] = np.array(per_layer_inputs.astype(mx.float32))
 
     if cache is None:
         cache = [None] * self.first_kv_shared_layer_idx
@@ -73,6 +74,7 @@ def patched_call(self, inputs=None, inputs_embeds=None, mask=None, cache=None,
         h = layer(h, local_mask, c, per_layer_input=pl_input)
         captured[f"layer_{i}_output"] = np.array(h.astype(mx.float32))
 
+    captured["norm_weight"] = np.array(self.norm.weight.astype(mx.float32))
     h = self.norm(h)
     captured["final_norm_output"] = np.array(h.astype(mx.float32))
     return h

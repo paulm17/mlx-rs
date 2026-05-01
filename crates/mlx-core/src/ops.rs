@@ -676,6 +676,7 @@ impl Array {
                 opt_gs,
                 opt_bits,
                 mode.as_ptr(),
+                mlx_array_ { ctx: std::ptr::null_mut() }, // global_scale (null)
                 dtype,
                 s,
             );

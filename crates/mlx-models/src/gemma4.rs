@@ -227,8 +227,8 @@ impl Module for RmsNormNoScale {
 }
 
 pub struct RmsNormZeroShift {
-    weight: Array,
-    eps: f32,
+    pub weight: Array,
+    pub eps: f32,
 }
 
 impl RmsNormZeroShift {
@@ -2320,7 +2320,17 @@ impl Gemma4 {
         }
 
         let per_layer_inputs = if self.language_model.model.embed_tokens_per_layer.is_some() {
-            let pli = self.language_model.model.compute_per_layer_inputs(input_ids, &h)?;
+            let pli_shape = input_ids.shape_raw().to_vec();
+            let zero_ids = Array::zeros(&pli_shape, input_ids.dtype())?;
+            let image_token_id_arr = Array::from_int(self.config.image_token_id as i32)?;
+            let image_mask = input_ids.equal(&image_token_id_arr)?;
+            let mut pli_input_ids = image_mask.where_cond(&zero_ids, input_ids)?;
+            if let Some(audio_id) = self.config.audio_token_id {
+                let audio_arr = Array::from_int(audio_id as i32)?;
+                let audio_mask = input_ids.equal(&audio_arr)?;
+                pli_input_ids = audio_mask.where_cond(&zero_ids, &pli_input_ids)?;
+            }
+            let pli = self.language_model.model.compute_per_layer_inputs(&pli_input_ids, &h)?;
             Some(pli)
         } else {
             None

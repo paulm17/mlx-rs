@@ -31,6 +31,9 @@ impl Array {
             mlx_get_default_device(&mut dev);
             let mut stream: mlx_stream = std::mem::zeroed();
             mlx_get_default_stream(&mut stream, dev);
+            // FIXME: We should not be freeing the device here, since the stream
+            // may still reference it. This works because the MLX runtime internally
+            // retains the device reference on the stream.
             mlx_device_free(dev);
             stream
         }

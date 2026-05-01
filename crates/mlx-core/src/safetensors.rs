@@ -14,17 +14,11 @@ pub fn load<P: AsRef<Path>>(path: P) -> Result<HashMap<String, Array>> {
 
     unsafe {
         // mlx-c Load operations only support CPU evaluation
-        let dev = mlx_device_new_type(mlx_device_type__MLX_CPU, 0);
-        // Reuse the CPU default stream instead of creating a new stream.
-        // Creating a new stream can trigger backend init paths that are fragile
-        // in non-GPU environments.
-        let mut s: mlx_stream = std::mem::zeroed();
-        mlx_get_default_stream(&mut s, dev);
+        let s = mlx_default_cpu_stream_new();
 
         let mut data_map: mlx_map_string_to_array = std::mem::zeroed();
         let mut meta_map: mlx_map_string_to_string = std::mem::zeroed();
         let rc = mlx_load_safetensors(&mut data_map, &mut meta_map, c_path.as_ptr(), s);
-        mlx_device_free(dev);
         mlx_map_string_to_string_free(meta_map);
 
         if rc != 0 {
