@@ -577,6 +577,21 @@ fn flush_valid_utf8(buf: &mut Vec<u8>) -> String {
     }
 }
 
+/// Detect whether this tokenizer uses ByteLevel encoding by checking if
+/// decoding individual early-vocabulary tokens produces replacement characters.
+/// ByteLevel tokenizers (GPT-2, Qwen) need per-token byte buffering;
+/// SentencePiece tokenizers (Mistral, Gemma) need cumulative decoding.
+fn needs_byte_buffering(tokenizer: &tokenizers::Tokenizer) -> bool {
+    for tid in 0..256u32 {
+        if let Ok(decoded) = tokenizer.decode(&[tid], true) {
+            if decoded.contains('\u{FFFD}') {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Decode a single token incrementally using ByteLevel byte buffering.
 ///
 /// For GPT-2-style ByteLevel BPE tokenizers, single tokens can represent partial
@@ -594,10 +609,14 @@ fn incremental_decode_token(
             byte_buf.extend_from_slice(&raw_bytes);
             return flush_valid_utf8(byte_buf);
         }
-        // Not a ByteLevel token — use the token string directly.
-        // Flush any pending bytes first.
+        // Not a ByteLevel token — flush pending bytes, then use the tokenizer's
+        // native decode to handle SentencePiece, WordPiece, etc.
         let mut text = flush_valid_utf8(byte_buf);
-        text.push_str(&token_str);
+        if let Ok(decoded) = tokenizer.decode(&[token_id], true) {
+            text.push_str(&decoded);
+        } else {
+            text.push_str(&token_str);
+        }
         return text;
     }
     // Token not in vocabulary (shouldn't happen during normal generation).
@@ -777,6 +796,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
         let mut last_token_id: Option<u32> = None;
         let reverse_map = build_byte_reverse_map();
         let mut byte_buf: Vec<u8> = Vec::new();
+        let needs_byte_buf = needs_byte_buffering(self.tokenizer.inner());
         if self.sampler.is_greedy() {
             let stage_t0 = Instant::now();
             let mut token_arr = self
@@ -845,12 +865,20 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 }
 
                 let stage_t0 = Instant::now();
-                let piece = incremental_decode_token(
-                    self.tokenizer.inner(),
-                    token,
-                    &reverse_map,
-                    &mut byte_buf,
-                );
+                let decode_result = if needs_byte_buf {
+                    Ok(incremental_decode_token(
+                        self.tokenizer.inner(),
+                        token,
+                        &reverse_map,
+                        &mut byte_buf,
+                    ))
+                } else {
+                    let prev_len = output.len();
+                    self.tokenizer
+                        .decode(&generated_tokens)
+                        .map(|full| full[prev_len..].to_string())
+                };
+                let piece = decode_result?;
                 if let Some(p) = profile.as_mut() {
                     if generated == 1 {
                         p.first_decode_s += stage_t0.elapsed().as_secs_f64();
@@ -906,13 +934,22 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 }
             }
             if !self.tokenizer.is_stop_token(token) {
+                generated_tokens.push(token);
                 let stage_t0 = Instant::now();
-                let piece = incremental_decode_token(
-                    self.tokenizer.inner(),
-                    token,
-                    &reverse_map,
-                    &mut byte_buf,
-                );
+                let decode_result = if needs_byte_buf {
+                    Ok(incremental_decode_token(
+                        self.tokenizer.inner(),
+                        token,
+                        &reverse_map,
+                        &mut byte_buf,
+                    ))
+                } else {
+                    let prev_len = output.len();
+                    self.tokenizer
+                        .decode(&generated_tokens)
+                        .map(|full| full[prev_len..].to_string())
+                };
+                let piece = decode_result?;
                 if let Some(p) = profile.as_mut() {
                     p.first_decode_s += stage_t0.elapsed().as_secs_f64();
                     p.decoded_pieces += 1;
@@ -920,7 +957,6 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 on_piece(token, &piece);
                 output.push_str(&piece);
                 history_tokens.push(token);
-                generated_tokens.push(token);
                 token_count += 1;
                 if ttft_s.is_none() {
                     ttft_s = Some(t0.elapsed().as_secs_f64());
@@ -983,12 +1019,20 @@ impl<M: CausalLM> GenerationPipeline<M> {
                 }
 
                 let stage_t0 = Instant::now();
-                let piece = incremental_decode_token(
-                    self.tokenizer.inner(),
-                    token,
-                    &reverse_map,
-                    &mut byte_buf,
-                );
+                let decode_result = if needs_byte_buf {
+                    Ok(incremental_decode_token(
+                        self.tokenizer.inner(),
+                        token,
+                        &reverse_map,
+                        &mut byte_buf,
+                    ))
+                } else {
+                    let prev_len = output.len();
+                    self.tokenizer
+                        .decode(&generated_tokens)
+                        .map(|full| full[prev_len..].to_string())
+                };
+                let piece = decode_result?;
                 if let Some(p) = profile.as_mut() {
                     p.decode_text_s += stage_t0.elapsed().as_secs_f64();
                     p.decoded_pieces += 1;

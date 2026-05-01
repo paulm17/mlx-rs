@@ -104,7 +104,7 @@ fn default_top_p() -> f32 {
     0.9
 }
 fn default_system_prompt() -> String {
-    "You are a helpful assistant.".to_string()
+    "You are a helpful assistant. Answer the question directly and concisely using as little words as possible and in English.".to_string()
 }
 fn default_expected_answer() -> String {
     "4".to_string()
