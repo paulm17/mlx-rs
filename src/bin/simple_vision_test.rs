@@ -6,7 +6,7 @@ fn test_generation(model_dir: &str, image_path: Option<&Path>, label: &str) -> R
     
     let vlm = mlx_vlm::load_gemma4_vlm(Path::new(model_dir))?;
     let tokenizer = vlm.tokenizer.clone();
-    let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, tokenizer.clone());
+    let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, tokenizer.clone(), vlm.eos_token_id);
 
     let config = vlm.config;
     let num_image_tokens = config.vision_soft_tokens_per_image;

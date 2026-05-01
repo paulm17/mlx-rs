@@ -30,13 +30,11 @@ fn compare_tensor(
     let n = rust_f32.len();
     let mut mse = 0.0f64;
     let mut max_diff = 0.0f64;
-    let mut max_idx = 0;
     for j in 0..n {
         let d = (rust_f32[j] as f64 - py_f32[j] as f64).abs();
         mse += d * d;
         if d > max_diff {
             max_diff = d;
-            max_idx = j;
         }
     }
     mse /= n as f64;
@@ -193,7 +191,6 @@ fn main() -> Result<()> {
 
     // Per-position RMS analysis to find amplification source
     let py_l34 = py_layers.get("layer_34_output").unwrap().to_vec_f32()?;
-    let py_norm_out = py_layers.get("final_norm_output").unwrap().to_vec_f32()?;
     let mut rms_diffs = Vec::with_capacity(batch * seq);
     for bi in 0..batch {
         for si in 0..seq {

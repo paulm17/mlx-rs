@@ -9,7 +9,7 @@ It is structured as layered crates that mirror the same separation of concerns y
 - model architecture implementations
 - LLM runtime features (loader, tokenizer, sampling, generation, server)
 
-The project currently supports dense and MoE decoder models plus encoder-style embedding models through the new `/crates` implementation (non-deprecated path).
+The project currently supports dense and MoE decoder models, encoder-style embedding models, and one multimodal vision-language model (Gemma4) through the `mlx-vlm` crate. All active code lives under `/crates` and `/src/bin`.
 
 ## Current Status
 
@@ -37,6 +37,7 @@ The two MoE implementations reached parity after moving the stable runtime to th
 - `crates/mlx-nn`
 - `crates/mlx-models`
 - `crates/mlx-lm`
+- `crates/mlx-vlm`
 - `src/bin/generate.rs`
 - `src/bin/mlx-server.rs`
 - `scripts/run_enclosed_benchmarks.sh`
@@ -92,10 +93,14 @@ What it does:
 Current modules:
 - `bert.rs`
 - `gemma3.rs`
-- `llama.rs`
+- `gemma4.rs` (multimodal: vision tower + text decoder)
+- `llama.rs` (also serves Qwen2 dense)
 - `qwen3.rs`
-- `qwen3_moe.rs` (used for Qwen1.5/Qwen2 MoE style)
+- `qwen3_5.rs`
+- `qwen3_moe.rs` (Qwen1.5/Qwen2 MoE style)
+- `qwen3_moe_python_port.rs` (device-native MoE path for Qwen MoE)
 - `lfm2_moe.rs` (hybrid conv/full-attention + switch-MoE)
+- `lfm2_moe_python_port.rs` (device-native MoE path for LFM2 MoE)
 
 Key idea:
 - “How to execute one forward pass” per architecture.
@@ -106,13 +111,24 @@ Runtime orchestration for text generation and serving.
 What it does:
 - Architecture detection and model loading (`loader.rs`).
 - Tokenization and stop-token handling (`tokenizer.rs`).
-- Chat template rendering (`chat_template.rs`) with fallback support for `chat_template.jinja`.
+- Chat template rendering (`chat_template.rs`) with fallback support for `chat_template.jinja`. Pre-built templates cover Llama, Mistral, Gemma, Gemma4, Qwen, Qwen3.5, and ChatML families.
 - Sampling and repetition handling (`sampler.rs`).
 - Generation pipeline with metrics (TTFT/total/tokens) (`generate.rs`).
 - Embedded HTTP server runtime (`server.rs`) with optional API key, embeddings route, and RPM limiter.
 
 Key idea:
 - “How inference is run in practice,” not just model math.
+
+#### `mlx-vlm`
+Vision-language model pipeline.
+
+What it does:
+- Image loading and preprocessing with aspect-ratio-preserving resize (`processing.rs`, `Gemma4ImageProcessor`).
+- VLM model loading (`loader.rs`) — loads Gemma4 with vision tower, multimodal embedder, and tokenizer.
+- Autoregressive VLM generation with optional `pixel_values` input (`generate.rs`, `VlmGenerationPipeline`).
+
+Key idea:
+- Text generation that understands images, via Gemma4's vision encoder and masked-scatter token expansion.
 
 ## Binary Entrypoints
 
@@ -191,31 +207,56 @@ cargo run --bin mlx-server -- \
   - Example tested: `mlx-community/mxbai-embed-large-v1`
 - Gemma3 text
   - Example tested: `mlx-community/gemma-3-text-12b-it-4bit`
+- Gemma4 multimodal (vision + text)
+  - Example tested: `google/gemma-4-2b-it-mlx-4bit`
+  - Vision tower: `VisionModel` (patch embed, RoPE, encoder layers, pooler)
+  - Multimodal embedder: `MultimodalEmbedder` (pre-projection norm + linear projection)
+  - Image token expansion uses boi/eoi tokens and `vision_soft_tokens_per_image`
+  - Text-only generation also supported (passes `None` for pixel_values)
 - Llama
   - Example tested: `mlx-community/Llama-3.2-1B-Instruct-4bit`
+- Qwen2 dense
+  - Example tested: `Qwen/Qwen2-1.5B-MLX-4bit`
+  - Reuses the Llama runtime code path
 - Qwen3 dense
   - Example tested: `Qwen/Qwen3-1.7B-MLX-4bit`
 - Qwen3.5 dense
   - Example tested: `mlx-community/Qwen3.5-0.8B-MLX-4bit`
 - Qwen MoE (`qwen1.5_moe` / `qwen2_moe`)
   - Example tested: `mlx-community/Qwen1.5-MoE-A2.7B-4bit`
+  - Two code paths: `QwenMoe` (stable) and `QwenMoePythonPort` (device-native router softmax, argpartition, take_along_axis, SwitchGLU, on-device weighted reduction)
 - LFM2 MoE (`lfm2_moe`)
   - Example tested: `LiquidAI/LFM2-24B-A2B-MLX-4bit`
+  - Two code paths: `Lfm2Moe` (stable) and `Lfm2MoePythonPort` (device-native MoE execution)
+
+### Python-port MoE variants
+
+The `PythonPort` variants replicate the execution shape used by Python MLX:
+- device-side router `softmax`
+- device-side `argpartition`
+- device-side `take_along_axis`
+- `SwitchGLU`-style expert execution
+- on-device weighted reduction
+
+These achieve output parity with Python for models where the stable path diverges.
 
 ### Detection logic
 
 Architecture is inferred from `config.json` using:
-- `model_type`
-- fallback `architectures[]`
+- `model_type` (top-level or nested `text_config.model_type`)
+- fallback `architectures[]` (case-insensitive substring matching)
 
 Mapped runtime enums:
 - `Bert`
 - `Gemma3`
-- `Llama`
+- `Gemma4`
+- `Llama` (also covers `Qwen2`, `Mistral`, `Phi3`, `Phi4`)
 - `Qwen3`
 - `Qwen35`
 - `QwenMoe`
+- `QwenMoePythonPort`
 - `Lfm2Moe`
+- `Lfm2MoePythonPort`
 
 ## Model-Specific Notes
 
@@ -227,6 +268,7 @@ Mapped runtime enums:
 ### Llama
 - Standard decoder-only attention + MLP path.
 - Uses KV cache and RoPE.
+- Also serves as the runtime code path for Qwen2 dense, Mistral, Phi3, and Phi4 models.
 
 ### Qwen3 (dense)
 - Optional Q/K RMS norm path where checkpoint provides it.
@@ -249,6 +291,23 @@ Mapped runtime enums:
   - weighted reduce on device
 - Uses `embedding_norm` head path where checkpoint uses tied embeddings.
 - Supports checkpoints where chat template is only in `chat_template.jinja`.
+
+### Gemma4 (Multimodal / Vision-Language)
+- Dual-structure model: vision tower + text decoder.
+- Vision encoder (`VisionModel`):
+  - `VisionPatchEmbedder` splits image into patches with position embeddings.
+  - `VisionPooler` reduces encoder features into `vision_soft_tokens_per_image` soft tokens.
+  - Configurable number of encoder layers with GQA and RoPE attention.
+  - `ClippableLinear` used for 2B vision variant (optional input/output clipping).
+- Multimodal embedder (`MultimodalEmbedder`):
+  - Pre-projection RMS norm followed by linear projection into text embedding space.
+- Image integration:
+  - `masked_scatter()` inserts projected vision features at placeholder positions in the text embedding sequence.
+  - Uses `boi_token_id` (begin-of-image) and `eoi_token_id` (end-of-image) markers.
+- Weight sanitization on load: strips clipping params, remaps vision keys, transposes conv weights, splits MoE.
+- Audio config is a placeholder; audio tower weights are stripped during sanitization when not present.
+- Text-only generation via `mlx-lm` works by passing `None` for `pixel_values`.
+- Vision generation uses `mlx-vlm` crate's `VlmGenerationPipeline` with `Gemma4ImageProcessor` for image preprocessing.
 
 ## `config.toml` Server Configuration
 

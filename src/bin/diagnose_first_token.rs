@@ -1,5 +1,4 @@
 use anyhow::Result;
-use mlx_core::Array;
 
 fn main() -> Result<()> {
     let model_dir = mlx_lm::resolve_model_dir("unsloth/gemma-4-E2B-it-UD-MLX-4bit")?;

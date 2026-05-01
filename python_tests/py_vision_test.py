@@ -35,6 +35,12 @@ def run(label, image=None):
         kwargs["pixel_values"] = px
     result = generate(model, processor, prompt="ignored", **kwargs)
     print(f"{label}: {result.text}")
+    # Print token-level debug
+    t = result.tokens
+    print(f"  Token IDs ({len(t)}): {t[-5:]}")
+    for i, tid in enumerate(t):
+        single = tokenizer.decode([tid])
+        print(f"  token[{i}]: id={tid} -> '{single}'")
 
 run("WITH IMAGE   ", img)
 run("WITHOUT IMAGE")

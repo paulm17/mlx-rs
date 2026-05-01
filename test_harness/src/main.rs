@@ -557,7 +557,7 @@ fn run_vision_model_test(model_id: &str, image_path: &Path, config: &Config) -> 
 
         let vlm = mlx_vlm::load_gemma4_vlm(&model_dir)?;
         let tokenizer = vlm.tokenizer.clone();
-        let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, tokenizer.clone());
+        let mut pipeline = mlx_vlm::VlmGenerationPipeline::new(vlm.model, tokenizer.clone(), vlm.eos_token_id);
 
         let template_options = mlx_lm::ChatTemplateOptions {
             add_generation_prompt: true,

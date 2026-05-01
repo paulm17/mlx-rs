@@ -28,12 +28,7 @@ impl Default for VlmGenerateOptions {
 
 impl VlmGenerationPipeline {
     /// Create a new VLM generation pipeline.
-    pub fn new(model: Gemma4, tokenizer: Tokenizer) -> Self {
-        let eos_token_id = tokenizer
-            .token_to_id("</s>")
-            .or_else(|| tokenizer.token_to_id("<|endoftext|>"))
-            .or_else(|| tokenizer.token_to_id("<|im_end|>"))
-            .unwrap_or(2);
+    pub fn new(model: Gemma4, tokenizer: Tokenizer, eos_token_id: u32) -> Self {
         Self {
             model,
             tokenizer,
@@ -375,7 +370,8 @@ mod tests {
         let vb = VarBuilder::from_weights(weights, DType::Float32);
         let model = Gemma4::new(&vb, &config).unwrap();
         let tokenizer = build_tiny_tokenizer();
-        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer);
+        // EOS is token 3 (</s>) in tiny tokenizer
+        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer, 3);
 
         // Prompt with a single token (id=1)
         let input_ids = Array::from_slice_i32(&[1]).unwrap().reshape(&[1, 1]).unwrap();
@@ -409,7 +405,8 @@ mod tests {
         let vb = VarBuilder::from_weights(weights, DType::Float32);
         let model = Gemma4::new(&vb, &config).unwrap();
         let tokenizer = build_tiny_tokenizer();
-        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer);
+        // EOS is token 3 (</s>) in tiny tokenizer
+        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer, 3);
 
         let input_ids = Array::from_slice_i32(&[1]).unwrap().reshape(&[1, 1]).unwrap();
         let opts = VlmGenerateOptions {
@@ -429,7 +426,8 @@ mod tests {
         let vb = VarBuilder::from_weights(weights, DType::Float32);
         let model = Gemma4::new(&vb, &config).unwrap();
         let tokenizer = build_tiny_tokenizer();
-        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer);
+        // EOS is token 3 (</s>) in tiny tokenizer
+        let mut pipeline = VlmGenerationPipeline::new(model, tokenizer, 3);
 
         let input_ids = Array::from_slice_i32(&[1]).unwrap().reshape(&[1, 1]).unwrap();
         let opts = VlmGenerateOptions {
