@@ -366,7 +366,7 @@ fn build_layer_idx_to_cache_idx(
     mapping
 }
 
-fn sliding_window_mask(
+pub fn sliding_window_mask(
     batch: usize,
     q_len: usize,
     offset: usize,
@@ -494,8 +494,18 @@ fn apply_proportional_rope(
 
     let rotated = Array::concatenate(&[&left_rot, &right_rot], last_axis)?;
 
-    // Apply standard rope to the interleaved rotated portion
-    let rotated = rotated.fast_rope(rotated_dims, false, Some(theta), 1.0, offset as i32, None)?;
+    // Compute freqs matching Python ProportionalRoPE:
+    // exponents = arange(0, rotated_dims, 2).float32() / dims
+    // freqs = (base ** exponents)  (factor defaults to 1.0)
+    let mut exponents = Vec::with_capacity(rot_half as usize);
+    for i in 0..rot_half {
+        exponents.push((2 * i) as f32 / dims as f32);
+    }
+    let exponents_arr = Array::from_slice_f32(&exponents)?;
+    let freqs = Array::from_float(theta)?.power(&exponents_arr)?;
+
+    // Apply rope with explicit freqs (matching Python's base=None, freqs=self._freqs)
+    let rotated = rotated.fast_rope(rotated_dims, false, None, 1.0, offset as i32, Some(&freqs))?;
 
     // Reconstruct left = [rotated[..., :rot_half], left[..., rot_half:]]
     let r1_start = vec![0i32; rotated.ndim()];
@@ -1090,7 +1100,7 @@ pub struct Gemma4DecoderLayer {
     post_ffw_layernorm_2: Option<RmsNormZeroShift>,
     pre_ffw_layernorm_2: Option<RmsNormZeroShift>,
     layer_scalar: Option<Array>,
-    is_sliding: bool,
+    pub is_sliding: bool,
     per_layer_input_gate: Option<Linear>,
     per_layer_projection: Option<Linear>,
     post_per_layer_input_norm: Option<RmsNormZeroShift>,
@@ -1225,7 +1235,7 @@ impl Gemma4DecoderLayer {
         }
     }
 
-    fn forward(
+    pub fn forward(
         &mut self,
         x: &Array,
         mask: Option<&Array>,
@@ -1374,7 +1384,7 @@ impl Gemma4TextModel {
 
     /// Compute per-layer inputs from token IDs and embeddings.
     /// Returns an array of shape [B, S, num_hidden_layers, hidden_size_per_layer_input].
-    fn compute_per_layer_inputs(
+    pub fn compute_per_layer_inputs(
         &mut self,
         input_ids: &Array,
         embeddings: &Array,
