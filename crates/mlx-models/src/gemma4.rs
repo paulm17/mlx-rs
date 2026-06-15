@@ -7,10 +7,18 @@ use mlx_core::{Array, DType, Module, Result};
 use mlx_nn::{repeat_kv, Embedding, KvCache, Linear, QuantConfig, VarBuilder};
 use std::collections::HashMap;
 
+const GEM4_TRACE: bool = false;
+macro_rules! gem4_trace {
+    ($($arg:tt)*) => {
+        if GEM4_TRACE {
+            eprintln!($($arg)*);
+        }
+    };
+}
+
 // ------------------------------------------------------------------
 // Config structs
 // ------------------------------------------------------------------
-
 #[derive(Debug, Clone)]
 pub struct RopeParams {
     pub rope_theta: f32,
@@ -311,7 +319,6 @@ fn gelu_approx(x: &Array) -> Result<Array> {
     let one = Array::from_float(1.0)?.as_type(dt)?;
     let sqrt_2_over_pi = Array::from_float((2.0f32 / std::f32::consts::PI).sqrt())?.as_type(dt)?;
     let coeff = Array::from_float(0.044715f32)?.as_type(dt)?;
-    let three = Array::from_float(3.0)?.as_type(dt)?;
 
     let x_sq = x.multiply(x)?;
     let x3 = x_sq.multiply(x)?;
@@ -997,6 +1004,7 @@ impl Router {
         let scores = self.proj.forward(&h)?;
 
         let num_tokens = scores.shape_raw()[0];
+        gem4_trace!("ROUTER_CALLED num_tokens={}", num_tokens);
         let num_experts = scores.shape_raw()[1] as usize;
         let top_k = self.top_k as i32;
         let kth = -top_k;
@@ -1013,6 +1021,36 @@ impl Router {
             .take_along_axis(&top_k_indices, -1)?;
         top_k_weights = top_k_weights.multiply(&expert_scale)?;
 
+        if num_tokens >= 4 {
+            let pos_mask = Array::from_slice_i32(&[0_i32])?.reshape(&[1_i32])?;
+            let scores_0 = scores.take(&pos_mask, 0)?;
+            let scores_0_vals = scores_0.slice(&[0i32, 0i32], &[1i32, 12i32])?;
+            gem4_trace!(
+                "ROUTER raw_scores[0,:12]={:?}",
+                scores_0_vals.to_vec_f32()?
+            );
+            let indices_0 = top_k_indices.take(&pos_mask, 0)?;
+            let weights_0 = top_k_weights.take(&pos_mask, 0)?;
+            gem4_trace!(
+                "ROUTER idx[0,:8]={:?} weights[0,:8]={:?}",
+                indices_0.to_vec_i32()?,
+                weights_0.to_vec_f32()?,
+            );
+            let pos3 = Array::from_slice_i32(&[3_i32])?.reshape(&[1_i32])?;
+            let scores_3 = scores.take(&pos3, 0)?;
+            let scores_3_vals = scores_3.slice(&[0i32, 0i32], &[1i32, 12i32])?;
+            gem4_trace!(
+                "ROUTER raw_scores[3,:12]={:?}",
+                scores_3_vals.to_vec_f32()?
+            );
+            let indices_3 = top_k_indices.take(&pos3, 0)?;
+            let weights_3 = top_k_weights.take(&pos3, 0)?;
+            gem4_trace!(
+                "ROUTER idx[3,:8]={:?} weights[3,:8]={:?}",
+                indices_3.to_vec_i32()?,
+                weights_3.to_vec_f32()?,
+            );
+        }
         Ok((top_k_indices, top_k_weights))
     }
 }
@@ -1245,10 +1283,14 @@ impl Gemma4DecoderLayer {
             None
         };
 
+        let enable_moe = cfg.enable_moe_block;
+        gem4_trace!("MOE_CHECK layer={} enable_moe_block={}", layer_idx, enable_moe);
         let (moe, post_ffw_layernorm_1, post_ffw_layernorm_2, pre_ffw_layernorm_2) =
-            if cfg.enable_moe_block {
+            if enable_moe {
+                let result = SparseMoeBlock::load(vb, cfg);
+                gem4_trace!("MOE_LOAD_RESULT layer={} ok={}", layer_idx, result.is_ok());
                 (
-                    Some(SparseMoeBlock::load(vb, cfg)?),
+                    Some(result?),
                     Some(RmsNormZeroShift::new(
                         &vb.pp("post_feedforward_layernorm_1"),
                         cfg.rms_norm_eps as f32,
@@ -1324,6 +1366,7 @@ impl Gemma4DecoderLayer {
         layer_emb: Option<&Array>,
         layer_scalar_override: Option<&Array>,
     ) -> Result<Array> {
+        gem4_trace!("LAYER_FWD is_moe={}", self.moe.is_some());
         // Attention sublayer
         let residual = x.clone();
         let h_norm = self.input_layernorm.forward(x)?;
@@ -1334,6 +1377,7 @@ impl Gemma4DecoderLayer {
         // MLP / MoE sublayer
         let residual = h.clone();
         let mut h = if let Some(ref moe) = self.moe {
+            gem4_trace!("MOE_ENTER_FWD");
             let h1_in = self.pre_ffw_layernorm.forward(&h)?;
             let h1 = self.mlp.forward(&h1_in)?;
             let h1 = self.post_ffw_layernorm_1.as_ref().unwrap().forward(&h1)?;
@@ -1345,6 +1389,7 @@ impl Gemma4DecoderLayer {
             h = self.post_ffw_layernorm.forward(&h)?;
             residual.add(&h)?
         } else {
+            gem4_trace!("MOE_SKIP_FWD");
             let h_norm = self.pre_ffw_layernorm.forward(&h)?;
             let mlp_out = self.mlp.forward(&h_norm)?;
             let h = self.post_ffw_layernorm.forward(&mlp_out)?;

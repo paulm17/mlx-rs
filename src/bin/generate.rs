@@ -1,7 +1,8 @@
 use anyhow::Result;
 use clap::Parser;
 use serde_json::json;
-use std::io::{IsTerminal, Write};
+
+use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -36,79 +37,51 @@ fn fallback_template_for_arch(arch: &Option<mlx_lm::loader::ModelArch>) -> mlx_l
     }
 }
 
-struct DraftRenderer {
-    enabled: bool,
-    lines_drawn: usize,
-    columns: usize,
+
+struct CanvasRedrawer {
+    rows: usize,
+    cols: usize,
 }
 
-impl DraftRenderer {
+impl CanvasRedrawer {
     fn new() -> Self {
-        Self {
-            enabled: std::io::stdout().is_terminal(),
-            lines_drawn: 0,
-            columns: std::env::var("COLUMNS")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|&value| value > 0)
-                .unwrap_or(120),
-        }
+        let cols = std::env::var("COLUMNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(120);
+        Self { rows: 0, cols }
     }
 
-    fn visual_line_count(&self, text: &str) -> usize {
+    fn visual_lines(&self, text: &str) -> usize {
         text.split('\n')
-            .map(|line| {
-                let width = line.chars().count().max(1);
-                width.div_ceil(self.columns)
-            })
+            .map(|line| (line.chars().count().max(1) + self.cols - 1) / self.cols.max(1))
             .sum::<usize>()
             .max(1)
     }
 
-    fn clear(&mut self) -> Result<()> {
-        if !self.enabled || self.lines_drawn == 0 {
-            return Ok(());
-        }
+    fn draw(&mut self, text: &str) {
         let mut stdout = std::io::stdout();
-        write!(stdout, "\r")?;
-        for _ in 1..self.lines_drawn {
-            write!(stdout, "\x1b[1A")?;
-        }
-        for i in 0..self.lines_drawn {
-            write!(stdout, "\r\x1b[2K")?;
-            if i + 1 < self.lines_drawn {
-                write!(stdout, "\x1b[1B")?;
+        let lines = self.visual_lines(text);
+        if self.rows > 0 {
+            let _ = write!(stdout, "\r");
+            for _ in 1..self.rows {
+                let _ = write!(stdout, "\x1b[1A");
             }
+            let _ = write!(stdout, "\x1b[0J");
         }
-        for _ in 1..self.lines_drawn {
-            write!(stdout, "\x1b[1A")?;
-        }
-        stdout.flush()?;
-        self.lines_drawn = 0;
-        Ok(())
-    }
-
-    fn render(&mut self, text: &str) -> Result<()> {
-        if !self.enabled {
-            return Ok(());
-        }
-        self.clear()?;
-        let mut stdout = std::io::stdout();
-        write!(stdout, "{text}")?;
-        stdout.flush()?;
-        self.lines_drawn = self.visual_line_count(text);
-        Ok(())
+        let _ = write!(stdout, "{text}");
+        let _ = stdout.flush();
+        self.rows = lines;
     }
 }
 
-fn diffusion_draft_text(
+fn canvas_draft_text(
     tokenizer: &mlx_lm::Tokenizer,
-    finalized: &[u32],
     canvas: &[u32],
     accepted_mask: &[bool],
-) -> Result<String> {
-    let mut text = tokenizer.decode(finalized).unwrap_or_default();
+) -> String {
     let mut pending = Vec::new();
+    let mut text = String::new();
 
     for (&token, &accepted) in canvas.iter().zip(accepted_mask.iter()) {
         if accepted {
@@ -126,7 +99,7 @@ fn diffusion_draft_text(
         text.push_str(&tokenizer.decode(&pending).unwrap_or_default());
     }
 
-    Ok(text)
+    text.trim().to_string()
 }
 
 /// MLX-RS text generation CLI.
@@ -230,21 +203,18 @@ fn main() -> Result<()> {
         let prompt_i32: Vec<i32> = prompt_ids.iter().map(|&x| x as i32).collect();
         let input =
             mlx_core::Array::from_slice_i32(&prompt_i32)?.reshape(&[1, prompt_i32.len() as i32])?;
-        let mut renderer = DraftRenderer::new();
+        let mut redrawer = CanvasRedrawer::new();
         let generated_token_ids = model.generate_block_diffusion_token_ids_with_drafts(
             &input,
             args.max_tokens,
             |draft| {
-                let text = diffusion_draft_text(
-                    &tokenizer,
-                    &draft.finalized_token_ids,
-                    &draft.canvas_token_ids,
-                    &draft.accepted_mask,
-                )?;
-                renderer.render(&text)
+                let canvas_text =
+                    canvas_draft_text(&tokenizer, &draft.canvas_token_ids, &draft.accepted_mask);
+                redrawer.draw(&canvas_text);
+                Ok(())
             },
         )?;
-        renderer.clear()?;
+        redrawer.draw(""); // clear last render
 
         let mut stdout = std::io::stdout();
         let mut accepted = Vec::new();

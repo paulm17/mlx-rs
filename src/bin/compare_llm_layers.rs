@@ -159,7 +159,7 @@ fn main() -> Result<()> {
                 stop[2] = (i + 1) as i32;
                 pli.slice(&start, &stop).unwrap().squeeze(2).unwrap()
             });
-        h = layer.forward(&h, mask.as_ref(), cache, layer_emb.as_ref())?;
+        h = layer.forward(&h, mask.as_ref(), cache, layer_emb.as_ref(), None)?;
         compare_tensor(&format!("layer_{i}_output"), &h, &py_layers)?;
     }
 

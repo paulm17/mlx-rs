@@ -41,9 +41,7 @@ impl Linear {
         };
 
         let (group_size, bits) = if let Some(ref s) = scales {
-            let (gs, b) = infer_quant_params(&weight.shape_raw(), &s.shape_raw(), config);
-            let path = vb.prefix();
-            (gs, b)
+            infer_quant_params(&weight.shape_raw(), &s.shape_raw(), config)
         } else {
             (0, 0)
         };
