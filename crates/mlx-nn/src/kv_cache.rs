@@ -25,6 +25,7 @@ pub fn kv_cache_stats() -> KvCacheStats {
 /// Key-Value cache for autoregressive decoding.
 ///
 /// Uses stepped preallocation and slice updates to avoid O(n^2) concat growth.
+#[derive(Clone)]
 pub struct KvCache {
     k: Option<Array>,
     v: Option<Array>,
@@ -187,6 +188,15 @@ impl KvCache {
             _ => Err(Error::Message(
                 "Cannot fetch from an empty KV cache".to_string(),
             )),
+        }
+    }
+
+    /// Fetch the current cached keys and values when initialized.
+    pub fn try_fetch(&self) -> Result<Option<(Array, Array)>> {
+        if self.is_empty() {
+            Ok(None)
+        } else {
+            self.fetch().map(Some)
         }
     }
 

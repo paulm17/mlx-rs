@@ -6,6 +6,7 @@
 pub mod bert;
 pub mod gemma3;
 pub mod gemma4;
+pub mod gemma4_diffusion;
 pub mod lfm2_moe;
 pub mod lfm2_moe_python_port;
 pub mod llama;
@@ -17,6 +18,9 @@ pub mod qwen3_moe_python_port;
 pub use bert::{Bert, BertConfig};
 pub use gemma3::{Gemma3, Gemma3Config};
 pub use gemma4::{sanitize_weights, Gemma4, Gemma4Config};
+pub use gemma4_diffusion::{
+    sanitize_gemma4_diffusion_weights, Gemma4Diffusion, Gemma4DiffusionConfig,
+};
 pub use lfm2_moe::{Lfm2Moe, Lfm2MoeConfig};
 pub use lfm2_moe_python_port::{Lfm2MoePythonPort, Lfm2MoePythonPortConfig};
 pub use llama::{Llama, LlamaConfig};

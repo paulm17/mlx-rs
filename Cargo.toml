@@ -44,6 +44,10 @@ path = "src/bin/embed_bench.rs"
 name = "simple_vision_test"
 path = "src/bin/simple_vision_test.rs"
 
+[[bin]]
+name = "diffusion_gemma_trace"
+path = "src/bin/diffusion_gemma_trace.rs"
+
 [dependencies]
 mlx-lm = { path = "crates/mlx-lm" }
 mlx-models = { path = "crates/mlx-models" }

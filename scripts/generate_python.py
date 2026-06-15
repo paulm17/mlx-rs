@@ -1,19 +1,16 @@
 #!/usr/bin/env python3
 import argparse
+import importlib.util
 import json
 import os
+import subprocess
+import sys
 import time
 import tomllib
 from pathlib import Path
 
-import mlx.core as mx
 import numpy as np
 from huggingface_hub import snapshot_download
-
-from mlx_lm.generate import generate_step
-from mlx_lm.sample_utils import make_sampler
-from mlx_lm.tokenizer_utils import load as load_tokenizer
-from mlx_lm.utils import load_model
 
 
 def has_runaway_repeat(generated_tokens):
@@ -103,6 +100,40 @@ def resolve_model_dir(model: str, root_dir: Path) -> Path:
     )
     return Path(local_dir)
 
+
+def is_diffusion_gemma(model_dir: Path) -> bool:
+    try:
+        config = json.loads((model_dir / "config.json").read_text())
+    except Exception:
+        return False
+    return config.get("model_type") == "diffusion_gemma"
+
+
+def run_mlx_vlm_generate(args, model_arg: str) -> int:
+    if importlib.util.find_spec("mlx_vlm") is None:
+        raise SystemExit(
+            "diffusion_gemma is an mlx-vlm model, but mlx-vlm is not installed in "
+            f"{Path(sys.executable).parent.parent}. Install mlx-vlm>=0.6.3 in the project "
+            ".venv, then rerun this script."
+        )
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "mlx_vlm.generate",
+        "--model",
+        model_arg,
+        "--prompt",
+        args.prompt,
+        "--temperature",
+        str(args.temperature),
+    ]
+    if args.max_tokens is not None:
+        cmd.extend(["--max-tokens", str(args.max_tokens)])
+
+    return subprocess.call(cmd)
+
+
 def main():
     ap = argparse.ArgumentParser(description="Python generate script comparable to Rust generate")
     ap.add_argument("--model-dir")
@@ -124,6 +155,15 @@ def main():
 
     root_dir = Path(__file__).resolve().parents[1]
     model_dir = resolve_model_dir(model_arg, root_dir)
+    if is_diffusion_gemma(model_dir):
+        raise SystemExit(run_mlx_vlm_generate(args, model_arg))
+
+    import mlx.core as mx
+    from mlx_lm.generate import generate_step
+    from mlx_lm.sample_utils import make_sampler
+    from mlx_lm.tokenizer_utils import load as load_tokenizer
+    from mlx_lm.utils import load_model
+
     print(f'Loading model from "{model_dir}"...')
     model, config = load_model(model_dir, strict=False)
     tokenizer = load_tokenizer(model_dir, eos_token_ids=get_eos_ids(config))

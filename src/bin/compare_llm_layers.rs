@@ -82,9 +82,7 @@ fn main() -> Result<()> {
         .embed_tokens
         .forward(&input_ids)?;
     eprintln!("embed_scale multiply...");
-    h = h.multiply(&mlx_core::Array::from_float(
-        model.language_model.model.embed_scale,
-    )?)?;
+    h = h.multiply(&model.language_model.model.embed_scale)?;
 
     // Vision
     eprintln!("vision_tower...");

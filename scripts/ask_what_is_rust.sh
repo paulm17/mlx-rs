@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PYTHON_BIN="${PYTHON_BIN:-${ROOT_DIR}/.venv/bin/python}"
-MODEL="unsloth/gemma-4-E2B-it-UD-MLX-4bit"
+MODEL="mlx-community/diffusiongemma-26B-A4B-it-4bit"
 PROMPT="${2:-What is Rust?}"
 TEMPERATURE="${TEMPERATURE:-0}"
 TOP_P="${TOP_P:-0.9}"

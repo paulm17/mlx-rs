@@ -306,13 +306,15 @@ fn clamp_array(x: &Array, min: Option<&Array>, max: Option<&Array>) -> Result<Ar
 }
 
 fn gelu_approx(x: &Array) -> Result<Array> {
-    let half = Array::from_float(0.5)?;
-    let one = Array::from_float(1.0)?;
-    let sqrt_2_over_pi = Array::from_float((2.0f32 / std::f32::consts::PI).sqrt())?;
-    let coeff = Array::from_float(0.044715f32)?;
-    let three = Array::from_float(3.0)?;
+    let dt = x.dtype();
+    let half = Array::from_float(0.5)?.as_type(dt)?;
+    let one = Array::from_float(1.0)?.as_type(dt)?;
+    let sqrt_2_over_pi = Array::from_float((2.0f32 / std::f32::consts::PI).sqrt())?.as_type(dt)?;
+    let coeff = Array::from_float(0.044715f32)?.as_type(dt)?;
+    let three = Array::from_float(3.0)?.as_type(dt)?;
 
-    let x3 = x.power(&three)?;
+    let x_sq = x.multiply(x)?;
+    let x3 = x_sq.multiply(x)?;
     let inner = x.add(&x3.multiply(&coeff)?)?;
     let inner = inner.multiply(&sqrt_2_over_pi)?;
     let tanh_val = inner.tanh()?;
@@ -795,7 +797,9 @@ impl Gemma4Attention {
         let v = repeat_kv(&v, n_rep)?;
 
 
-        let attn = if self.is_sliding {
+        let attn = if self.is_sliding
+            && !(offset.saturating_add(seq_len as usize) <= self.sliding_window)
+        {
             let window_mask = if self.is_kv_shared_layer {
                 // For KV-shared layers the cache already contains all KV tokens,
                 // so kv_len == cache size and queries map to the last seq_len positions.
@@ -830,7 +834,7 @@ impl Gemma4Attention {
             };
 
             let mut scores = q.matmul(&k.transpose_axes(&[0, 1, 3, 2])?)?;
-            scores = scores.multiply(&Array::from_float(self.scale)?)?;
+            scores = scores.multiply(&Array::from_float(self.scale)?.as_type(q.dtype())?)?;
             let probs = scores.add(&window_mask)?.softmax(-1)?;
             probs.matmul(&v)?
         } else {
@@ -838,6 +842,80 @@ impl Gemma4Attention {
             q.fast_scaled_dot_product_attention(&k, &v, self.scale, mask_mode, None)?
         };
 
+        let attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
+            b,
+            seq_len,
+            (self.n_heads * self.head_dim) as i32,
+        ])?;
+        let o = self.o_proj.forward(&attn)?;
+        Ok(o)
+    }
+
+    pub fn forward_diffusion_decoder(&mut self, x: &Array, prefix_cache: &KvCache) -> Result<Array> {
+        let shape = x.shape_raw();
+        let (b, seq_len, _) = (shape[0], shape[1], shape[2]);
+
+        let q = self.q_proj.forward(x)?
+            .reshape(&[b, seq_len, self.n_heads as i32, self.head_dim as i32])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let q = self.q_norm.forward(&q)?;
+        let q = if self.use_proportional_rope {
+            let rotated_dims = (self.partial_rotary_factor * self.head_dim as f32) as i32;
+            apply_proportional_rope(&q, self.head_dim as i32, rotated_dims, self.rope_theta, 0)?
+        } else {
+            apply_rope(&q, self.head_dim as i32, self.rope_theta, 0)?
+        };
+
+        let k = self.k_proj.forward(x)?
+            .reshape(&[b, seq_len, self.n_kv_heads as i32, self.head_dim as i32])?
+            .transpose_axes(&[0, 2, 1, 3])?;
+        let k = self.k_norm.forward(&k)?;
+        let k = if self.use_proportional_rope {
+            let rotated_dims = (self.partial_rotary_factor * self.head_dim as f32) as i32;
+            apply_proportional_rope(&k, self.head_dim as i32, rotated_dims, self.rope_theta, 0)?
+        } else {
+            apply_rope(&k, self.head_dim as i32, self.rope_theta, 0)?
+        };
+
+        let v = if self.k_eq_v {
+            k.clone()
+        } else {
+            self.v_proj.as_ref().unwrap().forward(x)?
+                .reshape(&[b, seq_len, self.n_kv_heads as i32, self.head_dim as i32])?
+                .transpose_axes(&[0, 2, 1, 3])?
+        };
+        let v = self.v_norm.forward(&v)?;
+
+        let (encoder_keys, encoder_values) = prefix_cache
+            .try_fetch()?
+            .ok_or_else(|| mlx_core::Error::Message("No encoder KV in prefix cache".to_string()))?;
+
+        let (encoder_keys, encoder_values) = if self.is_sliding {
+            let window = self.sliding_window.saturating_sub(1);
+            let encoder_len = encoder_keys.shape_raw()[2] as usize;
+            if window > 0 && encoder_len > window {
+                let start = (encoder_len - window) as i32;
+                let key_start = vec![0i32, 0, start, 0];
+                let val_start = vec![0i32, 0, start, 0];
+                (
+                    encoder_keys.slice(&key_start, &encoder_keys.shape_raw())?,
+                    encoder_values.slice(&val_start, &encoder_values.shape_raw())?,
+                )
+            } else {
+                (encoder_keys, encoder_values)
+            }
+        } else {
+            (encoder_keys, encoder_values)
+        };
+
+        let keys = Array::concatenate(&[&encoder_keys, &k], 2)?;
+        let values = Array::concatenate(&[&encoder_values, &v], 2)?;
+
+        let n_rep = self.n_heads / self.n_kv_heads;
+        let keys = repeat_kv(&keys, n_rep)?;
+        let values = repeat_kv(&values, n_rep)?;
+
+        let attn = q.fast_scaled_dot_product_attention(&keys, &values, self.scale, "", None)?;
         let attn = attn.transpose_axes(&[0, 2, 1, 3])?.reshape(&[
             b,
             seq_len,
@@ -913,20 +991,23 @@ impl Router {
             &Array::ones(&[hidden], flat.dtype())?,
             1e-6,
         )?;
-        h = h.multiply(&Array::from_float(self.root_size)?)?;
+        h = h.multiply(&Array::from_float(self.root_size)?.as_type(h.dtype())?)?;
         h = h.multiply(&self.scale)?;
 
-        let logits = self.proj.forward(&h)?;
-        let probs = logits.softmax(-1)?;
+        let scores = self.proj.forward(&h)?;
 
-        let kth = (self.top_k - 1) as i32;
-        let neg_logits = logits.negative()?;
-        let partition = neg_logits.argpartition(kth, -1)?;
-        let top_k_indices = partition.slice(&[0, 0], &[partition.shape_raw()[0], self.top_k as i32])?;
+        let num_tokens = scores.shape_raw()[0];
+        let num_experts = scores.shape_raw()[1] as usize;
+        let top_k = self.top_k as i32;
+        let kth = -top_k;
+        let partition = scores.argpartition(kth, -1)?;
+        let top_k_indices = partition.slice(
+            &[0, (num_experts - self.top_k) as i32],
+            &[num_tokens, num_experts as i32],
+        )?;
 
-        let mut top_k_weights = probs.take_along_axis(&top_k_indices, -1)?;
-        let denom = top_k_weights.sum_axis(-1, true)?;
-        top_k_weights = top_k_weights.divide(&denom)?;
+        let mut top_k_weights = scores.take_along_axis(&top_k_indices, -1)?;
+        top_k_weights = top_k_weights.softmax(-1)?;
 
         let expert_scale = self.per_expert_scale.reshape(&[1, self.per_expert_scale.shape_raw()[0]])?
             .take_along_axis(&top_k_indices, -1)?;
@@ -1065,14 +1146,14 @@ impl SparseMoeBlock {
         })
     }
 
-    fn forward(&self, x: &Array) -> Result<Array> {
-        let shape = x.shape_raw();
+    fn forward(&self, router_input: &Array, expert_input: &Array) -> Result<Array> {
+        let shape = router_input.shape_raw();
         let hidden = shape[shape.len() - 1];
         let orig_shape = shape.clone();
-        let flat = x.reshape(&[-1, hidden])?;
+        let flat = expert_input.reshape(&[-1, hidden])?;
         let num_tokens = flat.shape_raw()[0] as usize;
 
-        let (top_k_indices, top_k_weights) = self.router.forward(x)?;
+        let (top_k_indices, top_k_weights) = self.router.forward(router_input)?;
 
         let indices_flat = top_k_indices.reshape(&[-1, self.router.top_k as i32])?;
         let expert_out = self.switch_glu.forward(&flat, &indices_flat)?;
@@ -1241,6 +1322,7 @@ impl Gemma4DecoderLayer {
         mask: Option<&Array>,
         cache: &mut KvCache,
         layer_emb: Option<&Array>,
+        layer_scalar_override: Option<&Array>,
     ) -> Result<Array> {
         // Attention sublayer
         let residual = x.clone();
@@ -1252,14 +1334,13 @@ impl Gemma4DecoderLayer {
         // MLP / MoE sublayer
         let residual = h.clone();
         let mut h = if let Some(ref moe) = self.moe {
-            let h1 = self.pre_ffw_layernorm.forward(&h)?;
-            let h1 = self.mlp.forward(&h1)?;
+            let h1_in = self.pre_ffw_layernorm.forward(&h)?;
+            let h1 = self.mlp.forward(&h1_in)?;
             let h1 = self.post_ffw_layernorm_1.as_ref().unwrap().forward(&h1)?;
-
-            let h2 = self.pre_ffw_layernorm_2.as_ref().unwrap().forward(&h)?;
-            let h2 = moe.forward(&h2)?;
+            let h2_router_input = h.clone();
+            let h2_expert_input = self.pre_ffw_layernorm_2.as_ref().unwrap().forward(&h)?;
+            let h2 = moe.forward(&h2_router_input, &h2_expert_input)?;
             let h2 = self.post_ffw_layernorm_2.as_ref().unwrap().forward(&h2)?;
-
             let mut h = h1.add(&h2)?;
             h = self.post_ffw_layernorm.forward(&h)?;
             residual.add(&h)?
@@ -1275,7 +1356,47 @@ impl Gemma4DecoderLayer {
             h = self.apply_per_layer_gate(&h, layer_emb)?;
         }
 
-        // Layer scalar
+        // Layer scalar: use override if provided, otherwise use self.layer_scalar
+        // Matches Python: h * (self.layer_scalar if layer_scalar is None else layer_scalar)
+        if let Some(scalar) = layer_scalar_override.or(self.layer_scalar.as_ref()) {
+            h = h.multiply(scalar)?;
+        }
+
+        Ok(h)
+    }
+
+    pub(crate) fn forward_diffusion_decoder(
+        &mut self,
+        x: &Array,
+        prefix_cache: &KvCache,
+    ) -> Result<Array> {
+        let residual = x.clone();
+        let h_norm = self.input_layernorm.forward(x)?;
+        let attn_out = self.self_attn.forward_diffusion_decoder(&h_norm, prefix_cache)?;
+        let h = self.post_attn_layernorm.forward(&attn_out)?;
+        let h = residual.add(&h)?;
+
+        let residual = h.clone();
+        let mut h = if let Some(ref moe) = self.moe {
+            let h1 = self.pre_ffw_layernorm.forward(&h)?;
+            let h1 = self.mlp.forward(&h1)?;
+            let h1 = self.post_ffw_layernorm_1.as_ref().unwrap().forward(&h1)?;
+
+            let h2_router_input = h.clone();
+            let h2_expert_input = self.pre_ffw_layernorm_2.as_ref().unwrap().forward(&h)?;
+            let h2 = moe.forward(&h2_router_input, &h2_expert_input)?;
+            let h2 = self.post_ffw_layernorm_2.as_ref().unwrap().forward(&h2)?;
+
+            let h = h1.add(&h2)?;
+            let h = self.post_ffw_layernorm.forward(&h)?;
+            residual.add(&h)?
+        } else {
+            let h_norm = self.pre_ffw_layernorm.forward(&h)?;
+            let mlp_out = self.mlp.forward(&h_norm)?;
+            let h = self.post_ffw_layernorm.forward(&mlp_out)?;
+            residual.add(&h)?
+        };
+
         if let Some(ref scalar) = self.layer_scalar {
             h = h.multiply(scalar)?;
         }
@@ -1292,7 +1413,7 @@ pub struct Gemma4TextModel {
     pub embed_tokens: Embedding,
     pub layers: Vec<Gemma4DecoderLayer>,
     pub norm: RmsNormZeroShift,
-    pub embed_scale: f32,
+    pub embed_scale: Array,
     pub embed_tokens_per_layer: Option<Embedding>,
     pub embed_tokens_per_layer_scale: f32,
     pub per_layer_model_projection: Option<Linear>,
@@ -1368,7 +1489,8 @@ impl Gemma4TextModel {
             embed_tokens,
             layers,
             norm,
-            embed_scale: (cfg.hidden_size as f32).sqrt(),
+            embed_scale: Array::from_float((cfg.hidden_size as f32).sqrt())?
+                .as_type(DType::BFloat16)?,
             embed_tokens_per_layer,
             embed_tokens_per_layer_scale,
             per_layer_model_projection,
@@ -1459,7 +1581,7 @@ impl Gemma4TextModel {
                 pli.slice(&start, &stop)?.squeeze(2)
             }).transpose()?;
 
-            h = layer.forward(&h, mask.as_ref(), &mut caches[cache_idx], layer_emb.as_ref())?;
+            h = layer.forward(&h, mask.as_ref(), &mut caches[cache_idx], layer_emb.as_ref(), None)?;
         }
 
         let out = norm.forward(&h)?;
@@ -1468,7 +1590,7 @@ impl Gemma4TextModel {
 
     fn forward(&mut self, input_ids: &Array) -> Result<Array> {
         let mut h = self.embed_tokens.forward(input_ids)?;
-        h = h.multiply(&Array::from_float(self.embed_scale)?)?;
+        h = h.multiply(&self.embed_scale)?;
 
         let per_layer_inputs = if self.embed_tokens_per_layer.is_some() {
             Some(self.compute_per_layer_inputs(input_ids, &h)?)
@@ -1487,10 +1609,158 @@ impl Gemma4TextModel {
         )
     }
 
-    fn clear_cache(&mut self) {
+    pub(crate) fn clear_cache(&mut self) {
         for c in &mut self.caches {
             c.reset();
         }
+    }
+
+    pub(crate) fn forward_with_layer_scalars(
+        &mut self,
+        input_ids: &Array,
+        layer_scalars: &[Array],
+    ) -> Result<Array> {
+        let mut h = self.embed_tokens.forward(input_ids)?;
+        h = h.multiply(&self.embed_scale)?;
+
+        let per_layer_inputs = if self.embed_tokens_per_layer.is_some() {
+            Some(self.compute_per_layer_inputs(input_ids, &h)?)
+        } else {
+            None
+        };
+
+        Self::forward_embeddings_with_scalars(
+            &mut self.layers,
+            &self.layer_idx_to_cache_idx,
+            &self.norm,
+            &h,
+            per_layer_inputs.as_ref(),
+            &mut self.caches,
+            self.sliding_window,
+            layer_scalars,
+        )
+    }
+
+    fn forward_embeddings_with_scalars(
+        layers: &mut [Gemma4DecoderLayer],
+        layer_idx_to_cache_idx: &[usize],
+        norm: &RmsNormZeroShift,
+        embeddings: &Array,
+        per_layer_inputs: Option<&Array>,
+        caches: &mut [KvCache],
+        sliding_window: usize,
+        layer_scalars: &[Array],
+    ) -> Result<Array> {
+        let mut h = embeddings.clone();
+        let shape = h.shape_raw();
+        let seq_len = shape[1] as usize;
+        let batch = shape[0] as usize;
+
+        for (i, layer) in layers.iter_mut().enumerate() {
+            let cache_idx = layer_idx_to_cache_idx[i];
+
+            let mask = if layer.is_sliding {
+                let offset = caches[cache_idx].offset();
+                Some(sliding_window_mask(
+                    batch,
+                    seq_len,
+                    offset,
+                    sliding_window,
+                    h.dtype(),
+                )?)
+            } else {
+                None
+            };
+
+            let layer_emb = per_layer_inputs.and_then(|pli| {
+                let start = vec![0i32, 0, i as i32, 0];
+                let mut stop = pli.shape_raw();
+                stop[2] = (i + 1) as i32;
+                pli.slice(&start, &stop).ok()?.squeeze(2).ok()
+            });
+
+            h = layer.forward(&h, mask.as_ref(), &mut caches[cache_idx], layer_emb.as_ref(), layer_scalars.get(i))?;
+        }
+
+        norm.forward(&h)
+    }
+
+    pub(crate) fn forward_diffusion_decoder_embeddings(
+        layers: &mut [Gemma4DecoderLayer],
+        layer_idx_to_cache_idx: &[usize],
+        norm: &RmsNormZeroShift,
+        embeddings: &Array,
+        prefix_cache: &[KvCache],
+    ) -> Result<Array> {
+        let mut h = embeddings.clone();
+
+        for (i, layer) in layers.iter_mut().enumerate() {
+            let cache_idx = layer_idx_to_cache_idx[i];
+            h = layer.forward_diffusion_decoder(&h, &prefix_cache[cache_idx])?;
+        }
+
+        norm.forward(&h)
+    }
+
+    fn trace_encoder_embeddings(
+        &mut self,
+        input_ids: &Array,
+        layer_scalars: &[Array],
+        traces: &mut HashMap<String, Array>,
+    ) -> Result<Array> {
+        let mut h = self.embed_tokens.forward(input_ids)?;
+        h = h.multiply(&self.embed_scale)?;
+        traces.insert("encoder.embeddings".to_string(), h.clone());
+
+        let per_layer_inputs = if self.embed_tokens_per_layer.is_some() {
+            let pli = self.compute_per_layer_inputs(input_ids, &h)?;
+            traces.insert("encoder.per_layer_inputs".to_string(), pli.clone());
+            Some(pli)
+        } else {
+            None
+        };
+
+        let shape = h.shape_raw();
+        let seq_len = shape[1] as usize;
+        let batch = shape[0] as usize;
+
+        for (i, layer) in self.layers.iter_mut().enumerate() {
+            let cache_idx = self.layer_idx_to_cache_idx[i];
+            let mask = if layer.is_sliding {
+                let offset = self.caches[cache_idx].offset();
+                Some(sliding_window_mask(
+                    batch,
+                    seq_len,
+                    offset,
+                    self.sliding_window,
+                    h.dtype(),
+                )?)
+            } else {
+                None
+            };
+            if let Some(mask) = mask.as_ref() {
+                traces.insert(format!("encoder.layer_{i}.mask"), mask.clone());
+            }
+
+            let layer_emb = per_layer_inputs
+                .as_ref()
+                .map(|pli| {
+                    let start = vec![0i32, 0, i as i32, 0];
+                    let mut stop = pli.shape_raw();
+                    stop[2] = (i + 1) as i32;
+                    pli.slice(&start, &stop)?.squeeze(2)
+                })
+                .transpose()?;
+
+            h = layer.forward(&h, mask.as_ref(), &mut self.caches[cache_idx], layer_emb.as_ref(), layer_scalars.get(i))?;
+            traces.insert(format!("encoder.layer_{i}.output"), h.clone());
+            if let Some((k, v)) = self.caches[cache_idx].try_fetch()? {
+                traces.insert(format!("encoder.layer_{i}.cache_k"), k);
+                traces.insert(format!("encoder.layer_{i}.cache_v"), v);
+            }
+        }
+
+        Ok(h)
     }
 }
 
@@ -1505,7 +1775,7 @@ pub struct LanguageModel {
 }
 
 impl LanguageModel {
-    fn new(vb: &VarBuilder, cfg: &Gemma4TextConfig) -> anyhow::Result<Self> {
+    pub fn new(vb: &VarBuilder, cfg: &Gemma4TextConfig) -> anyhow::Result<Self> {
         let model_vb = vb.pp("model");
         let model = Gemma4TextModel::new(&model_vb, cfg)?;
 
@@ -1522,8 +1792,78 @@ impl LanguageModel {
         })
     }
 
-    fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
+    pub(crate) fn forward_hidden_states(&mut self, input_ids: &Array) -> Result<Array> {
         self.model.forward(input_ids)
+    }
+
+    pub(crate) fn forward_hidden_states_with_layer_scalars(
+        &mut self,
+        input_ids: &Array,
+        layer_scalars: &[Array],
+    ) -> Result<Array> {
+        self.model.forward_with_layer_scalars(input_ids, layer_scalars)
+    }
+
+    pub(crate) fn forward_diffusion_decoder_logits(
+        &mut self,
+        embeddings: &Array,
+        prefix_cache: &[KvCache],
+    ) -> Result<(Array, Array)> {
+        let hidden = Gemma4TextModel::forward_diffusion_decoder_embeddings(
+            &mut self.model.layers,
+            &self.model.layer_idx_to_cache_idx,
+            &self.model.norm,
+            embeddings,
+            prefix_cache,
+        )?;
+        let logits = self.lm_head.forward(&hidden)?;
+        if let Some(cap) = self.final_logit_softcapping {
+            let raw = logits.divide(&Array::from_float(cap)?)?;
+            let capped = raw.tanh()?.multiply(&Array::from_float(cap)?)?;
+            Ok((capped, hidden))
+        } else {
+            Ok((logits, hidden))
+        }
+    }
+
+    pub(crate) fn trace_encoder_with_layer_scalars(
+        &mut self,
+        input_ids: &Array,
+        layer_scalars: &[Array],
+        traces: &mut HashMap<String, Array>,
+    ) -> Result<Array> {
+        let hidden = self.model.trace_encoder_embeddings(input_ids, layer_scalars, traces)?;
+        traces.insert("encoder.final_hidden".to_string(), hidden.clone());
+        Ok(hidden)
+    }
+
+    pub(crate) fn trace_diffusion_decoder_logits(
+        &mut self,
+        embeddings: &Array,
+        prefix_cache: &[KvCache],
+        traces: &mut HashMap<String, Array>,
+    ) -> Result<Array> {
+        traces.insert("decoder.embeddings".to_string(), embeddings.clone());
+
+        let hidden = Gemma4TextModel::forward_diffusion_decoder_embeddings(
+            &mut self.model.layers,
+            &self.model.layer_idx_to_cache_idx,
+            &self.model.norm,
+            embeddings,
+            prefix_cache,
+        )?;
+        traces.insert("decoder.final_hidden".to_string(), hidden.clone());
+
+        let logits = self.lm_head.forward(&hidden)?;
+
+        let raw_logits = if let Some(cap) = self.final_logit_softcapping {
+            let raw = logits.divide(&Array::from_float(cap)?)?;
+            raw.tanh()?.multiply(&Array::from_float(cap)?)?
+        } else {
+            logits
+        };
+        traces.insert("decoder.raw_logits".to_string(), raw_logits.clone());
+        Ok(raw_logits)
     }
 }
 
@@ -2303,7 +2643,7 @@ impl Gemma4 {
         pixel_values: Option<&Array>,
     ) -> Result<(Array, Option<Array>)> {
         let mut h = self.language_model.model.embed_tokens.forward(input_ids)?;
-        h = h.multiply(&Array::from_float(self.language_model.model.embed_scale)?)?;
+        h = h.multiply(&self.language_model.model.embed_scale)?;
 
         if let Some(pixel_values) = pixel_values {
             let vision_features = self.vision_tower.forward(pixel_values)?;

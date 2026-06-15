@@ -65,7 +65,7 @@ fn main() -> Result<()> {
     // 1. text_embeddings (pre-scatter)
     let text_emb = {
         let raw = vlm.model.language_model.model.embed_tokens.forward(&input_ids)?;
-        raw.multiply(&Array::from_float(vlm.model.language_model.model.embed_scale)?)?
+        raw.multiply(&vlm.model.language_model.model.embed_scale)?
     };
     compare("text_embeddings", &text_emb, "/tmp/python_text_embeddings.safetensors", "text_embeddings")?;
     

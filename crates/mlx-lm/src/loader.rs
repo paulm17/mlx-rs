@@ -191,6 +191,7 @@ fn configure_mlx_cache_policy() {
 #[derive(Debug, Clone)]
 pub enum ModelArch {
     Bert,
+    Gemma4Diffusion,
     Gemma3,
     Gemma4,
     Llama,
@@ -209,6 +210,7 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
     if let Some(model_type) = config.get("model_type").and_then(|v| v.as_str()) {
         match model_type.to_lowercase().as_str() {
             "bert" => return Ok(ModelArch::Bert),
+            "diffusion_gemma" => return Ok(ModelArch::Gemma4Diffusion),
             "gemma3" => return Ok(ModelArch::Gemma3),
             "gemma4" => return Ok(ModelArch::Gemma4),
             "llama" | "mistral" | "phi3" | "phi4" => return Ok(ModelArch::Llama),
@@ -260,6 +262,9 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 if lower.contains("gemma4") {
                     return Ok(ModelArch::Gemma4);
                 }
+                if lower.contains("diffusiongemma") || lower.contains("diffusion_gemma") {
+                    return Ok(ModelArch::Gemma4Diffusion);
+                }
                 if lower.contains("gemma3") {
                     return Ok(ModelArch::Gemma3);
                 }
@@ -270,7 +275,10 @@ pub fn detect_architecture(config: &serde_json::Value) -> Result<ModelArch> {
                 {
                     return Ok(ModelArch::Llama);
                 }
-                if lower.contains("qwen2") && !lower.contains("qwen2_moe") && !lower.contains("qwen2moe") {
+                if lower.contains("qwen2")
+                    && !lower.contains("qwen2_moe")
+                    && !lower.contains("qwen2moe")
+                {
                     return Ok(ModelArch::Qwen2);
                 }
                 if lower.contains("qwen3") {
@@ -371,6 +379,45 @@ fn gemma3_text_config(config: &Value) -> Result<Value> {
     Ok(text)
 }
 
+fn gemma4_diffusion_config(config: &Value) -> Result<Value> {
+    let mut cfg = config.clone();
+    let text = cfg
+        .get_mut("text_config")
+        .and_then(|v| v.as_object_mut())
+        .ok_or_else(|| anyhow::anyhow!("diffusion_gemma text_config must be an object"))?;
+
+    let has_experts = text.get("num_experts").is_some();
+    text.entry("enable_moe_block".to_string())
+        .or_insert_with(|| Value::Bool(has_experts));
+    text.entry("attention_k_eq_v".to_string())
+        .or_insert_with(|| Value::Bool(true));
+    text.entry("num_kv_shared_layers".to_string())
+        .or_insert_with(|| Value::Number(0.into()));
+    text.entry("hidden_size_per_layer_input".to_string())
+        .or_insert_with(|| Value::Number(0.into()));
+    text.entry("use_double_wide_mlp".to_string())
+        .or_insert_with(|| Value::Bool(true));
+
+    if let Some(value) = config.get("tie_word_embeddings") {
+        text.entry("tie_word_embeddings".to_string())
+            .or_insert_with(|| value.clone());
+    }
+
+    Ok(cfg)
+}
+
+fn sanitized_gemma4_diffusion_var_builder(model_dir: &Path) -> Result<VarBuilder> {
+    let shards = VarBuilder::discover_shards(model_dir)?;
+    let mut all_weights = HashMap::new();
+    for shard in &shards {
+        let weights = mlx_core::safetensors::load(shard)
+            .map_err(|e| anyhow::anyhow!("failed loading {}: {e}", shard.display()))?;
+        all_weights.extend(weights);
+    }
+    let sanitized = mlx_models::sanitize_gemma4_diffusion_weights(all_weights);
+    Ok(VarBuilder::from_weights(sanitized, DType::BFloat16))
+}
+
 fn load_stop_tokens(
     model_dir: &Path,
     tokenizer: crate::tokenizer::Tokenizer,
@@ -432,6 +479,12 @@ pub fn load_model(
     // Detect architecture
     let arch = detect_architecture(&config)?;
     eprintln!("Detected architecture: {:?}", arch);
+    if matches!(arch, ModelArch::Gemma4Diffusion) {
+        anyhow::bail!(
+            "gemma4_diffusion must be loaded with load_gemma4_diffusion_model; \
+             the normal autoregressive generate pipeline is disabled for this architecture."
+        );
+    }
     // Load weights
     let vb = VarBuilder::from_dir(model_dir, DType::BFloat16)?;
     eprintln!("Loaded {} tensors", vb.data().len());
@@ -442,6 +495,7 @@ pub fn load_model(
             let cfg: mlx_models::BertConfig = serde_json::from_value(config.clone())?;
             Box::new(mlx_models::Bert::new(&cfg, &vb)?)
         }
+        ModelArch::Gemma4Diffusion => unreachable!("gemma4_diffusion is handled above"),
         ModelArch::Gemma3 => {
             let cfg: mlx_models::Gemma3Config =
                 serde_json::from_value(gemma3_text_config(&config)?)?;
@@ -492,6 +546,36 @@ pub fn load_model(
     let mut tokenizer = crate::tokenizer::Tokenizer::from_file(&tokenizer_path)?;
 
     tokenizer = load_stop_tokens(model_dir, tokenizer, &config);
+
+    Ok((model, tokenizer))
+}
+
+pub fn load_gemma4_diffusion_model(
+    model_dir: &Path,
+) -> Result<(mlx_models::Gemma4Diffusion, crate::tokenizer::Tokenizer)> {
+    let config_path = model_dir.join("config.json");
+    let config_str = std::fs::read_to_string(&config_path)
+        .map_err(|e| anyhow::anyhow!("failed to read config.json: {e}"))?;
+    let config: serde_json::Value = serde_json::from_str(&config_str)?;
+
+    let arch = detect_architecture(&config)?;
+    if !matches!(arch, ModelArch::Gemma4Diffusion) {
+        anyhow::bail!("expected gemma4_diffusion architecture, got {arch:?}");
+    }
+    eprintln!("Detected architecture: {:?}", arch);
+
+    let vb = sanitized_gemma4_diffusion_var_builder(model_dir)?;
+    eprintln!("Loaded {} tensors", vb.data().len());
+
+    let cfg: mlx_models::Gemma4DiffusionConfig =
+        serde_json::from_value(gemma4_diffusion_config(&config)?)?;
+    let model = mlx_models::Gemma4Diffusion::new(&vb, &cfg)?;
+
+    configure_mlx_cache_policy();
+
+    let tokenizer_path = model_dir.join("tokenizer.json");
+    let tokenizer = crate::tokenizer::Tokenizer::from_file(&tokenizer_path)?;
+    let tokenizer = load_stop_tokens(model_dir, tokenizer, &config);
 
     Ok((model, tokenizer))
 }

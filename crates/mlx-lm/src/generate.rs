@@ -714,8 +714,7 @@ impl<M: CausalLM> GenerationPipeline<M> {
         let input_ids = self.tokenizer.encode(prompt)?;
         let tokenize_s = tokenize_t0.elapsed().as_secs_f64();
         let prompt_i32: Vec<i32> = input_ids.iter().map(|&x| x as i32).collect();
-        let input = Array::from_slice_i32(&prompt_i32)?
-            .reshape(&[1, prompt_i32.len() as i32])?;
+        let input = Array::from_slice_i32(&prompt_i32)?.reshape(&[1, prompt_i32.len() as i32])?;
         let (output, mut metrics) =
             self.generate_from_ids_with_metrics(&input, None, max_tokens, on_piece)?;
         metrics.total_s += tokenize_s;

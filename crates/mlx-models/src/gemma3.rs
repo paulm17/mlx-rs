@@ -356,7 +356,11 @@ struct GemmaMlp {
 impl GemmaMlp {
     fn load(vb: &VarBuilder, cfg: &Gemma3Config) -> anyhow::Result<Self> {
         let qc = cfg.quant_config();
-        let activation = if cfg.mlp_uses_silu() { Activation::Silu } else { Activation::Gelu };
+        let activation = if cfg.mlp_uses_silu() {
+            Activation::Silu
+        } else {
+            Activation::Gelu
+        };
         Ok(Self {
             gate_proj: Linear::new(&vb.pp("gate_proj"), &qc)?,
             up_proj: Linear::new(&vb.pp("up_proj"), &qc)?,
@@ -444,9 +448,16 @@ impl Gemma3 {
 
         // Text-only Gemma3 (e.g. gemma-3-1b-it) stores weights at model.* / lm_head.*
         // Multimodal Gemma3 (e.g. gemma-3-4b-it) nests them under language_model.*
-        let has_language_model = vb.pp("language_model").pp("model").pp("embed_tokens").contains("weight");
+        let has_language_model = vb
+            .pp("language_model")
+            .pp("model")
+            .pp("embed_tokens")
+            .contains("weight");
         let (model_vb, lm_head_vb) = if has_language_model {
-            (vb.pp("language_model").pp("model"), vb.pp("language_model").pp("lm_head"))
+            (
+                vb.pp("language_model").pp("model"),
+                vb.pp("language_model").pp("lm_head"),
+            )
         } else {
             (vb.pp("model"), vb.pp("lm_head"))
         };

@@ -74,6 +74,25 @@ impl Embedding {
             self.bits,
         )
     }
+
+    /// Project vocabulary probabilities/distributions back into embedding space.
+    ///
+    /// This is the inverse tied-embedding direction used by diffusion
+    /// self-conditioning: [..., vocab] @ [vocab, hidden] -> [..., hidden].
+    pub fn embed_probabilities(&self, probs: &Array) -> Result<Array> {
+        if let Some(ref scales) = self.scales {
+            probs.quantized_matmul(
+                &self.weight,
+                scales,
+                self.biases.as_ref(),
+                false,
+                self.group_size,
+                self.bits,
+            )
+        } else {
+            probs.matmul(&self.weight)
+        }
+    }
 }
 
 impl Module for Embedding {
@@ -105,7 +124,9 @@ impl Module for Embedding {
                 (
                     q_rows.reshape(&[1, packed])?,
                     s_rows.reshape(&[1, s_rows.shape_raw().last().copied().unwrap_or(0)])?,
-                    b_rows.map(|b| b.reshape(&[1, b.shape_raw().last().copied().unwrap_or(0)])).transpose()?,
+                    b_rows
+                        .map(|b| b.reshape(&[1, b.shape_raw().last().copied().unwrap_or(0)]))
+                        .transpose()?,
                 )
             } else {
                 (q_rows, s_rows, b_rows)

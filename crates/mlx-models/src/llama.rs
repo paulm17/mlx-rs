@@ -126,23 +126,18 @@ fn split_qkv_proj(
     };
 
     let make_linear = |start: usize, stop: usize| -> anyhow::Result<Linear> {
-        let w = weight.slice(
-            &[start as i32, 0],
-            &[stop as i32, weight.shape_raw()[1]],
-        )?;
-        let s = scales.as_ref().map(|arr| {
-            arr.slice(
-                &[start as i32, 0],
-                &[stop as i32, arr.shape_raw()[1]],
-            )
-        }).transpose()?;
-        let b = biases.as_ref().map(|arr| {
-            arr.slice(
-                &[start as i32, 0],
-                &[stop as i32, arr.shape_raw()[1]],
-            )
-        }).transpose()?;
-        Ok(Linear::from_weights_quantized(w, None, s, b, group_size, bits))
+        let w = weight.slice(&[start as i32, 0], &[stop as i32, weight.shape_raw()[1]])?;
+        let s = scales
+            .as_ref()
+            .map(|arr| arr.slice(&[start as i32, 0], &[stop as i32, arr.shape_raw()[1]]))
+            .transpose()?;
+        let b = biases
+            .as_ref()
+            .map(|arr| arr.slice(&[start as i32, 0], &[stop as i32, arr.shape_raw()[1]]))
+            .transpose()?;
+        Ok(Linear::from_weights_quantized(
+            w, None, s, b, group_size, bits,
+        ))
     };
 
     Ok((
@@ -181,23 +176,18 @@ fn split_gate_up_proj(
     };
 
     let make_linear = |start: usize, stop: usize| -> anyhow::Result<Linear> {
-        let w = weight.slice(
-            &[start as i32, 0],
-            &[stop as i32, weight.shape_raw()[1]],
-        )?;
-        let s = scales.as_ref().map(|arr| {
-            arr.slice(
-                &[start as i32, 0],
-                &[stop as i32, arr.shape_raw()[1]],
-            )
-        }).transpose()?;
-        let b = biases.as_ref().map(|arr| {
-            arr.slice(
-                &[start as i32, 0],
-                &[stop as i32, arr.shape_raw()[1]],
-            )
-        }).transpose()?;
-        Ok(Linear::from_weights_quantized(w, None, s, b, group_size, bits))
+        let w = weight.slice(&[start as i32, 0], &[stop as i32, weight.shape_raw()[1]])?;
+        let s = scales
+            .as_ref()
+            .map(|arr| arr.slice(&[start as i32, 0], &[stop as i32, arr.shape_raw()[1]]))
+            .transpose()?;
+        let b = biases
+            .as_ref()
+            .map(|arr| arr.slice(&[start as i32, 0], &[stop as i32, arr.shape_raw()[1]]))
+            .transpose()?;
+        Ok(Linear::from_weights_quantized(
+            w, None, s, b, group_size, bits,
+        ))
     };
 
     Ok((make_linear(0, mid)?, make_linear(mid, total)?))

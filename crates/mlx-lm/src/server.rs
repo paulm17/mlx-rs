@@ -1126,8 +1126,11 @@ fn handle_request(
 
                         let mut title = None;
                         if parsed.generate_title.unwrap_or(false) {
-                            if let Some(content) =
-                                parsed.messages.iter().find(|m| m.role == "user").map(|m| &m.content)
+                            if let Some(content) = parsed
+                                .messages
+                                .iter()
+                                .find(|m| m.role == "user")
+                                .map(|m| &m.content)
                             {
                                 let title_messages = vec![
                                     LmMessage::system("You are a helpful assistant that generates concise chat titles."),
@@ -1141,13 +1144,16 @@ fn handle_request(
                                     continue_final_message: false,
                                     enable_thinking: false,
                                 };
-                                if let Ok(title_prompt) = ChatTemplate::from_model_dir(&lm.model_dir)
-                                    .and_then(|t| t.apply(&title_messages, &options))
+                                if let Ok(title_prompt) =
+                                    ChatTemplate::from_model_dir(&lm.model_dir)
+                                        .and_then(|t| t.apply(&title_messages, &options))
                                 {
-                                    if let Ok((generated_title, _)) =
-                                        pipeline.generate_with_metrics(&title_prompt, Some(12), |_, _| {})
+                                    if let Ok((generated_title, _)) = pipeline
+                                        .generate_with_metrics(&title_prompt, Some(12), |_, _| {})
                                     {
-                                        title = Some(generated_title.trim().trim_matches('"').to_string());
+                                        title = Some(
+                                            generated_title.trim().trim_matches('"').to_string(),
+                                        );
                                     }
                                 }
                             }
@@ -1202,8 +1208,11 @@ fn handle_request(
                 Ok((text, metrics)) => {
                     let mut title = None;
                     if parsed.generate_title.unwrap_or(false) {
-                        if let Some(content) =
-                            parsed.messages.iter().find(|m| m.role == "user").map(|m| &m.content)
+                        if let Some(content) = parsed
+                            .messages
+                            .iter()
+                            .find(|m| m.role == "user")
+                            .map(|m| &m.content)
                         {
                             let title_messages = vec![
                                 LmMessage::system("You are a helpful assistant that generates concise chat titles."),
@@ -1220,10 +1229,13 @@ fn handle_request(
                             if let Ok(title_prompt) = ChatTemplate::from_model_dir(&lm.model_dir)
                                 .and_then(|t| t.apply(&title_messages, &options))
                             {
-                                if let Ok((generated_title, _)) =
-                                    pipeline.generate_with_metrics(&title_prompt, Some(12), |_, _| {})
-                                {
-                                    title = Some(generated_title.trim().trim_matches('"').to_string());
+                                if let Ok((generated_title, _)) = pipeline.generate_with_metrics(
+                                    &title_prompt,
+                                    Some(12),
+                                    |_, _| {},
+                                ) {
+                                    title =
+                                        Some(generated_title.trim().trim_matches('"').to_string());
                                 }
                             }
                         }

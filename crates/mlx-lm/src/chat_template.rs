@@ -159,7 +159,7 @@ fn preprocess_jinja_for_minijinja(template: &str) -> String {
             // Found .get(
             let start = i;
             i += 5; // skip .get(
-            // Skip whitespace
+                    // Skip whitespace
             while i < chars.len() && chars[i].is_whitespace() {
                 i += 1;
             }
@@ -174,7 +174,7 @@ fn preprocess_jinja_for_minijinja(template: &str) -> String {
                 if i < chars.len() {
                     let key = &result[key_start..i];
                     i += 1; // skip closing quote
-                    // Skip whitespace
+                            // Skip whitespace
                     while i < chars.len() && chars[i].is_whitespace() {
                         i += 1;
                     }
@@ -619,6 +619,4 @@ mod tests {
         let result = template.apply_for_generation(&messages).unwrap();
         assert!(result.contains("user: test"));
     }
-
-
 }
