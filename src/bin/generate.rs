@@ -2,7 +2,9 @@ use anyhow::Result;
 use clap::Parser;
 use serde_json::json;
 
-use std::io::Write;
+use std::io::{IsTerminal, Write};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -37,41 +39,156 @@ fn fallback_template_for_arch(arch: &Option<mlx_lm::loader::ModelArch>) -> mlx_l
     }
 }
 
-
 struct CanvasRedrawer {
+    active: bool,
     rows: usize,
-    cols: usize,
 }
 
 impl CanvasRedrawer {
     fn new() -> Self {
-        let cols = std::env::var("COLUMNS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(120);
-        Self { rows: 0, cols }
+        Self {
+            active: std::io::stdout().is_terminal(),
+            rows: 0,
+        }
     }
 
-    fn visual_lines(&self, text: &str) -> usize {
-        text.split('\n')
-            .map(|line| (line.chars().count().max(1) + self.cols - 1) / self.cols.max(1))
-            .sum::<usize>()
-            .max(1)
+    fn terminal_cols() -> usize {
+        Self::ioctl_terminal_cols()
+            .or_else(Self::stty_terminal_cols)
+            .or_else(|| {
+                std::env::var("COLUMNS")
+                    .ok()
+                    .and_then(|v| v.parse().ok())
+                    .filter(|&v| v > 1)
+            })
+            .unwrap_or(120usize)
+            .saturating_sub(1)
+            .max(20)
+    }
+
+    #[cfg(unix)]
+    fn ioctl_terminal_cols() -> Option<usize> {
+        #[repr(C)]
+        struct Winsize {
+            ws_row: u16,
+            ws_col: u16,
+            ws_xpixel: u16,
+            ws_ypixel: u16,
+        }
+
+        #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd"))]
+        const TIOCGWINSZ: u64 = 0x40087468;
+        #[cfg(target_os = "linux")]
+        const TIOCGWINSZ: u64 = 0x5413;
+
+        unsafe extern "C" {
+            fn ioctl(fd: i32, request: u64, ...) -> i32;
+        }
+
+        let mut winsize = Winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let rc = unsafe { ioctl(std::io::stdout().as_raw_fd(), TIOCGWINSZ, &mut winsize) };
+        (rc == 0 && winsize.ws_col > 1).then_some(winsize.ws_col as usize)
+    }
+
+    #[cfg(not(unix))]
+    fn ioctl_terminal_cols() -> Option<usize> {
+        None
+    }
+
+    fn stty_terminal_cols() -> Option<usize> {
+        std::process::Command::new("stty")
+            .arg("size")
+            .output()
+            .ok()
+            .and_then(|output| String::from_utf8(output.stdout).ok())
+            .and_then(|v| {
+                v.split_whitespace()
+                    .nth(1)
+                    .and_then(|cols| cols.parse().ok())
+            })
+            .filter(|&v| v > 1)
+    }
+
+    fn wrap_text(text: &str, width: usize) -> String {
+        let mut wrapped = Vec::new();
+        for raw_line in text.replace('\r', "\\r").split('\n') {
+            let mut line = String::new();
+            let mut line_width = 0usize;
+            for word in raw_line.split(' ') {
+                let word_width = word.chars().count();
+                let separator = usize::from(!line.is_empty());
+                if line_width + separator + word_width <= width {
+                    if separator == 1 {
+                        line.push(' ');
+                    }
+                    line.push_str(word);
+                    line_width += separator + word_width;
+                    continue;
+                }
+                if !line.is_empty() {
+                    wrapped.push(line);
+                    line = String::new();
+                }
+                let mut rest = word;
+                while rest.chars().count() > width {
+                    let split_at = rest
+                        .char_indices()
+                        .nth(width)
+                        .map(|(idx, _)| idx)
+                        .unwrap_or(rest.len());
+                    let (head, tail) = rest.split_at(split_at);
+                    wrapped.push(head.to_string());
+                    rest = tail;
+                }
+                line.push_str(rest);
+                line_width = rest.chars().count();
+            }
+            wrapped.push(line);
+        }
+        wrapped.join("\n")
     }
 
     fn draw(&mut self, text: &str) {
+        if !self.active {
+            return;
+        }
         let mut stdout = std::io::stdout();
-        let lines = self.visual_lines(text);
+        let canvas = Self::wrap_text(text, Self::terminal_cols());
+        let lines: Vec<&str> = canvas.split('\n').collect();
         if self.rows > 0 {
             let _ = write!(stdout, "\r");
             for _ in 1..self.rows {
                 let _ = write!(stdout, "\x1b[1A");
             }
-            let _ = write!(stdout, "\x1b[0J");
         }
-        let _ = write!(stdout, "{text}");
+        for (idx, line) in lines.iter().enumerate() {
+            if idx > 0 {
+                let _ = write!(stdout, "\n");
+            }
+            let _ = write!(stdout, "\x1b[2K{line}");
+        }
+        let _ = write!(stdout, "\x1b[0J");
         let _ = stdout.flush();
-        self.rows = lines;
+        self.rows = lines.len().max(1);
+    }
+
+    fn finish(&mut self) {
+        if !self.active || self.rows == 0 {
+            return;
+        }
+        let mut stdout = std::io::stdout();
+        let _ = write!(stdout, "\r");
+        for _ in 1..self.rows {
+            let _ = write!(stdout, "\x1b[1A");
+        }
+        let _ = write!(stdout, "\x1b[0J");
+        let _ = stdout.flush();
+        self.rows = 0;
     }
 }
 
@@ -81,7 +198,7 @@ fn canvas_draft_text(
     accepted_mask: &[bool],
 ) -> String {
     let mut pending = Vec::new();
-    let mut text = String::new();
+    let mut pieces = Vec::new();
 
     for (&token, &accepted) in canvas.iter().zip(accepted_mask.iter()) {
         if accepted {
@@ -89,17 +206,39 @@ fn canvas_draft_text(
             continue;
         }
         if !pending.is_empty() {
-            text.push_str(&tokenizer.decode(&pending).unwrap_or_default());
+            pieces.push(tokenizer.decode(&pending).unwrap_or_default());
             pending.clear();
         }
-        text.push_str("[Mask]");
+        pieces.push("[Mask]".to_string());
     }
 
     if !pending.is_empty() {
-        text.push_str(&tokenizer.decode(&pending).unwrap_or_default());
+        pieces.push(tokenizer.decode(&pending).unwrap_or_default());
     }
 
-    text.trim().to_string()
+    pieces
+        .into_iter()
+        .filter(|piece| !piece.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('\n', "\\n")
+        .trim()
+        .to_string()
+}
+
+fn diffusion_draft_text(
+    tokenizer: &mlx_lm::Tokenizer,
+    finalized: &[u32],
+    canvas: &[u32],
+    accepted_mask: &[bool],
+) -> String {
+    let finalized_text = if finalized.is_empty() {
+        String::new()
+    } else {
+        tokenizer.decode(finalized).unwrap_or_default()
+    };
+    let canvas_text = canvas_draft_text(tokenizer, canvas, accepted_mask);
+    format!("{finalized_text}{canvas_text}")
 }
 
 /// MLX-RS text generation CLI.
@@ -204,17 +343,23 @@ fn main() -> Result<()> {
         let input =
             mlx_core::Array::from_slice_i32(&prompt_i32)?.reshape(&[1, prompt_i32.len() as i32])?;
         let mut redrawer = CanvasRedrawer::new();
-        let generated_token_ids = model.generate_block_diffusion_token_ids_with_drafts(
-            &input,
-            args.max_tokens,
-            |draft| {
-                let canvas_text =
-                    canvas_draft_text(&tokenizer, &draft.canvas_token_ids, &draft.accepted_mask);
-                redrawer.draw(&canvas_text);
-                Ok(())
-            },
-        )?;
-        redrawer.draw(""); // clear last render
+        let generated_token_ids = model
+            .generate_block_diffusion_token_ids_with_drafts_and_temperature(
+                &input,
+                args.max_tokens,
+                args.temperature,
+                |draft| {
+                    let canvas_text = diffusion_draft_text(
+                        &tokenizer,
+                        &draft.finalized_token_ids,
+                        &draft.canvas_token_ids,
+                        &draft.accepted_mask,
+                    );
+                    redrawer.draw(&canvas_text);
+                    Ok(())
+                },
+            )?;
+        redrawer.finish(); // clear last render
 
         let mut stdout = std::io::stdout();
         let mut accepted = Vec::new();

@@ -24,6 +24,8 @@ pub struct Gemma4DiffusionGenerationConfig {
     pub max_new_tokens: Option<usize>,
     pub t_min: Option<f32>,
     pub t_max: Option<f32>,
+    pub confidence_threshold: Option<f32>,
+    pub stability_threshold: Option<usize>,
     pub sampler_config: Option<Gemma4DiffusionSamplerConfig>,
 }
 
@@ -259,6 +261,14 @@ impl Gemma4Diffusion {
             .unwrap_or(0.1)
     }
 
+    fn diffusion_stopping_thresholds(&self) -> Option<(usize, f32)> {
+        let cfg = self.config.generation_config.as_ref()?;
+        match (cfg.stability_threshold, cfg.confidence_threshold) {
+            (None, None) => None,
+            (stability, confidence) => Some((stability.unwrap_or(1), confidence.unwrap_or(0.005))),
+        }
+    }
+
     fn initialize_canvas(
         &self,
         _canvas_index: usize,
@@ -274,18 +284,6 @@ impl Gemma4Diffusion {
         Array::from_slice_i32(&ids)?.reshape(&[1, canvas_len as i32])
     }
 
-    fn self_conditioning_embeddings_from_logits(&self, logits: &Array) -> Result<Array> {
-        let probs = logits.softmax(-1)?;
-        let mut embeddings = self
-            .language_model
-            .model
-            .embed_tokens
-            .embed_probabilities(&probs)?;
-        embeddings =
-            embeddings.multiply(&self.language_model.model.embed_scale)?;
-        Ok(embeddings)
-    }
-
     fn canvas_logits(
         &mut self,
         canvas: &Array,
@@ -293,8 +291,7 @@ impl Gemma4Diffusion {
     ) -> Result<Array> {
         let prefix_cache = self.language_model.model.caches.clone();
         let mut embeddings = self.language_model.model.embed_tokens.forward(canvas)?;
-        embeddings =
-            embeddings.multiply(&self.language_model.model.embed_scale)?;
+        embeddings = embeddings.multiply(&self.language_model.model.embed_scale)?;
         let zero_signal;
         let signal = if let Some(signal) = self_conditioning_signal {
             signal
@@ -327,24 +324,32 @@ impl Gemma4Diffusion {
         )?;
 
         let prefix_cache = self.language_model.model.caches.clone();
+        let cache_offset = prefix_cache.first().map(|c| c.offset()).unwrap_or(0) as i32;
+        traces.insert(
+            "decoder.cache_offset".to_string(),
+            Array::from_slice_i32(&[cache_offset])?.reshape(&[1])?,
+        );
         let mut canvas_embeddings = self.language_model.model.embed_tokens.forward(canvas_ids)?;
-        canvas_embeddings =
-            canvas_embeddings.multiply(&self.language_model.model.embed_scale)?;
+        canvas_embeddings = canvas_embeddings.multiply(&self.language_model.model.embed_scale)?;
         traces.insert(
             "decoder.canvas_embeddings_raw".to_string(),
             canvas_embeddings.clone(),
         );
 
         let zero_signal = Array::zeros(&canvas_embeddings.shape_raw(), canvas_embeddings.dtype())?;
-        traces.insert("decoder.self_conditioning_signal".to_string(), zero_signal.clone());
-        let conditioned_embeddings =
-            self.self_conditioning.forward(&canvas_embeddings, &zero_signal)?;
+        traces.insert(
+            "decoder.self_conditioning_signal".to_string(),
+            zero_signal.clone(),
+        );
+        let conditioned_embeddings = self
+            .self_conditioning
+            .forward(&canvas_embeddings, &zero_signal)?;
         traces.insert(
             "decoder.canvas_embeddings_conditioned".to_string(),
             conditioned_embeddings.clone(),
         );
 
-        let raw_logits = self.language_model.trace_diffusion_decoder_logits(
+        let raw_logits = self.language_model.trace_diffusion_decoder_logits_with_layers(
             &conditioned_embeddings,
             &prefix_cache,
             &mut traces,
@@ -360,8 +365,8 @@ impl Gemma4Diffusion {
             processed_logits.argmax(-1)?.as_type(canvas_ids.dtype())?,
         );
 
-        let (_sampled, accept_mask, _accepted) =
-            Self::sample_canvas_and_accept_mask(&processed_logits, self.entropy_bound())?;
+        let (accept_mask, _accepted, _mean_entropy) =
+            Self::entropy_transfer_mask(&processed_logits, self.entropy_bound())?;
         traces.insert(
             "decoder.entropy_accept_mask".to_string(),
             accept_mask.as_type(DType::Int32)?,
@@ -370,10 +375,36 @@ impl Gemma4Diffusion {
         Ok(traces)
     }
 
-    fn sample_canvas_and_accept_mask(
+    fn entropy_transfer_mask(
         logits: &Array,
         entropy_bound: f32,
-    ) -> anyhow::Result<(Array, Array, Vec<bool>)> {
+    ) -> anyhow::Result<(Array, Vec<bool>, f32)> {
+        let probs = logits.softmax(-1)?;
+        Self::entropy_transfer_mask_from_probs(logits, &probs, entropy_bound)
+    }
+
+    fn entropy_transfer_mask_and_soft_embeddings(
+        &self,
+        logits: &Array,
+        entropy_bound: f32,
+    ) -> anyhow::Result<(Array, Vec<bool>, f32, Array)> {
+        let probs = logits.softmax(-1)?;
+        let (accept_mask, accepted_mask, mean_entropy) =
+            Self::entropy_transfer_mask_from_probs(logits, &probs, entropy_bound)?;
+        let mut embeddings = self
+            .language_model
+            .model
+            .embed_tokens
+            .embed_probabilities(&probs)?;
+        embeddings = embeddings.multiply(&self.language_model.model.embed_scale)?;
+        Ok((accept_mask, accepted_mask, mean_entropy, embeddings))
+    }
+
+    fn entropy_transfer_mask_from_probs(
+        logits: &Array,
+        probs: &Array,
+        entropy_bound: f32,
+    ) -> anyhow::Result<(Array, Vec<bool>, f32)> {
         let shape = logits.shape_raw();
         anyhow::ensure!(
             shape.len() == 3,
@@ -381,41 +412,14 @@ impl Gemma4Diffusion {
         );
         let batch = shape[0] as usize;
         let canvas_len = shape[1] as usize;
-        let vocab = shape[2] as usize;
-        anyhow::ensure!(vocab > 0, "cannot sample from empty vocabulary");
-
-        let values = logits.as_type(DType::Float32)?.to_vec_f32()?;
-        let mut rng = rand::thread_rng();
-        let mut sampled_ids = Vec::with_capacity(batch * canvas_len);
-        let mut entropies = Vec::with_capacity(batch * canvas_len);
-
-        for row in values.chunks_exact(vocab) {
-            let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let mut sum_exp = 0.0f32;
-            let mut weighted_logits = 0.0f32;
-            for &logit in row {
-                let exp = (logit - max_v).exp();
-                sum_exp += exp;
-                weighted_logits += exp * logit;
-            }
-
-            let total = sum_exp.max(f32::MIN_POSITIVE);
-            let target = rng.gen::<f32>() * total;
-            let mut cumulative = 0.0f32;
-            let mut sampled = vocab - 1;
-            for (idx, &logit) in row.iter().enumerate() {
-                cumulative += (logit - max_v).exp();
-                if cumulative > target {
-                    sampled = idx;
-                    break;
-                }
-            }
-            sampled_ids.push(sampled as i32);
-
-            let logsumexp = max_v + total.ln();
-            let expected_logit = weighted_logits / total;
-            entropies.push(logsumexp - expected_logit);
-        }
+        let expected_logit = probs.multiply(logits)?.sum_axis(-1, false)?;
+        let entropy = logits.logsumexp(-1, false)?.subtract(&expected_logit)?;
+        let entropies = entropy.as_type(DType::Float32)?.to_vec_f32()?;
+        let mean_entropy = if entropies.is_empty() {
+            f32::INFINITY
+        } else {
+            entropies.iter().sum::<f32>() / entropies.len() as f32
+        };
 
         let mut mask = vec![0i32; batch * canvas_len];
         for b in 0..batch {
@@ -439,11 +443,50 @@ impl Gemma4Diffusion {
         }
 
         let accepted_mask = mask.iter().map(|&value| value != 0).collect::<Vec<_>>();
-        let sampled_canvas = Array::from_slice_i32(&sampled_ids)?.reshape(&[shape[0], shape[1]])?;
         let accept_mask = Array::from_slice_i32(&mask)?
             .reshape(&[shape[0], shape[1]])?
             .greater(&Array::from_int(0)?)?;
-        Ok((sampled_canvas, accept_mask, accepted_mask))
+        Ok((accept_mask, accepted_mask, mean_entropy))
+    }
+
+    fn sample_canvas(logits: &Array, dtype: DType, temperature: f32) -> anyhow::Result<Array> {
+        let shape = logits.shape_raw();
+        anyhow::ensure!(
+            shape.len() == 3,
+            "diffusion logits must be [batch, canvas, vocab], got {shape:?}"
+        );
+        let vocab = shape[2] as usize;
+        anyhow::ensure!(vocab > 0, "cannot sample from empty vocabulary");
+
+        let scaled = logits.divide(&Array::from_float(temperature.max(f32::MIN_POSITIVE))?)?;
+        let values = scaled.as_type(DType::Float32)?.to_vec_f32()?;
+        let mut rng = rand::thread_rng();
+        let mut sampled_ids = Vec::with_capacity(shape[0] as usize * shape[1] as usize);
+
+        for row in values.chunks_exact(vocab) {
+            let max_v = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let mut total = 0.0f32;
+            for &logit in row {
+                total += (logit - max_v).exp();
+            }
+
+            let target = rng.gen::<f32>() * total.max(f32::MIN_POSITIVE);
+            let mut cumulative = 0.0f32;
+            let mut sampled = vocab - 1;
+            for (idx, &logit) in row.iter().enumerate() {
+                cumulative += (logit - max_v).exp();
+                if cumulative > target {
+                    sampled = idx;
+                    break;
+                }
+            }
+            sampled_ids.push(sampled as i32);
+        }
+
+        Array::from_slice_i32(&sampled_ids)?
+            .reshape(&[shape[0], shape[1]])?
+            .as_type(dtype)
+            .map_err(Into::into)
     }
 
     pub fn generate_block_diffusion_token_ids(
@@ -458,6 +501,21 @@ impl Gemma4Diffusion {
         &mut self,
         input_ids: &Array,
         max_tokens: Option<usize>,
+        on_draft: F,
+    ) -> anyhow::Result<Vec<u32>>
+    where
+        F: FnMut(Gemma4DiffusionDraft) -> anyhow::Result<()>,
+    {
+        self.generate_block_diffusion_token_ids_with_drafts_and_temperature(
+            input_ids, max_tokens, 0.0, on_draft,
+        )
+    }
+
+    pub fn generate_block_diffusion_token_ids_with_drafts_and_temperature<F>(
+        &mut self,
+        input_ids: &Array,
+        max_tokens: Option<usize>,
+        temperature: f32,
         mut on_draft: F,
     ) -> anyhow::Result<Vec<u32>>
     where
@@ -470,6 +528,7 @@ impl Gemma4Diffusion {
         let max_denoising_steps = self.max_denoising_steps();
         let canvas_limit = self.config.canvas_length.max(1);
         let min_canvas = canvas_limit.min(64);
+        let stopping_thresholds = self.diffusion_stopping_thresholds();
         let mut generated = Vec::with_capacity(max_tokens);
         let mut canvas_index = 0usize;
 
@@ -479,12 +538,22 @@ impl Gemma4Diffusion {
             let canvas_len = canvas_limit.min(remaining.max(min_canvas)).min(remaining);
             let mut canvas = self.initialize_canvas(canvas_index, 0, canvas_len)?;
             let mut self_conditioning_signal: Option<Array> = None;
+            let mut diffusion_history: Vec<Array> = Vec::new();
+
+            on_draft(Gemma4DiffusionDraft {
+                finalized_token_ids: generated.clone(),
+                canvas_index,
+                denoising_step: 0,
+                canvas_token_ids: vec![0u32; canvas_len],
+                accepted_mask: vec![false; canvas_len],
+            })?;
 
             for cur_step in (1..=max_denoising_steps).rev() {
                 let logits = self.canvas_logits(&canvas, self_conditioning_signal.as_ref())?;
                 let processed_logits =
                     logits.divide(&Array::from_float(self.temperature_for_step(cur_step))?)?;
                 let argmax_canvas = processed_logits.argmax(-1)?.as_type(input_ids.dtype())?;
+                let mut next_self_conditioning_signal = None;
 
                 if cur_step == 1 {
                     canvas = argmax_canvas.clone();
@@ -497,26 +566,51 @@ impl Gemma4Diffusion {
                         accepted_mask: vec![true; canvas_len],
                     })?;
                 } else {
-                    let (denoiser_canvas, accept_mask, accepted_mask) =
-                        Self::sample_canvas_and_accept_mask(
+                    let (accept_mask, accepted_mask, mean_entropy, embeddings) = self
+                        .entropy_transfer_mask_and_soft_embeddings(
                             &processed_logits,
                             self.entropy_bound(),
                         )?;
+                    next_self_conditioning_signal = Some(embeddings);
+                    let denoiser_canvas = if temperature <= 0.0 {
+                        argmax_canvas.clone()
+                    } else {
+                        Self::sample_canvas(&processed_logits, input_ids.dtype(), temperature)?
+                    };
                     let argmax_ids = argmax_canvas.as_type(DType::Int32)?.to_vec_i32()?;
                     on_draft(Gemma4DiffusionDraft {
                         finalized_token_ids: generated.clone(),
                         canvas_index,
                         denoising_step: cur_step,
                         canvas_token_ids: argmax_ids.into_iter().map(|id| id as u32).collect(),
-                        accepted_mask,
+                        accepted_mask: accepted_mask.clone(),
                     })?;
                     let random_canvas =
                         self.initialize_canvas(canvas_index, cur_step, canvas_len)?;
                     canvas = accept_mask.where_cond(&denoiser_canvas, &random_canvas)?;
+
+                    if let Some((stability_threshold, confidence_threshold)) = stopping_thresholds {
+                        let stable = diffusion_history.len() == stability_threshold
+                            && diffusion_history.iter().all(|previous| {
+                                argmax_canvas
+                                    .equal(previous)
+                                    .and_then(|eq| eq.as_type(DType::Int32))
+                                    .and_then(|eq| eq.to_vec_i32())
+                                    .map(|values| values.iter().all(|&value| value != 0))
+                                    .unwrap_or(false)
+                            });
+                        diffusion_history.push(argmax_canvas.clone());
+                        if diffusion_history.len() > stability_threshold {
+                            diffusion_history.remove(0);
+                        }
+                        if stable && mean_entropy < confidence_threshold {
+                            canvas = argmax_canvas.clone();
+                            break;
+                        }
+                    }
                 }
 
-                self_conditioning_signal =
-                    Some(self.self_conditioning_embeddings_from_logits(&processed_logits)?);
+                self_conditioning_signal = next_self_conditioning_signal;
             }
 
             let ids = canvas.as_type(DType::Int32)?.to_vec_i32()?;

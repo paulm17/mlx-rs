@@ -858,7 +858,7 @@ impl Gemma4Attention {
         Ok(o)
     }
 
-    pub fn forward_diffusion_decoder(&mut self, x: &Array, prefix_cache: &KvCache) -> Result<Array> {
+    pub fn forward_diffusion_decoder(&mut self, x: &Array, prefix_cache: &KvCache, offset: usize) -> Result<Array> {
         let shape = x.shape_raw();
         let (b, seq_len, _) = (shape[0], shape[1], shape[2]);
 
@@ -868,9 +868,9 @@ impl Gemma4Attention {
         let q = self.q_norm.forward(&q)?;
         let q = if self.use_proportional_rope {
             let rotated_dims = (self.partial_rotary_factor * self.head_dim as f32) as i32;
-            apply_proportional_rope(&q, self.head_dim as i32, rotated_dims, self.rope_theta, 0)?
+            apply_proportional_rope(&q, self.head_dim as i32, rotated_dims, self.rope_theta, offset)?
         } else {
-            apply_rope(&q, self.head_dim as i32, self.rope_theta, 0)?
+            apply_rope(&q, self.head_dim as i32, self.rope_theta, offset)?
         };
 
         let k = self.k_proj.forward(x)?
@@ -879,9 +879,9 @@ impl Gemma4Attention {
         let k = self.k_norm.forward(&k)?;
         let k = if self.use_proportional_rope {
             let rotated_dims = (self.partial_rotary_factor * self.head_dim as f32) as i32;
-            apply_proportional_rope(&k, self.head_dim as i32, rotated_dims, self.rope_theta, 0)?
+            apply_proportional_rope(&k, self.head_dim as i32, rotated_dims, self.rope_theta, offset)?
         } else {
-            apply_rope(&k, self.head_dim as i32, self.rope_theta, 0)?
+            apply_rope(&k, self.head_dim as i32, self.rope_theta, offset)?
         };
 
         let v = if self.k_eq_v {
@@ -1381,7 +1381,10 @@ impl Gemma4DecoderLayer {
             let h1_in = self.pre_ffw_layernorm.forward(&h)?;
             let h1 = self.mlp.forward(&h1_in)?;
             let h1 = self.post_ffw_layernorm_1.as_ref().unwrap().forward(&h1)?;
-            let h2_router_input = h.clone();
+            // Python: flat = residual.reshape(-1, hidden); router(flat)
+            // Router gets the RAW residual, NOT pre_ffw_layernorm(h).
+            // Router applies its own fast_rms_norm internally.
+            let h2_router_input = residual.clone();
             let h2_expert_input = self.pre_ffw_layernorm_2.as_ref().unwrap().forward(&h)?;
             let h2 = moe.forward(&h2_router_input, &h2_expert_input)?;
             let h2 = self.post_ffw_layernorm_2.as_ref().unwrap().forward(&h2)?;
@@ -1415,9 +1418,10 @@ impl Gemma4DecoderLayer {
         x: &Array,
         prefix_cache: &KvCache,
     ) -> Result<Array> {
+        let offset = prefix_cache.offset();
         let residual = x.clone();
         let h_norm = self.input_layernorm.forward(x)?;
-        let attn_out = self.self_attn.forward_diffusion_decoder(&h_norm, prefix_cache)?;
+        let attn_out = self.self_attn.forward_diffusion_decoder(&h_norm, prefix_cache, offset)?;
         let h = self.post_attn_layernorm.forward(&attn_out)?;
         let h = residual.add(&h)?;
 
@@ -1427,7 +1431,9 @@ impl Gemma4DecoderLayer {
             let h1 = self.mlp.forward(&h1)?;
             let h1 = self.post_ffw_layernorm_1.as_ref().unwrap().forward(&h1)?;
 
-            let h2_router_input = h.clone();
+            // Python: flat = residual.reshape(-1, hidden); router(flat)
+            // Router gets the RAW residual, NOT pre_ffw_layernorm(h).
+            let h2_router_input = residual.clone();
             let h2_expert_input = self.pre_ffw_layernorm_2.as_ref().unwrap().forward(&h)?;
             let h2 = moe.forward(&h2_router_input, &h2_expert_input)?;
             let h2 = self.post_ffw_layernorm_2.as_ref().unwrap().forward(&h2)?;
@@ -1443,6 +1449,57 @@ impl Gemma4DecoderLayer {
         };
 
         if let Some(ref scalar) = self.layer_scalar {
+            h = h.multiply(scalar)?;
+        }
+
+        Ok(h)
+    }
+
+    pub(crate) fn trace_forward_diffusion_decoder(
+        &mut self,
+        x: &Array,
+        prefix_cache: &KvCache,
+        layer_idx: usize,
+        traces: &mut HashMap<String, Array>,
+    ) -> Result<Array> {
+        let offset = prefix_cache.offset();
+        let residual = x.clone();
+        let h_norm = self.input_layernorm.forward(x)?;
+        traces.insert(format!("decoder.layer_{layer_idx}.attn_input_norm"), h_norm.clone());
+        let attn_out = self.self_attn.forward_diffusion_decoder(&h_norm, prefix_cache, offset)?;
+        traces.insert(format!("decoder.layer_{layer_idx}.attn_out"), attn_out.clone());
+        let h = self.post_attn_layernorm.forward(&attn_out)?;
+        let h = residual.add(&h)?;
+        traces.insert(format!("decoder.layer_{layer_idx}.after_attn_residual"), h.clone());
+
+        let residual = h.clone();
+        let mut h = if let Some(ref moe) = self.moe {
+            let h1 = self.pre_ffw_layernorm.forward(&h)?;
+            let h1 = self.mlp.forward(&h1)?;
+            let h1 = self.post_ffw_layernorm_1.as_ref().unwrap().forward(&h1)?;
+
+            // Python: flat = residual.reshape(-1, hidden); router(flat)
+            let h2_router_input = residual.clone();
+            let h2_expert_input = self.pre_ffw_layernorm_2.as_ref().unwrap().forward(&h)?;
+            let h2 = moe.forward(&h2_router_input, &h2_expert_input)?;
+            let h2 = self.post_ffw_layernorm_2.as_ref().unwrap().forward(&h2)?;
+            traces.insert(format!("decoder.layer_{layer_idx}.mlp_out"), h1.clone());
+            traces.insert(format!("decoder.layer_{layer_idx}.moe_out"), h2.clone());
+
+            let h = h1.add(&h2)?;
+            let h = self.post_ffw_layernorm.forward(&h)?;
+            traces.insert(format!("decoder.layer_{layer_idx}.after_ffw_norm"), h.clone());
+            residual.add(&h)?
+        } else {
+            let h_norm = self.pre_ffw_layernorm.forward(&h)?;
+            let mlp_out = self.mlp.forward(&h_norm)?;
+            traces.insert(format!("decoder.layer_{layer_idx}.mlp_out"), mlp_out.clone());
+            let h = self.post_ffw_layernorm.forward(&mlp_out)?;
+            residual.add(&h)?
+        };
+
+        if let Some(ref scalar) = self.layer_scalar {
+            traces.insert(format!("decoder.layer_{layer_idx}.layer_scalar"), scalar.clone());
             h = h.multiply(scalar)?;
         }
 
@@ -1897,6 +1954,36 @@ impl LanguageModel {
             embeddings,
             prefix_cache,
         )?;
+        traces.insert("decoder.final_hidden".to_string(), hidden.clone());
+
+        let logits = self.lm_head.forward(&hidden)?;
+
+        let raw_logits = if let Some(cap) = self.final_logit_softcapping {
+            let raw = logits.divide(&Array::from_float(cap)?)?;
+            raw.tanh()?.multiply(&Array::from_float(cap)?)?
+        } else {
+            logits
+        };
+        traces.insert("decoder.raw_logits".to_string(), raw_logits.clone());
+        Ok(raw_logits)
+    }
+
+    pub(crate) fn trace_diffusion_decoder_logits_with_layers(
+        &mut self,
+        embeddings: &Array,
+        prefix_cache: &[KvCache],
+        traces: &mut HashMap<String, Array>,
+    ) -> Result<Array> {
+        traces.insert("decoder.embeddings".to_string(), embeddings.clone());
+
+        let mut h = embeddings.clone();
+        for (i, layer) in self.model.layers.iter_mut().enumerate() {
+            let cache_idx = self.model.layer_idx_to_cache_idx[i];
+            traces.insert(format!("decoder.layer_{i}.input"), h.clone());
+            h = layer.trace_forward_diffusion_decoder(&h, &prefix_cache[cache_idx], i, traces)?;
+            traces.insert(format!("decoder.layer_{i}.output"), h.clone());
+        }
+        let hidden = self.model.norm.forward(&h)?;
         traces.insert("decoder.final_hidden".to_string(), hidden.clone());
 
         let logits = self.lm_head.forward(&hidden)?;

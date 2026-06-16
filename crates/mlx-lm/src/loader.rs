@@ -160,6 +160,18 @@ fn parse_env_usize(name: &str) -> Option<usize> {
 }
 
 fn configure_mlx_cache_policy() {
+    configure_mlx_cache_policy_with_auto_bounds(256usize * 1024 * 1024, 512usize * 1024 * 1024, 8);
+}
+
+fn configure_mlx_diffusion_cache_policy() {
+    configure_mlx_cache_policy_with_auto_bounds(
+        4usize * 1024 * 1024 * 1024,
+        12usize * 1024 * 1024 * 1024,
+        2,
+    );
+}
+
+fn configure_mlx_cache_policy_with_auto_bounds(min_b: usize, max_b: usize, active_divisor: usize) {
     // Priority:
     // 1) MLX_CACHE_LIMIT_BYTES
     // 2) MLX_CACHE_LIMIT_MB
@@ -172,12 +184,8 @@ fn configure_mlx_cache_policy() {
         v.saturating_mul(1024 * 1024)
     } else {
         let active = mlx_core::metal::memory_info().active_memory;
-        // Conservative default for production behavior:
-        // keep allocator cache small so RSS tracks active model memory.
-        // Auto target is active/8, clamped to [256 MiB, 512 MiB].
-        let auto = active / 8;
-        let min_b = 256usize * 1024 * 1024;
-        let max_b = 512usize * 1024 * 1024;
+        // Auto target is a fraction of active memory, clamped by the caller's workload profile.
+        let auto = active / active_divisor.max(1);
         auto.clamp(min_b, max_b)
     };
     mlx_core::metal::set_cache_limit(target);
@@ -571,7 +579,7 @@ pub fn load_gemma4_diffusion_model(
         serde_json::from_value(gemma4_diffusion_config(&config)?)?;
     let model = mlx_models::Gemma4Diffusion::new(&vb, &cfg)?;
 
-    configure_mlx_cache_policy();
+    configure_mlx_diffusion_cache_policy();
 
     let tokenizer_path = model_dir.join("tokenizer.json");
     let tokenizer = crate::tokenizer::Tokenizer::from_file(&tokenizer_path)?;
