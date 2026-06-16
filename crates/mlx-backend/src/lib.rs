@@ -2,12 +2,16 @@ pub mod array;
 pub mod cache;
 pub mod chat_template;
 pub mod ffi;
+pub mod gemma3;
 pub mod llama;
 pub mod loader;
 pub mod manifest;
 pub mod memory;
 pub mod mlx_backend;
+pub mod model;
 pub mod ops;
+pub mod qwen3;
+pub mod registry;
 pub mod tensors;
 
 pub use array::Array;

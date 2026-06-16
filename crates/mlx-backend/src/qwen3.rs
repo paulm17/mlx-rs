@@ -1,78 +1,26 @@
+use std::collections::HashMap;
+
 use crate::array::Array;
+use crate::llama::{Embedding, KvCache, Linear, Mlp, RmsNorm, resolve_weight_prefix};
 use crate::model::Model;
 use crate::ops;
 
-pub struct Linear {
-    weight: Array,
-    bias: Option<Array>,
-}
-
-impl Linear {
-    pub fn new(weight: Array, bias: Option<Array>) -> Self {
-        Self { weight, bias }
-    }
-
-    pub fn forward(&self, x: &Array) -> anyhow::Result<Array> {
-        let w_t = ops::transpose(&self.weight, &[1, 0])?;
-        let out = ops::matmul(x, &w_t)?;
-        match &self.bias {
-            Some(b) => ops::add(&out, b),
-            None => Ok(out),
-        }
-    }
-}
-
-pub struct Embedding {
-    weight: Array,
-}
-
-impl Embedding {
-    pub fn new(weight: Array) -> Self {
-        Self { weight }
-    }
-
-    pub fn forward(&self, indices: &Array) -> anyhow::Result<Array> {
-        ops::take(&self.weight, indices, 0)
-    }
-
-    pub fn weight(&self) -> &Array {
-        &self.weight
-    }
-}
-
-pub struct RmsNorm {
-    weight: Array,
-    eps: f32,
-}
-
-impl RmsNorm {
-    pub fn new(weight: Array, eps: f32) -> Self {
-        Self { weight, eps }
-    }
-
-    pub fn forward(&self, x: &Array) -> anyhow::Result<Array> {
-        ops::fast_rms_norm(x, &self.weight, self.eps)
-    }
-}
-
-pub struct Attention {
+pub struct Qwen3Attention {
     q_proj: Linear,
     k_proj: Linear,
     v_proj: Linear,
     o_proj: Linear,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
 }
 
-impl Attention {
-    pub fn new(q_proj: Linear, k_proj: Linear, v_proj: Linear, o_proj: Linear) -> Self {
-        Self { q_proj, k_proj, v_proj, o_proj }
-    }
-
+impl Qwen3Attention {
     pub fn forward(
         &self,
         x: &Array,
         kv: &mut KvCache,
         _positions: &Array,
-        cfg: &LlamaConfig,
+        cfg: &Qwen3Config,
     ) -> anyhow::Result<Array> {
         let b = x.dim(0)?;
         let l = x.dim(1)?;
@@ -90,6 +38,9 @@ impl Attention {
         let v = ops::reshape(&v, &[b, l, cfg.num_key_value_heads as usize, cfg.head_dim as usize])?;
         let v = ops::transpose(&v, &[0, 2, 1, 3])?;
 
+        let q = self.q_norm.forward(&q)?;
+        let k = self.k_norm.forward(&k)?;
+
         let head_dim = cfg.head_dim as i32;
         let rope_theta = Some(cfg.rope_theta);
         let q = ops::fast_rope(&q, head_dim, false, rope_theta, 1.0, 0)?;
@@ -106,40 +57,20 @@ impl Attention {
     }
 }
 
-pub struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
-}
-
-impl Mlp {
-    pub fn new(gate_proj: Linear, up_proj: Linear, down_proj: Linear) -> Self {
-        Self { gate_proj, up_proj, down_proj }
-    }
-
-    pub fn forward(&self, x: &Array) -> anyhow::Result<Array> {
-        let gate = self.gate_proj.forward(x)?;
-        let up = self.up_proj.forward(x)?;
-        let gate_silu = ops::multiply(&gate, &ops::sigmoid(&gate)?)?;
-        let gated = ops::multiply(&gate_silu, &up)?;
-        self.down_proj.forward(&gated)
-    }
-}
-
-pub struct Layer {
-    attention: Attention,
+pub struct Qwen3Layer {
+    attention: Qwen3Attention,
     mlp: Mlp,
     attention_norm: RmsNorm,
     mlp_norm: RmsNorm,
 }
 
-impl Layer {
+impl Qwen3Layer {
     pub fn forward(
         &self,
         x: &Array,
         kv: &mut KvCache,
         positions: &Array,
-        cfg: &LlamaConfig,
+        cfg: &Qwen3Config,
     ) -> anyhow::Result<Array> {
         let normed = self.attention_norm.forward(x)?;
         let attn_out = self.attention.forward(&normed, kv, positions, cfg)?;
@@ -150,41 +81,8 @@ impl Layer {
     }
 }
 
-#[derive(Clone)]
-pub struct KvCache {
-    k_cache: Option<Array>,
-    v_cache: Option<Array>,
-}
-
-impl KvCache {
-    pub fn new() -> Self {
-        Self { k_cache: None, v_cache: None }
-    }
-
-    pub fn update(&mut self, k: &Array, v: &Array) -> anyhow::Result<(Array, Array)> {
-        match (&self.k_cache, &self.v_cache) {
-            (Some(ck), Some(cv)) => {
-                let new_k = ops::concatenate(&[ck, k], 2)?;
-                let new_v = ops::concatenate(&[cv, v], 2)?;
-                self.k_cache = Some(new_k.clone());
-                self.v_cache = Some(new_v.clone());
-                Ok((new_k, new_v))
-            }
-            _ => {
-                self.k_cache = Some(k.clone());
-                self.v_cache = Some(v.clone());
-                Ok((k.clone(), v.clone()))
-            }
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.k_cache.as_ref().map(|k| k.dim(2).unwrap_or(0)).unwrap_or(0)
-    }
-}
-
 #[derive(Debug, Clone)]
-pub struct LlamaConfig {
+pub struct Qwen3Config {
     pub hidden_size: i32,
     pub num_hidden_layers: i32,
     pub intermediate_size: i32,
@@ -196,9 +94,10 @@ pub struct LlamaConfig {
     pub max_position_embeddings: i32,
     pub tie_word_embeddings: bool,
     pub head_dim: i32,
+    pub qk_norm_eps: f32,
 }
 
-impl LlamaConfig {
+impl Qwen3Config {
     pub fn from_json(config: &serde_json::Value) -> anyhow::Result<Self> {
         let hidden_size = config.get("hidden_size").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let num_hidden_layers = config.get("num_hidden_layers").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
@@ -207,13 +106,14 @@ impl LlamaConfig {
         let num_key_value_heads = config.get("num_key_value_heads").and_then(|v| v.as_i64()).unwrap_or(num_attention_heads as i64) as i32;
         let vocab_size = config.get("vocab_size").and_then(|v| v.as_i64()).unwrap_or(0) as i32;
         let rms_norm_eps = config.get("rms_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-5) as f32;
-        let rope_theta = config.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(10000.0) as f32;
-        let max_position_embeddings = config.get("max_position_embeddings").and_then(|v| v.as_i64()).unwrap_or(2048) as i32;
+        let rope_theta = config.get("rope_theta").and_then(|v| v.as_f64()).unwrap_or(1000000.0) as f32;
+        let max_position_embeddings = config.get("max_position_embeddings").and_then(|v| v.as_i64()).unwrap_or(4096) as i32;
         let tie_word_embeddings = config.get("tie_word_embeddings").and_then(|v| v.as_bool()).unwrap_or(false);
         let head_dim = config.get("head_dim").and_then(|v| v.as_i64()).unwrap_or((hidden_size / num_attention_heads) as i64) as i32;
+        let qk_norm_eps = config.get("qk_norm_eps").and_then(|v| v.as_f64()).unwrap_or(1e-6) as f32;
 
-        if hidden_size <= 0 || num_attention_heads <= 0 || num_key_value_heads <= 0 {
-            anyhow::bail!("invalid model config: hidden_size={hidden_size} heads={num_attention_heads}/{num_key_value_heads}");
+        if hidden_size <= 0 || num_attention_heads <= 0 {
+            anyhow::bail!("invalid Qwen3 config: hidden_size={hidden_size} heads={num_attention_heads}");
         }
 
         Ok(Self {
@@ -228,6 +128,7 @@ impl LlamaConfig {
             max_position_embeddings,
             tie_word_embeddings,
             head_dim,
+            qk_norm_eps,
         })
     }
 
@@ -236,15 +137,15 @@ impl LlamaConfig {
     }
 }
 
-pub struct LlamaModel {
+pub struct Qwen3Model {
     embed_tokens: Embedding,
-    layers: Vec<Layer>,
+    layers: Vec<Qwen3Layer>,
     norm: RmsNorm,
     lm_head: Linear,
-    config: LlamaConfig,
+    config: Qwen3Config,
 }
 
-impl Model for LlamaModel {
+impl Model for Qwen3Model {
     fn forward(
         &self,
         input_ids: &Array,
@@ -276,14 +177,14 @@ impl Model for LlamaModel {
     }
 }
 
-impl LlamaModel {
-    pub fn config(&self) -> &LlamaConfig {
+impl Qwen3Model {
+    pub fn config(&self) -> &Qwen3Config {
         &self.config
     }
 
     pub fn load_from_tensors(
-        tensors: std::collections::HashMap<String, Array>,
-        config: LlamaConfig,
+        tensors: HashMap<String, Array>,
+        config: Qwen3Config,
     ) -> anyhow::Result<Self> {
         let prefix = resolve_weight_prefix(&tensors);
 
@@ -298,8 +199,6 @@ impl LlamaModel {
         let lm_head = if config.tie_word_embeddings {
             Linear::new(embed_w.clone(), None)
         } else if let Some(w) = tensors.get(&format!("{prefix}lm_head.weight")) {
-            Linear::new(w.clone(), None)
-        } else if let Some(w) = tensors.get("lm_head.weight") {
             Linear::new(w.clone(), None)
         } else {
             Linear::new(embed_w.clone(), None)
@@ -318,17 +217,19 @@ impl LlamaModel {
             let o_w = tensors.get(&format!("{lp}.self_attn.o_proj.weight"))
                 .ok_or_else(|| anyhow::anyhow!("missing {lp}.self_attn.o_proj.weight"))?;
 
-            let q_bias = tensors.get(&format!("{lp}.self_attn.q_proj.bias")).cloned();
-            let k_bias = tensors.get(&format!("{lp}.self_attn.k_proj.bias")).cloned();
-            let v_bias = tensors.get(&format!("{lp}.self_attn.v_proj.bias")).cloned();
-            let o_bias = tensors.get(&format!("{lp}.self_attn.o_proj.bias")).cloned();
+            let q_norm_w = tensors.get(&format!("{lp}.self_attn.q_norm.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {lp}.self_attn.q_norm.weight"))?;
+            let k_norm_w = tensors.get(&format!("{lp}.self_attn.k_norm.weight"))
+                .ok_or_else(|| anyhow::anyhow!("missing {lp}.self_attn.k_norm.weight"))?;
 
-            let attention = Attention::new(
-                Linear::new(q_w.clone(), q_bias),
-                Linear::new(k_w.clone(), k_bias),
-                Linear::new(v_w.clone(), v_bias),
-                Linear::new(o_w.clone(), o_bias),
-            );
+            let attention = Qwen3Attention {
+                q_proj: Linear::new(q_w.clone(), None),
+                k_proj: Linear::new(k_w.clone(), None),
+                v_proj: Linear::new(v_w.clone(), None),
+                o_proj: Linear::new(o_w.clone(), None),
+                q_norm: RmsNorm::new(q_norm_w.clone(), config.qk_norm_eps),
+                k_norm: RmsNorm::new(k_norm_w.clone(), config.qk_norm_eps),
+            };
 
             let gate_w = tensors.get(&format!("{lp}.mlp.gate_proj.weight"))
                 .ok_or_else(|| anyhow::anyhow!("missing {lp}.mlp.gate_proj.weight"))?;
@@ -348,7 +249,7 @@ impl LlamaModel {
             let mlp_norm_w = tensors.get(&format!("{lp}.post_attention_layernorm.weight"))
                 .ok_or_else(|| anyhow::anyhow!("missing {lp}.post_attention_layernorm.weight"))?;
 
-            layers.push(Layer {
+            layers.push(Qwen3Layer {
                 attention,
                 mlp,
                 attention_norm: RmsNorm::new(attn_norm_w.clone(), config.rms_norm_eps),
@@ -358,33 +259,6 @@ impl LlamaModel {
 
         Ok(Self { embed_tokens, layers, norm, lm_head, config })
     }
-}
-
-pub fn resolve_weight_prefix(tensors: &std::collections::HashMap<String, Array>) -> String {
-    if tensors.contains_key("model.embed_tokens.weight") {
-        return String::new();
-    }
-    if tensors.contains_key("language_model.model.embed_tokens.weight") {
-        return "language_model.".to_string();
-    }
-    String::new()
-}
-
-pub fn argmax(logits: &Array) -> anyhow::Result<i32> {
-    let shape = logits.shape();
-    let ndim = shape.len();
-    let vocab_size = shape[ndim - 1];
-    let data = logits.data_f32()?;
-    let offset = data.len() - vocab_size;
-    let mut best_val = f32::NEG_INFINITY;
-    let mut best_idx = 0i32;
-    for i in 0..vocab_size {
-        if data[offset + i] > best_val {
-            best_val = data[offset + i];
-            best_idx = i as i32;
-        }
-    }
-    Ok(best_idx)
 }
 
 #[cfg(test)]
@@ -397,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn test_llama_config_from_json() {
+    fn test_qwen3_config_from_json() {
         let json = serde_json::json!({
             "hidden_size": 64,
             "num_hidden_layers": 2,
@@ -406,92 +280,26 @@ mod tests {
             "num_key_value_heads": 2,
             "vocab_size": 100,
             "rms_norm_eps": 1e-5,
-            "rope_theta": 10000.0,
-            "max_position_embeddings": 128
+            "rope_theta": 1000000.0,
+            "max_position_embeddings": 128,
+            "head_dim": 16
         });
-        let cfg = LlamaConfig::from_json(&json).unwrap();
+        let cfg = Qwen3Config::from_json(&json).unwrap();
         assert_eq!(cfg.hidden_size, 64);
-        assert_eq!(cfg.num_hidden_layers, 2);
-        assert_eq!(cfg.num_attention_heads, 4);
-        assert_eq!(cfg.num_key_value_heads, 2);
+        assert_eq!(cfg.rope_theta, 1000000.0);
         assert_eq!(cfg.head_dim, 16);
+        assert!((cfg.qk_norm_eps - 1e-6).abs() < 1e-10);
     }
 
     #[test]
-    fn test_linear_forward() {
+    fn test_qwen3_qk_norm() {
         if !mlx_available() { return; }
-        let w = Array::from_data_f32(&[1.0, 0.0, 0.0, 1.0], &[2, 2]).unwrap();
-        let linear = Linear::new(w, None);
-        let x = Array::from_data_f32(&[2.0, 3.0], &[1, 2]).unwrap();
-        let out = linear.forward(&x).unwrap();
-        out.eval().unwrap();
-        let data = out.data_f32().unwrap();
-        assert!((data[0] - 2.0).abs() < 1e-5);
-        assert!((data[1] - 3.0).abs() < 1e-5);
-    }
-
-    #[test]
-    fn test_embedding_forward() {
-        if !mlx_available() { return; }
-        let w = Array::from_data_f32(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0], &[3, 2]).unwrap();
-        let emb = Embedding::new(w);
-        let idx = Array::from_i32(1).unwrap();
-        let out = emb.forward(&idx).unwrap();
-        out.eval().unwrap();
-        let data = out.data_f32().unwrap();
-        assert_eq!(data, &[3.0, 4.0]);
-    }
-
-    #[test]
-    fn test_rms_norm_forward() {
-        if !mlx_available() { return; }
-        let w = Array::from_data_f32(&[1.0, 1.0], &[2]).unwrap();
-        let norm = RmsNorm::new(w, 1e-5);
-        let x = Array::from_data_f32(&[3.0, 4.0], &[1, 2]).unwrap();
+        let w = Array::from_data_f32(&[1.0, 1.0, 1.0, 1.0], &[4]).unwrap();
+        let norm = RmsNorm::new(w, 1e-6);
+        let x = Array::from_data_f32(&[1.0, 2.0, 3.0, 4.0], &[1, 4]).unwrap();
         let out = norm.forward(&x).unwrap();
         out.eval().unwrap();
         let data = out.data_f32().unwrap();
-        let expected_rms = ((3.0f32 * 3.0 + 4.0 * 4.0) / 2.0 + 1e-5).sqrt();
-        assert!((data[0] - 3.0 / expected_rms).abs() < 1e-4);
-        assert!((data[1] - 4.0 / expected_rms).abs() < 1e-4);
-    }
-
-    #[test]
-    fn test_kv_cache_update() {
-        if !mlx_available() { return; }
-        let mut kv = KvCache::new();
-        assert_eq!(kv.len(), 0);
-        let k = Array::from_data_f32(&[1.0, 2.0], &[1, 2, 1]).unwrap();
-        let v = Array::from_data_f32(&[3.0, 4.0], &[1, 2, 1]).unwrap();
-        let (k1, _v1) = kv.update(&k, &v).unwrap();
-        assert_eq!(k1.shape(), vec![1, 2, 1]);
-        assert_eq!(kv.len(), 1);
-        let k2 = Array::from_data_f32(&[5.0, 6.0], &[1, 2, 1]).unwrap();
-        let v2 = Array::from_data_f32(&[7.0, 8.0], &[1, 2, 1]).unwrap();
-        let (k3, _v3) = kv.update(&k2, &v2).unwrap();
-        assert_eq!(k3.shape(), vec![1, 2, 2]);
-        assert_eq!(kv.len(), 2);
-    }
-
-    #[test]
-    fn test_argmax() {
-        if !mlx_available() { return; }
-        let logits = Array::from_data_f32(&[1.0, 3.0, 2.0], &[1, 3]).unwrap();
-        let idx = argmax(&logits).unwrap();
-        assert_eq!(idx, 1);
-    }
-
-    #[test]
-    fn test_swiglu() {
-        if !mlx_available() { return; }
-        let gate = Array::from_data_f32(&[1.0, -1.0], &[1, 2]).unwrap();
-        let up = Array::from_data_f32(&[2.0, 3.0], &[1, 2]).unwrap();
-        let gate_silu = ops::multiply(&gate, &ops::sigmoid(&gate).unwrap()).unwrap();
-        let out = ops::multiply(&gate_silu, &up).unwrap();
-        out.eval().unwrap();
-        let data = out.data_f32().unwrap();
-        let sigmoid_1 = 1.0 / (1.0 + (-1.0f32).exp());
-        assert!((data[0] - 1.0 * sigmoid_1 * 2.0).abs() < 1e-5);
+        assert!(data.iter().all(|v| v.is_finite()));
     }
 }
-

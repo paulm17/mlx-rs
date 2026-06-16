@@ -334,6 +334,7 @@ pub struct MlxSymbols {
     pub mlx_softmax: MlxUnaryOpFn,
     pub mlx_sigmoid: MlxUnaryOpFn,
     pub mlx_sqrt: MlxUnaryOpFn,
+    pub mlx_tanh: MlxUnaryOpFn,
     // Memory
     pub mlx_get_active_memory: MlxGetActiveMemoryFn,
     pub mlx_get_cache_memory: MlxGetCacheMemoryFn,
@@ -413,6 +414,7 @@ impl MlxSymbols {
                 mlx_softmax: load_sym!(lib, b"mlx_softmax\0", MlxUnaryOpFn),
                 mlx_sigmoid: load_sym!(lib, b"mlx_sigmoid\0", MlxUnaryOpFn),
                 mlx_sqrt: load_sym!(lib, b"mlx_sqrt\0", MlxUnaryOpFn),
+                mlx_tanh: load_sym!(lib, b"mlx_tanh\0", MlxUnaryOpFn),
                 mlx_get_active_memory: load_sym!(lib, b"mlx_get_active_memory\0", MlxGetActiveMemoryFn),
                 mlx_get_cache_memory: load_sym!(lib, b"mlx_get_cache_memory\0", MlxGetCacheMemoryFn),
                 mlx_get_peak_memory: load_sym!(lib, b"mlx_get_peak_memory\0", MlxGetPeakMemoryFn),

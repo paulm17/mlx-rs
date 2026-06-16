@@ -275,6 +275,16 @@ pub fn sqrt(a: &Array) -> anyhow::Result<Array> {
     Ok(Array { ctx: res })
 }
 
+pub fn tanh(a: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_tanh)(&mut res, a.raw(), null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_tanh returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
 pub fn fast_rms_norm(x: &Array, weight: &Array, eps: f32) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };

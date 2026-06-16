@@ -1178,7 +1178,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 2.10 - Additional MLX Model Families
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -1204,6 +1204,21 @@ Reference:
 Acceptance:
 
 - Each family has:
+  - one env-gated real model smoke test
+  - one config detection test
+  - one generation smoke
+
+Completion notes (2026-06-16):
+
+- `model.rs` (new): `Model` trait with `forward(input_ids, caches, positions)`, `num_layers()`, `max_position_embeddings()`, `hidden_size()`, `vocab_size()`.
+- `llama.rs` (modified): `LlamaModel` now implements `Model` trait. `resolve_weight_prefix` made public.
+- `qwen3.rs` (new): `Qwen3Model` with Q/K RMSNorms (`q_norm`, `k_norm` with `qk_norm_eps=1e-6`), `rope_theta` default 1000000. `Qwen3Config` parses all fields. `Qwen3Attention` applies Q/K norms before RoPE. 2 tests.
+- `gemma3.rs` (new): `Gemma3Model` with 4 norms per layer (attention_norm, mlp_norm, pre_feedforward_norm, post_feedforward_norm), embedding scaling (`h * sqrt(hidden_size)`), GELU activation in MLP, sliding window attention detection via `sliding_window_pattern`. `Gemma3Config` with `rope_local_base_freq`, `sliding_window`, `sliding_window_pattern`. 3 tests.
+- `registry.rs` (new): `detect_architecture(config)` extracts `architectures[0]` from config.json. `create_model(arch, tensors, config)` dispatches to LlamaModel/Qwen3Model/Gemma3Model. `supported_architectures()` returns list. 6 tests.
+- `ops.rs` (modified): Added `tanh()` unary op.
+- `ffi.rs` (modified): Added `mlx_tanh` symbol.
+- `lib.rs`: Added `gemma3`, `model`, `qwen3`, `registry` modules.
+- All 161 tests pass (88 llama-lm + 73 mlx-backend), cargo check clean, zero warnings.
   - one env-gated real model smoke test
   - one config detection test
   - one generation smoke

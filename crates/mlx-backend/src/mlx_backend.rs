@@ -10,16 +10,20 @@ use backend_trait::types::{
 use crate::array::Array;
 use crate::cache::PrefixCache;
 use crate::chat_template::ChatTemplate;
-use crate::llama::{argmax, KvCache, LlamaConfig, LlamaModel};
+use crate::llama::{argmax, KvCache};
 use crate::manifest::ModelManifest;
+use crate::model::Model;
+use crate::registry;
 
 pub struct MlxBackend {
-    model: LlamaModel,
+    model: Box<dyn Model>,
     tokenizer: tokenizers::Tokenizer,
-    config: LlamaConfig,
     model_path: String,
     chat_template: ChatTemplate,
     prefix_cache: PrefixCache,
+    max_position_embeddings: i32,
+    hidden_size: i32,
+    vocab_size: i32,
 }
 
 impl MlxBackend {
@@ -27,13 +31,13 @@ impl MlxBackend {
         let manifest = ModelManifest::open(dir)
             .with_context(|| format!("failed to open model at {}", dir.display()))?;
 
-        let config = LlamaConfig::from_json(manifest.config())
-            .context("failed to parse model config")?;
+        let config = manifest.config().clone();
+        let architecture = registry::detect_architecture(&config);
 
         let tensors = manifest.load_all_tensors()
             .context("failed to load tensors")?;
 
-        let model = LlamaModel::load_from_tensors(tensors, config.clone())
+        let model = registry::create_model(&architecture, tensors, &config)
             .context("failed to construct model")?;
 
         let tokenizer_path = dir.join("tokenizer.json");
@@ -47,16 +51,21 @@ impl MlxBackend {
         let chat_template = ChatTemplate::load(dir)
             .unwrap_or_else(|_| ChatTemplate::default_llama3());
 
-        let num_layers = config.num_hidden_layers as usize;
+        let num_layers = model.num_layers();
+        let max_position_embeddings = model.max_position_embeddings();
+        let hidden_size = model.hidden_size();
+        let vocab_size = model.vocab_size();
         let prefix_cache = PrefixCache::new(num_layers, 64);
 
         Ok(Self {
             model,
             tokenizer,
-            config,
             model_path: dir.display().to_string(),
             chat_template,
             prefix_cache,
+            max_position_embeddings,
+            hidden_size,
+            vocab_size,
         })
     }
 }
@@ -75,9 +84,9 @@ impl backend_trait::Backend for MlxBackend {
     fn model_info(&self) -> LoadedModelInfo {
         LoadedModelInfo {
             model_path: self.model_path.clone(),
-            context_length: Some(self.config.max_position_embeddings as usize),
-            embedding_dimension: Some(self.config.hidden_size as usize),
-            vocab_size: Some(self.config.vocab_size as usize),
+            context_length: Some(self.max_position_embeddings as usize),
+            embedding_dimension: Some(self.hidden_size as usize),
+            vocab_size: Some(self.vocab_size as usize),
         }
     }
 
