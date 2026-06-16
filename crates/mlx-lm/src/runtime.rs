@@ -167,6 +167,29 @@ impl Runtime {
     }
 
     pub fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput> {
+        let mut text = String::new();
+
+        let metrics = self.generate_with_callback(prompt, options, |piece| {
+            text.push_str(piece);
+            true
+        })?;
+
+        Ok(GenerateOutput {
+            text,
+            stop_reason: StopReason::Eos,
+            metrics,
+        })
+    }
+
+    pub fn generate_with_callback<F>(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+        mut on_token: F,
+    ) -> Result<GenerationMetrics>
+    where
+        F: FnMut(&str) -> bool,
+    {
         let start = Instant::now();
 
         let prompt_tokens = self.tokenize(prompt, true)?;
@@ -189,10 +212,8 @@ impl Runtime {
             .with_min_p(options.min_p);
         let mut sampler = sampler_config.build_llama_sampler();
 
-        // Decode loop
         let mut generated_tokens = 0usize;
         let mut output_text = String::new();
-        let mut stop_reason = StopReason::MaxTokens;
 
         // Sample first token from prefill logits
         let mut current_token = sampler.sample(self.context(), n_prompt as i32 - 1);
@@ -200,41 +221,44 @@ impl Runtime {
 
         if self.is_eog(current_token.0) {
             let total_s = start.elapsed().as_secs_f64();
-            return Ok(GenerateOutput {
-                text: String::new(),
-                stop_reason: StopReason::Eos,
-                metrics: GenerationMetrics {
-                    prompt_tokens: n_prompt,
-                    generated_tokens: 0,
-                    total_tokens: n_prompt,
-                    ttft_s: Some(ttft),
-                    total_s: Some(total_s),
-                    tokens_per_s: None,
-                },
+            return Ok(GenerationMetrics {
+                prompt_tokens: n_prompt,
+                generated_tokens: 0,
+                total_tokens: n_prompt,
+                ttft_s: Some(ttft),
+                total_s: Some(total_s),
+                tokens_per_s: None,
             });
         }
 
         let piece = self.detokenize(&[current_token.0])?;
+        if !on_token(&piece) {
+            let total_s = start.elapsed().as_secs_f64();
+            let tps = generated_tokens as f64 / (total_s - ttft).max(0.001);
+            return Ok(GenerationMetrics {
+                prompt_tokens: n_prompt,
+                generated_tokens,
+                total_tokens: n_prompt + generated_tokens,
+                ttft_s: Some(ttft),
+                total_s: Some(total_s),
+                tokens_per_s: Some(tps),
+            });
+        }
         output_text.push_str(&piece);
         generated_tokens += 1;
 
         // Check stop sequences
         if let Some(stops) = &options.stop {
             if stops.iter().any(|s| output_text.contains(s)) {
-                stop_reason = StopReason::Eos;
                 let total_s = start.elapsed().as_secs_f64();
                 let tps = generated_tokens as f64 / (total_s - ttft).max(0.001);
-                return Ok(GenerateOutput {
-                    text: output_text,
-                    stop_reason,
-                    metrics: GenerationMetrics {
-                        prompt_tokens: n_prompt,
-                        generated_tokens,
-                        total_tokens: n_prompt + generated_tokens,
-                        ttft_s: Some(ttft),
-                        total_s: Some(total_s),
-                        tokens_per_s: Some(tps),
-                    },
+                return Ok(GenerationMetrics {
+                    prompt_tokens: n_prompt,
+                    generated_tokens,
+                    total_tokens: n_prompt + generated_tokens,
+                    ttft_s: Some(ttft),
+                    total_s: Some(total_s),
+                    tokens_per_s: Some(tps),
                 });
             }
         }
@@ -250,11 +274,13 @@ impl Runtime {
             sampler.accept(next_token);
 
             if self.is_eog(next_token.0) {
-                stop_reason = StopReason::Eos;
                 break;
             }
 
             let piece = self.detokenize(&[next_token.0])?;
+            if !on_token(&piece) {
+                break;
+            }
             output_text.push_str(&piece);
             generated_tokens += 1;
             pos += 1;
@@ -263,7 +289,6 @@ impl Runtime {
             // Check stop sequences
             if let Some(stops) = &options.stop {
                 if stops.iter().any(|s| output_text.contains(s)) {
-                    stop_reason = StopReason::Eos;
                     break;
                 }
             }
@@ -277,17 +302,13 @@ impl Runtime {
             0.0
         };
 
-        Ok(GenerateOutput {
-            text: output_text,
-            stop_reason,
-            metrics: GenerationMetrics {
-                prompt_tokens: n_prompt,
-                generated_tokens,
-                total_tokens: n_prompt + generated_tokens,
-                ttft_s: Some(ttft),
-                total_s: Some(total_s),
-                tokens_per_s: Some(tps),
-            },
+        Ok(GenerationMetrics {
+            prompt_tokens: n_prompt,
+            generated_tokens,
+            total_tokens: n_prompt + generated_tokens,
+            ttft_s: Some(ttft),
+            total_s: Some(total_s),
+            tokens_per_s: Some(tps),
         })
     }
 }
@@ -493,5 +514,79 @@ mod tests {
 
         // Should have stopped - either by stop sequence or EOS
         assert!(output.metrics.generated_tokens <= 100);
+    }
+
+    #[test]
+    fn test_generate_streaming() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping streaming test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let config = LlamaCppConfig {
+            n_ctx: Some(2048),
+            ..Default::default()
+        };
+
+        let mut runtime = Runtime::new(&model_path, config).expect("Failed to load model");
+
+        let options = GenerationOptions {
+            max_tokens: Some(16),
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        let mut chunks = Vec::new();
+        let metrics = runtime
+            .generate_with_callback("Hello", &options, |piece| {
+                chunks.push(piece.to_string());
+                true
+            })
+            .expect("Streaming generation failed");
+
+        assert!(metrics.prompt_tokens > 0);
+        // Should have received at least one chunk
+        assert!(!chunks.is_empty() || metrics.generated_tokens == 0);
+        assert!(metrics.ttft_s.is_some());
+        assert!(metrics.total_s.is_some());
+    }
+
+    #[test]
+    fn test_generate_streaming_cancel() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping streaming cancel test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let config = LlamaCppConfig {
+            n_ctx: Some(2048),
+            ..Default::default()
+        };
+
+        let mut runtime = Runtime::new(&model_path, config).expect("Failed to load model");
+
+        let options = GenerationOptions {
+            max_tokens: Some(100),
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        let mut count = 0;
+        let metrics = runtime
+            .generate_with_callback("Count to ten.", &options, |_piece| {
+                count += 1;
+                count <= 3 // Cancel after 3 tokens
+            })
+            .expect("Streaming generation with cancel failed");
+
+        // Should have stopped early
+        assert!(count <= 4); // at most 3 accepted + 1 that triggered cancel
+        assert!(metrics.generated_tokens <= 4);
     }
 }

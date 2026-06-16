@@ -30,6 +30,18 @@ impl GenerationPipeline {
         self.runtime.generate(prompt, options)
     }
 
+    pub fn generate_stream<F>(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+        on_token: F,
+    ) -> anyhow::Result<GenerationMetrics>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.runtime.generate_with_callback(prompt, options, on_token)
+    }
+
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 use mlx_lm::config::LlamaCppConfig;
@@ -31,6 +32,9 @@ struct Args {
 
     #[arg(long, default_value = "You are a helpful assistant.")]
     system_prompt: String,
+
+    #[arg(long, default_value_t = false)]
+    stream: bool,
 }
 
 fn build_chat_prompt(system: &str, user: &str) -> String {
@@ -77,23 +81,42 @@ fn main() -> Result<()> {
         ..Default::default()
     };
 
-    let output = pipeline.generate(&prompt, &options)?;
-
-    println!("{}", output.text);
-    eprintln!("\n--- Metrics ---");
-    eprintln!("Prompt tokens: {}", output.metrics.prompt_tokens);
-    eprintln!("Generated tokens: {}", output.metrics.generated_tokens);
-    eprintln!("Total tokens: {}", output.metrics.total_tokens);
-    if let Some(ttft) = output.metrics.ttft_s {
-        eprintln!("Time to first token: {:.3}s", ttft);
+    if args.stream {
+        let metrics = pipeline.generate_stream(&prompt, &options, |piece| {
+            print!("{}", piece);
+            io::stdout().flush().ok();
+            true
+        })?;
+        eprintln!("\n--- Metrics ---");
+        eprintln!("Prompt tokens: {}", metrics.prompt_tokens);
+        eprintln!("Generated tokens: {}", metrics.generated_tokens);
+        if let Some(ttft) = metrics.ttft_s {
+            eprintln!("Time to first token: {:.3}s", ttft);
+        }
+        if let Some(total) = metrics.total_s {
+            eprintln!("Total time: {:.3}s", total);
+        }
+        if let Some(tps) = metrics.tokens_per_s {
+            eprintln!("Tokens/sec: {:.2}", tps);
+        }
+    } else {
+        let output = pipeline.generate(&prompt, &options)?;
+        println!("{}", output.text);
+        eprintln!("\n--- Metrics ---");
+        eprintln!("Prompt tokens: {}", output.metrics.prompt_tokens);
+        eprintln!("Generated tokens: {}", output.metrics.generated_tokens);
+        eprintln!("Total tokens: {}", output.metrics.total_tokens);
+        if let Some(ttft) = output.metrics.ttft_s {
+            eprintln!("Time to first token: {:.3}s", ttft);
+        }
+        if let Some(total) = output.metrics.total_s {
+            eprintln!("Total time: {:.3}s", total);
+        }
+        if let Some(tps) = output.metrics.tokens_per_s {
+            eprintln!("Tokens/sec: {:.2}", tps);
+        }
+        eprintln!("Stop reason: {:?}", output.stop_reason);
     }
-    if let Some(total) = output.metrics.total_s {
-        eprintln!("Total time: {:.3}s", total);
-    }
-    if let Some(tps) = output.metrics.tokens_per_s {
-        eprintln!("Tokens/sec: {:.2}", tps);
-    }
-    eprintln!("Stop reason: {:?}", output.stop_reason);
 
     Ok(())
 }

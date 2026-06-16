@@ -602,7 +602,7 @@ Completion notes:
 
 ### Milestone 1.8 - Streaming Text Generation
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -624,6 +624,13 @@ Acceptance:
   - multiple chunks
   - final chunk
   - cancellation does not panic
+
+Completion notes:
+
+- `runtime.rs`: Added `generate_with_callback(prompt, options, on_token: FnMut(&str) -> bool) -> Result<GenerationMetrics>`. Callback returns `true` to continue, `false` to cancel. Refactored `generate` to delegate to `generate_with_callback`.
+- `lib.rs`: Added `GenerationPipeline::generate_stream` that delegates to `runtime.generate_with_callback`.
+- `generate.rs`: Added `--stream` flag. When set, prints tokens to stdout as they arrive, flushes after each piece, metrics to stderr.
+- 30 tests pass (2 new env-gated: `test_generate_streaming`, `test_generate_streaming_cancel`).
 
 ### Milestone 1.9 - Server Load, Models, Health, Auth, Rate Limit
 
