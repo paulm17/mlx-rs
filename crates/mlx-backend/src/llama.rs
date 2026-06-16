@@ -455,7 +455,7 @@ mod tests {
         assert_eq!(kv.len(), 0);
         let k = Array::from_data_f32(&[1.0, 2.0], &[1, 2, 1]).unwrap();
         let v = Array::from_data_f32(&[3.0, 4.0], &[1, 2, 1]).unwrap();
-        let (k1, v1) = kv.update(&k, &v).unwrap();
+        let (k1, _v1) = kv.update(&k, &v).unwrap();
         assert_eq!(k1.shape(), vec![1, 2, 1]);
         assert_eq!(kv.len(), 1);
         let k2 = Array::from_data_f32(&[5.0, 6.0], &[1, 2, 1]).unwrap();

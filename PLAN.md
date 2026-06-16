@@ -1111,7 +1111,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 2.8 - MLX Chat Rendering And Tokenizer
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -1135,6 +1135,14 @@ Acceptance:
 
 - `/v1/chat/completions` works with MLX Llama backend.
 - Existing llama.cpp chat path unaffected.
+
+Completion notes (2026-06-16):
+
+- `chat_template.rs` (new): `ChatTemplate` struct loads Jinja2 template from `tokenizer_config.json` `chat_template` field. Supports single template string and array-of-dicts format (picks `default` name or first entry). Extracts `bos_token`/`eos_token` as string or `{content: ...}` object. Renders via `minijinja` crate with `messages`, `bos_token`, `eos_token`, `add_generation_prompt` context variables. Falls back to default Llama-3 template when config missing. 5 tests.
+- `mlx_backend.rs` (modified): Added `chat_template: ChatTemplate` field. `load()` now loads `ChatTemplate::load(dir)`. `apply_chat_template()` delegates to `self.chat_template.render(messages)` instead of hardcoded Llama-3 string formatting.
+- `Cargo.toml`: Added `minijinja = { version = "2", features = ["builtins"] }`.
+- `lib.rs`: Added `chat_template` module.
+- All 145 tests pass (88 llama-lm + 57 mlx-backend), cargo check clean, zero warnings.
 
 ### Milestone 2.9 - MLX KV Cache And Prefix Reuse
 

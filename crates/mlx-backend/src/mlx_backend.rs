@@ -8,6 +8,7 @@ use backend_trait::types::{
 };
 
 use crate::array::Array;
+use crate::chat_template::ChatTemplate;
 use crate::llama::{argmax, KvCache, LlamaConfig, LlamaModel};
 use crate::manifest::ModelManifest;
 
@@ -16,6 +17,7 @@ pub struct MlxBackend {
     tokenizer: tokenizers::Tokenizer,
     config: LlamaConfig,
     model_path: String,
+    chat_template: ChatTemplate,
 }
 
 impl MlxBackend {
@@ -40,11 +42,15 @@ impl MlxBackend {
             anyhow::bail!("tokenizer.json not found in {}", dir.display());
         };
 
+        let chat_template = ChatTemplate::load(dir)
+            .unwrap_or_else(|_| ChatTemplate::default_llama3());
+
         Ok(Self {
             model,
             tokenizer,
             config,
             model_path: dir.display().to_string(),
+            chat_template,
         })
     }
 }
@@ -116,12 +122,7 @@ impl backend_trait::Backend for MlxBackend {
     }
 
     fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
-        let mut conv = String::new();
-        for msg in messages {
-            conv.push_str(&format!("<|start_of_text|><|{}|>\n{}<|end_of_text|>\n", msg.role, msg.content));
-        }
-        conv.push_str("<|start_of_text|><|assistant|>\n");
-        Ok(conv)
+        self.chat_template.render(messages)
     }
 
     fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput> {

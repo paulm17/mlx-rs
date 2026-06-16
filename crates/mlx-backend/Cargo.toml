@@ -13,6 +13,7 @@ safetensors = "0.4"
 serde.workspace = true
 serde_json.workspace = true
 tokenizers = { version = "0.21", features = ["onig"] }
+minijinja = { version = "2", features = ["builtins"] }
 
 [dev-dependencies]
 tempfile = "3"
