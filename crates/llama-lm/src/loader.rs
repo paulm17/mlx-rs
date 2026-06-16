@@ -124,18 +124,6 @@ fn home_dir() -> Option<PathBuf> {
 fn download_hf_gguf(reference: &HfGgufReference, target: &Path) -> Result<()> {
     let local_dir = hf_cache_repo_dir(reference)?;
 
-    let hf_cli_status = Command::new("huggingface-cli")
-        .arg("download")
-        .arg(&reference.repo_id)
-        .arg(&reference.filename)
-        .arg("--local-dir")
-        .arg(&local_dir)
-        .status();
-
-    if matches!(hf_cli_status, Ok(status) if status.success()) {
-        return Ok(());
-    }
-
     let hf_status = Command::new("hf")
         .arg("download")
         .arg(&reference.repo_id)
@@ -145,6 +133,18 @@ fn download_hf_gguf(reference: &HfGgufReference, target: &Path) -> Result<()> {
         .status();
 
     if matches!(hf_status, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    let hf_cli_status = Command::new("huggingface-cli")
+        .arg("download")
+        .arg(&reference.repo_id)
+        .arg(&reference.filename)
+        .arg("--local-dir")
+        .arg(&local_dir)
+        .status();
+
+    if matches!(hf_cli_status, Ok(status) if status.success()) {
         return Ok(());
     }
 
@@ -167,7 +167,7 @@ fn download_hf_gguf(reference: &HfGgufReference, target: &Path) -> Result<()> {
     }
 
     bail!(
-        "Failed to download Hugging Face model {}/{}; install `huggingface-cli`/`hf`, or ensure `curl` can reach {}",
+        "Failed to download Hugging Face model {}/{}; install `hf`, or ensure `curl` can reach {}",
         reference.repo_id,
         reference.filename,
         url

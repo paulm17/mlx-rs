@@ -232,16 +232,21 @@ impl Runtime {
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| anyhow::anyhow!("Failed to create chat message: {}", e))?;
 
-        if let Some(ref tmpl) = template {
-            // Use native template with add_ass=true to get the assistant prefix
-            let result = self
-                .model
-                .apply_chat_template(tmpl, &chat_messages, true)
-                .map_err(|e| anyhow::anyhow!("Failed to apply chat template: {}", e))?;
-            return Ok(result);
-        }
+        let tmpl = if let Some(ref tmpl) = template {
+            let result = self.model.apply_chat_template(tmpl, &chat_messages, true);
+            if let Ok(result) = result {
+                return Ok(result);
+            }
+            Some(
+                tmpl.to_str()
+                    .map(|s| s.to_string())
+                    .unwrap_or_default(),
+            )
+        } else {
+            None
+        };
 
-        Ok(render_fallback_chat_template(messages))
+        Ok(render_fallback_chat_template(tmpl.as_deref(), messages))
     }
 
     pub fn generate(
@@ -421,7 +426,54 @@ impl Runtime {
     }
 }
 
-fn render_fallback_chat_template(messages: &[crate::types::ChatMessage]) -> String {
+fn render_fallback_chat_template(tmpl: Option<&str>, messages: &[crate::types::ChatMessage]) -> String {
+    let is_gemma_family = tmpl.map_or(false, |t| t.contains("<|turn|>") || t.contains("<start_of_turn>"));
+
+    if is_gemma_family {
+        render_gemma_chat_template(messages)
+    } else {
+        render_llama_chat_template(messages)
+    }
+}
+
+fn render_gemma_chat_template(messages: &[crate::types::ChatMessage]) -> String {
+    let system_prompt = messages
+        .iter()
+        .filter(|msg| msg.role == "system")
+        .map(|msg| msg.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut prompt = String::new();
+    let mut system_appended = false;
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {}
+            "user" => {
+                prompt.push_str("<|turn>user\n");
+                if !system_prompt.is_empty() && !system_appended {
+                    prompt.push_str(&system_prompt);
+                    prompt.push_str("\n\n");
+                    system_appended = true;
+                }
+                prompt.push_str(&msg.content);
+                prompt.push_str("<turn|>\n");
+            }
+            "assistant" => {
+                prompt.push_str("<|turn>model\n");
+                prompt.push_str(&msg.content);
+                prompt.push_str("<turn|>\n");
+            }
+            _ => {}
+        }
+    }
+
+    prompt.push_str("<|turn>model\n");
+    prompt
+}
+
+fn render_llama_chat_template(messages: &[crate::types::ChatMessage]) -> String {
     let system_prompt = messages
         .iter()
         .filter(|msg| msg.role == "system")
@@ -490,13 +542,13 @@ mod tests {
 
     #[test]
     fn test_fallback_chat_template_simple_user() {
-        let prompt = render_fallback_chat_template(&[ChatMessage::user("Hello")]);
+        let prompt = render_fallback_chat_template(None, &[ChatMessage::user("Hello")]);
         assert_eq!(prompt, "[INST] Hello [/INST]");
     }
 
     #[test]
     fn test_fallback_chat_template_system_user() {
-        let prompt = render_fallback_chat_template(&[
+        let prompt = render_fallback_chat_template(None, &[
             ChatMessage::system("You are helpful."),
             ChatMessage::user("Hello"),
         ]);
@@ -507,7 +559,7 @@ mod tests {
 
     #[test]
     fn test_fallback_chat_template_assistant_history() {
-        let prompt = render_fallback_chat_template(&[
+        let prompt = render_fallback_chat_template(None, &[
             ChatMessage::user("Hello"),
             ChatMessage::assistant("Hi there."),
             ChatMessage::user("How are you?"),
@@ -520,7 +572,7 @@ mod tests {
 
     #[test]
     fn test_fallback_chat_template_ignores_unsupported_tool_role() {
-        let prompt = render_fallback_chat_template(&[
+        let prompt = render_fallback_chat_template(None, &[
             ChatMessage::user("Hello"),
             ChatMessage {
                 role: "tool".to_string(),
@@ -528,6 +580,16 @@ mod tests {
             },
         ]);
         assert_eq!(prompt, "[INST] Hello [/INST]");
+    }
+
+    #[test]
+    fn test_fallback_chat_template_gemma_family() {
+        let prompt = render_fallback_chat_template(
+            Some("{%- macro format_parameters(properties...) %}...<|turn|>user\n..."),
+            &[ChatMessage::user("Hello")],
+        );
+        assert!(prompt.contains("<|turn>user\n"));
+        assert!(prompt.contains("<|turn>model\n"));
     }
 
     #[test]

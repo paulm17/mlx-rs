@@ -2,7 +2,6 @@
 bind = "127.0.0.1"
 port = 8080
 # model_path = "/path/to/model.gguf"
-# api_key = "secret"
 # rate_limit_rpm = 120
 
 # llama.cpp engine options
