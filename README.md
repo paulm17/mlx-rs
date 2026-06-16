@@ -16,12 +16,12 @@ Local LLM inference server and CLI powered by **llama.cpp** and **GGUF** models.
 
 - Rust 1.75+
 - CMake (for building llama.cpp from source)
-- A GGUF model file
+- A local GGUF model file, or a Hugging Face GGUF reference
 
 ## Quick Start
 
 ```bash
-MODEL=/path/to/model.gguf
+MODEL=unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf
 
 # Build
 cargo build --release
@@ -40,7 +40,9 @@ cargo run --release --bin generate -- \
 cargo run --release --bin llama-server -- --model "$MODEL"
 ```
 
-Model paths may point directly to a `.gguf` file, a directory containing one `.gguf`, or a complete split-GGUF shard set.
+Model inputs may point directly to a `.gguf` file, a directory containing one `.gguf`, a complete split-GGUF shard set, or a Hugging Face file reference in `owner/repo/file.gguf` form.
+
+Hugging Face references are downloaded automatically when missing locally. Downloads are cached under `$LLAMA_RS_MODEL_CACHE`, then `$HF_HOME/llama-rs/models`, then `~/.cache/llama-rs/models`. The downloader uses `huggingface-cli`, `hf`, or `curl`; set `HF_TOKEN` for gated or private models.
 
 ## Server API
 
@@ -129,7 +131,7 @@ n_gpu_layers = 99
 Usage: generate [OPTIONS] --model <MODEL>
 
 Options:
-  --model <MODEL>          Path to GGUF model or directory
+  --model <MODEL>          Path to GGUF model, directory, or Hugging Face GGUF file reference
   --config <CONFIG>        Config file [default: config.toml]
   --prompt <PROMPT>        Input prompt [default: "Hello, how are you?"]
   --max-tokens <N>         Max tokens to generate

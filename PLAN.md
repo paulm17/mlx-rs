@@ -408,9 +408,10 @@ Completion notes (2026-06-16):
 
 - `resolve_model_path` implemented in `loader.rs`
 - Handles: direct .gguf file, directory with single .gguf, directory with split GGUF shards (NNNNN-of-NNNNN pattern)
+- Handles Hugging Face GGUF file refs like `unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf` by downloading into a local cache when missing
 - Rejects: missing path, non-gguf file, safetensors/config.json directories, empty dirs, ambiguous multi-gguf dirs
 - Shard detection: parses `-NNNNN-of-NNNNN` suffix, groups by base name, returns first shard sorted by index
-- 12 loader tests: direct file, nonexistent, non-gguf, single in dir, split shards, multiple unrelated, safetensors, config.json only, empty dir, shard name parsing, not-shard patterns, unsorted shards
+- 19 loader tests: Hugging Face ref parsing/URL encoding plus direct file, nonexistent, non-gguf, single in dir, split shards, multiple unrelated, safetensors, config.json only, empty dir, shard name parsing, not-shard patterns, unsorted shards
 - Re-exported as `llama_lm::resolve_model_path`
 
 ### Milestone 1.4 - Choose And Pin llama.cpp Binding

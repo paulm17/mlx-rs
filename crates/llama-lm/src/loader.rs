@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
@@ -8,6 +9,7 @@ use anyhow::{bail, Context, Result};
 /// - A direct `.gguf` file path
 /// - A directory containing exactly one `.gguf` file
 /// - A directory containing split GGUF shards (e.g., `model-00001-of-00003.gguf`)
+/// - A Hugging Face reference like `owner/repo/model.gguf`
 ///
 /// Rejected inputs:
 /// - Missing paths
@@ -17,6 +19,9 @@ pub fn resolve_model_path(input: &str) -> Result<PathBuf> {
     let path = Path::new(input);
 
     if !path.exists() {
+        if let Some(reference) = parse_hf_gguf_reference(input) {
+            return resolve_hf_gguf_reference(&reference);
+        }
         bail!("Model path does not exist: {}", input);
     }
 
@@ -32,6 +37,169 @@ pub fn resolve_model_path(input: &str) -> Result<PathBuf> {
     }
 
     resolve_from_dir(path)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct HfGgufReference {
+    repo_id: String,
+    filename: String,
+}
+
+fn parse_hf_gguf_reference(input: &str) -> Option<HfGgufReference> {
+    if input.starts_with('/')
+        || input.starts_with("./")
+        || input.starts_with("../")
+        || input.contains("://")
+    {
+        return None;
+    }
+
+    let parts = input.split('/').collect::<Vec<_>>();
+    if parts.len() < 3 || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+
+    let filename = parts[2..].join("/");
+    if Path::new(&filename).extension().and_then(|e| e.to_str()) != Some("gguf") {
+        return None;
+    }
+
+    Some(HfGgufReference {
+        repo_id: format!("{}/{}", parts[0], parts[1]),
+        filename,
+    })
+}
+
+fn resolve_hf_gguf_reference(reference: &HfGgufReference) -> Result<PathBuf> {
+    let path = hf_cache_path(reference)?;
+    if path.exists() {
+        return Ok(path);
+    }
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("Failed to create model cache dir: {}", parent.display()))?;
+    }
+
+    download_hf_gguf(reference, &path)?;
+
+    if path.exists() {
+        Ok(path)
+    } else {
+        bail!(
+            "Download completed but model file was not found at {}",
+            path.display()
+        )
+    }
+}
+
+fn hf_cache_root() -> Result<PathBuf> {
+    let cache_root = if let Some(path) = std::env::var_os("LLAMA_RS_MODEL_CACHE") {
+        PathBuf::from(path)
+    } else if let Some(path) = std::env::var_os("HF_HOME") {
+        PathBuf::from(path).join("llama-rs").join("models")
+    } else {
+        home_dir()
+            .context("Cannot determine model cache directory; set LLAMA_RS_MODEL_CACHE")?
+            .join(".cache")
+            .join("llama-rs")
+            .join("models")
+    };
+
+    Ok(cache_root)
+}
+
+fn hf_cache_repo_dir(reference: &HfGgufReference) -> Result<PathBuf> {
+    Ok(hf_cache_root()?.join(reference.repo_id.replace('/', "--")))
+}
+
+fn hf_cache_path(reference: &HfGgufReference) -> Result<PathBuf> {
+    Ok(hf_cache_repo_dir(reference)?.join(&reference.filename))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(PathBuf::from)
+}
+
+fn download_hf_gguf(reference: &HfGgufReference, target: &Path) -> Result<()> {
+    let local_dir = hf_cache_repo_dir(reference)?;
+
+    let hf_cli_status = Command::new("huggingface-cli")
+        .arg("download")
+        .arg(&reference.repo_id)
+        .arg(&reference.filename)
+        .arg("--local-dir")
+        .arg(&local_dir)
+        .status();
+
+    if matches!(hf_cli_status, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    let hf_status = Command::new("hf")
+        .arg("download")
+        .arg(&reference.repo_id)
+        .arg(&reference.filename)
+        .arg("--local-dir")
+        .arg(&local_dir)
+        .status();
+
+    if matches!(hf_status, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    let url = hf_resolve_url(reference);
+    let mut curl = Command::new("curl");
+    curl.arg("--fail")
+        .arg("--location")
+        .arg("--create-dirs")
+        .arg("--output")
+        .arg(target);
+
+    if let Some(token) = std::env::var_os("HF_TOKEN") {
+        curl.arg("--header")
+            .arg(format!("Authorization: Bearer {}", token.to_string_lossy()));
+    }
+
+    let curl_status = curl.arg(&url).status();
+    if matches!(curl_status, Ok(status) if status.success()) {
+        return Ok(());
+    }
+
+    bail!(
+        "Failed to download Hugging Face model {}/{}; install `huggingface-cli`/`hf`, or ensure `curl` can reach {}",
+        reference.repo_id,
+        reference.filename,
+        url
+    )
+}
+
+fn hf_resolve_url(reference: &HfGgufReference) -> String {
+    format!(
+        "https://huggingface.co/{}/resolve/main/{}",
+        reference.repo_id,
+        url_path_encode(&reference.filename)
+    )
+}
+
+fn url_path_encode(path: &str) -> String {
+    path.split('/')
+        .map(url_component_encode)
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn url_component_encode(component: &str) -> String {
+    let mut encoded = String::new();
+    for byte in component.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                encoded.push(byte as char);
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 fn resolve_from_dir(dir: &Path) -> Result<PathBuf> {
@@ -178,6 +346,47 @@ mod tests {
 
     fn create_temp_dir() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
+    }
+
+    #[test]
+    fn test_parse_hf_gguf_reference() {
+        let reference =
+            parse_hf_gguf_reference("unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf")
+                .unwrap();
+
+        assert_eq!(reference.repo_id, "unsloth/gemma-4-E2B-it-GGUF");
+        assert_eq!(reference.filename, "gemma-4-E2B-it-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn test_parse_hf_gguf_reference_nested_file() {
+        let reference = parse_hf_gguf_reference("owner/repo/sub/dir/model.gguf").unwrap();
+
+        assert_eq!(reference.repo_id, "owner/repo");
+        assert_eq!(reference.filename, "sub/dir/model.gguf");
+    }
+
+    #[test]
+    fn test_parse_hf_gguf_reference_rejects_local_or_invalid_inputs() {
+        assert!(parse_hf_gguf_reference("./owner/repo/model.gguf").is_none());
+        assert!(parse_hf_gguf_reference("../owner/repo/model.gguf").is_none());
+        assert!(parse_hf_gguf_reference("/owner/repo/model.gguf").is_none());
+        assert!(parse_hf_gguf_reference("https://huggingface.co/owner/repo/model.gguf").is_none());
+        assert!(parse_hf_gguf_reference("owner/repo/model.bin").is_none());
+        assert!(parse_hf_gguf_reference("owner/repo").is_none());
+    }
+
+    #[test]
+    fn test_hf_resolve_url_encodes_filename_path() {
+        let reference = HfGgufReference {
+            repo_id: "owner/repo".to_string(),
+            filename: "sub dir/model file-Q4_K_M.gguf".to_string(),
+        };
+
+        assert_eq!(
+            hf_resolve_url(&reference),
+            "https://huggingface.co/owner/repo/resolve/main/sub%20dir/model%20file-Q4_K_M.gguf"
+        );
     }
 
     #[test]
