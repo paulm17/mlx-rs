@@ -856,7 +856,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 2.2 - Runner Process Protocol
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -887,6 +887,17 @@ Acceptance:
 
 - Mock runner can serve one completion through the main server.
 - Main server does not know whether backend is in-process or subprocess.
+
+Completion notes:
+
+- Created `runner.rs` with full protocol types: `StatusResponse`, `LoadRequest/LoadResponse`, `CompletionRequest/CompletionResponse`, `CompletionOptions`, `TokenizeRequest`.
+- `RunnerClient` implements `Backend` trait over raw TCP HTTP (no external HTTP client dependency). Uses line-delimited JSON (JSONL) for streaming completions.
+- Methods implemented: `tokenize`, `generate`, `generate_stream`, `generate_stream_output`, `model_info`. Methods that require model-side logic (`detokenize`, `is_eog`, `apply_chat_template`, `embed`) return clear unsupported errors.
+- `MockRunnerServer` serves `/v1/status`, `/v1/load`, `/v1/completions`, `/v1/tokenize` over TCP with configurable responses. Includes auto-shutdown via `Drop`.
+- 8 new tests: mock server status/tokenize/completions via reqwest, RunnerClient tokenize/generate/generate_stream/generate_stream_output, model_info.
+- Added `reqwest` (blocking+json) to dev-dependencies for mock server verification tests.
+- Exported `RunnerClient`, `CompletionRequest`, `CompletionResponse`, `CompletionOptions` from lib.rs.
+- All 87 tests pass, cargo check clean.
 
 ### Milestone 2.3 - MLX Dynamic Loader Skeleton
 
