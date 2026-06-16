@@ -1,8 +1,8 @@
-# mlx-rs Clean Break Plan: llama.cpp First, Ollama-Style MLX Later
+# llama-rs Clean Break Plan: llama.cpp First, Ollama-Style MLX Later
 
 Date: 2026-06-16
 
-This file is the durable working plan for replacing the current `mlx-rs` implementation. It is intentionally detailed because future sessions may have little context. Re-read this file before doing any implementation work.
+This file is the durable working plan for replacing the current `llama-rs` implementation. It is intentionally detailed because future sessions may have little context. Re-read this file before doing any implementation work.
 
 ## Goal
 
@@ -11,8 +11,8 @@ Make a clean break from the current hand-written Rust MLX stack.
 Phase 1 replaces the project with a llama.cpp-backed runtime that preserves the useful public API shape:
 
 - `generate` CLI
-- `mlx-server` CLI
-- `mlx_lm` high-level Rust facade
+- `llama-server` CLI
+- `llama_lm` high-level Rust facade
 - OpenAI-style `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`
 - config loading and server options
 
@@ -32,7 +32,7 @@ This is not the same as Ollama's MLX preview. Local inspection of `/Volumes/Data
 
 So this project should first become a good llama.cpp wrapper, then later grow an Ollama-style backend abstraction that can host MLX.
 
-## Current mlx-rs State To Discard
+## Current llama-rs State To Discard
 
 The current workspace contains these MLX-specific crates:
 
@@ -41,9 +41,9 @@ The current workspace contains these MLX-specific crates:
 - `crates/mlx-nn`
 - `crates/mlx-models`
 - `crates/mlx-vlm`
-- `crates/mlx-lm`
+- `crates/llama-lm`
 
-Only `crates/mlx-lm` should survive as the public facade name. Its internals should be rewritten.
+Only `crates/llama-lm` should survive as the public facade name. Its internals should be rewritten.
 
 The current APIs that expose `mlx_core::Array` are not portable and should be removed or replaced:
 
@@ -51,23 +51,23 @@ The current APIs that expose `mlx_core::Array` are not portable and should be re
 - `EmbeddingModel::forward_hidden_states(&Array) -> Array`
 - multimodal methods that take `pixel_values: Option<&Array>`
 
-Public compatibility target is not the MLX tensor API. Public compatibility target is CLI, server, JSON routes, config, prompts, callbacks, metrics, and the `mlx_lm` facade.
+Public compatibility target is not the MLX tensor API. Public compatibility target is CLI, server, JSON routes, config, prompts, callbacks, metrics, and the `llama_lm` facade.
 
 ## Reference Code To Revisit Before Work
 
-### Current mlx-rs
+### Current llama-rs
 
-- `/Volumes/Data/Users/paul/development/src/github/mlx-rs/Cargo.toml`
+- `/Volumes/Data/Users/paul/development/src/github/llama-rs/Cargo.toml`
   - Current workspace membership and binary declarations.
-- `/Volumes/Data/Users/paul/development/src/github/mlx-rs/crates/mlx-lm/src/lib.rs`
+- `/Volumes/Data/Users/paul/development/src/github/llama-rs/crates/llama-lm/src/lib.rs`
   - Current facade exports to preserve or deliberately replace.
-- `/Volumes/Data/Users/paul/development/src/github/mlx-rs/crates/mlx-lm/src/generate.rs`
+- `/Volumes/Data/Users/paul/development/src/github/llama-rs/crates/llama-lm/src/generate.rs`
   - Existing `GenerationPipeline`, `GenerationMetrics`, callback flow, stop handling.
-- `/Volumes/Data/Users/paul/development/src/github/mlx-rs/crates/mlx-lm/src/server.rs`
+- `/Volumes/Data/Users/paul/development/src/github/llama-rs/crates/llama-lm/src/server.rs`
   - Existing HTTP server behavior, config parsing, auth, rate limiting, embeddings response shape.
-- `/Volumes/Data/Users/paul/development/src/github/mlx-rs/src/bin/generate.rs`
+- `/Volumes/Data/Users/paul/development/src/github/llama-rs/src/bin/generate.rs`
   - Current CLI flags and stdout behavior.
-- `/Volumes/Data/Users/paul/development/src/github/mlx-rs/src/bin/mlx-server.rs`
+- `/Volumes/Data/Users/paul/development/src/github/llama-rs/src/bin/llama-server.rs`
   - Current server CLI flags.
 
 ### Ollama llama.cpp Path
@@ -262,10 +262,10 @@ Delete the MLX implementation and leave a minimal compiling Rust workspace skele
 Actions:
 
 - Replace root `Cargo.toml` workspace members with only:
-  - `crates/mlx-lm`
+  - `crates/llama-lm`
 - Keep root package only if needed for binaries:
   - `src/bin/generate.rs`
-  - `src/bin/mlx-server.rs`
+  - `src/bin/llama-server.rs`
 - Delete active use of:
   - `crates/mlx-sys`
   - `crates/mlx-core`
@@ -285,7 +285,7 @@ Actions:
   - `embed_bench`
 - Delete or quarantine MLX parity scripts and Python tests.
 - Keep `README.md`, `config.toml`, `AGENTS.md`, and this `PLAN.md`.
-- Make `crates/mlx-lm/src/lib.rs` compile with placeholder modules:
+- Make `crates/llama-lm/src/lib.rs` compile with placeholder modules:
   - `config`
   - `runtime`
   - `sampler`
@@ -304,9 +304,9 @@ Completion notes (2026-06-16):
 
 - Deleted crates: mlx-sys, mlx-core, mlx-nn, mlx-models, mlx-vlm
 - Deleted binaries: check_tokens, compare_all, compare_llm_layers, compare_logits, diagnose_first_token, diffusion_gemma_trace, embed_bench, generate_diag, simple_vision_test, test_gemma4, test_gemma4_vision
-- Deleted directories: python_tests/, scripts/, test_harness/, tests/, config/, crates/mlx-lm/src/bin/
-- Root Cargo.toml: workspace members reduced to `crates/mlx-lm` only; root package kept for generate + mlx-server binaries
-- mlx-lm placeholder modules: config, runtime, sampler, server, types
+- Deleted directories: python_tests/, scripts/, test_harness/, tests/, config/, crates/llama-lm/src/bin/
+- Root Cargo.toml: workspace members reduced to `crates/llama-lm` only; root package kept for generate + llama-server binaries
+- llama-lm placeholder modules: config, runtime, sampler, server, types
 - Binaries stub with "not yet implemented" exit
 - README updated to reflect llama.cpp rewrite status
 
@@ -320,7 +320,7 @@ Define the backend-neutral public API and config surface without real inference.
 
 Actions:
 
-- Define public types in `mlx-lm`:
+- Define public types in `llama-lm`:
   - `ServerConfig`
   - `Sampler`
   - `GenerationOptions`
@@ -361,7 +361,7 @@ Actions:
 
 Acceptance:
 
-- `cargo test -p mlx-lm config` passes.
+- `cargo test -p llama-lm config` passes.
 - `cargo check --workspace` passes.
 - Existing config files parse.
 
@@ -411,7 +411,7 @@ Completion notes (2026-06-16):
 - Rejects: missing path, non-gguf file, safetensors/config.json directories, empty dirs, ambiguous multi-gguf dirs
 - Shard detection: parses `-NNNNN-of-NNNNN` suffix, groups by base name, returns first shard sorted by index
 - 12 loader tests: direct file, nonexistent, non-gguf, single in dir, split shards, multiple unrelated, safetensors, config.json only, empty dir, shard name parsing, not-shard patterns, unsorted shards
-- Re-exported as `mlx_lm::resolve_model_path`
+- Re-exported as `llama_lm::resolve_model_path`
 
 ### Milestone 1.4 - Choose And Pin llama.cpp Binding
 
@@ -443,12 +443,12 @@ Actions:
 
 Acceptance:
 
-- `cargo check -p mlx-lm` links or at least compiles wrapper types.
+- `cargo check -p llama-lm` links or at least compiles wrapper types.
 - Document exact crate version and API mapping in this file.
 
 Completion notes (2026-06-16):
 
-- Selected `llama-cpp-2` v0.1.146 (with `llama-cpp-sys-2` v0.1.146)
+- Selected exact `llama-cpp-2` v0.1.146 pin (with `llama-cpp-sys-2` v0.1.146 in `Cargo.lock`)
 - No `build.rs` needed; crate builds llama.cpp from source via cmake
 - API mapping to llama.cpp C API:
   - `llama_backend_init` -> `llama_cpp_2::llama_backend::LlamaBackend`
@@ -514,7 +514,7 @@ Acceptance:
 
 Completion notes (2026-06-16):
 
-- Runtime struct holds LlamaModel + LlamaContext<'static> (lifetime transmute safe because model never moves)
+- Runtime struct holds `LlamaContext<'static>` followed by a boxed `LlamaModel`; the boxed model allocation is stable across `Runtime` moves and the context drops before the model
 - Backend initialization via `OnceLock<LlamaBackend>` (thread-safe, once-only)
 - Model params: n_gpu_layers, use_mmap, use_mlock via `LlamaModelParams::with_*`
 - Context params: n_ctx, n_batch, n_ubatch, n_threads, n_threads_batch, embeddings, pooling_type via `LlamaContextParams::with_*`
@@ -551,6 +551,14 @@ Acceptance:
   - non-empty tokenization
   - piece detokenization
   - EOS/EOG detection
+
+Completion notes (2026-06-16):
+
+- `Runtime::tokenize(&str, add_bos)` uses `LlamaModel::str_to_token` with `AddBos::Always` / `AddBos::Never`
+- `Runtime::detokenize(&[i32])` and `Runtime::detokenize_piece(i32)` use `LlamaModel::token_to_piece`
+- Generation reuses one UTF-8 decoder across sampled tokens so partial UTF-8 pieces can be buffered across token boundaries
+- EOS/EOG helpers exposed as `Runtime::token_eos()` and `Runtime::is_eog(i32)`
+- Env-gated GGUF tests cover tokenization, detokenization, single-piece detokenization, BOS behavior, and EOG detection
 
 ### Milestone 1.7 - Non-Streaming Text Generation
 
@@ -595,8 +603,10 @@ Completion notes:
 
 - `sampler.rs`: Added `build_llama_sampler()` that builds a `LlamaSampler::chain_simple` with top-k, top-p, min-p, temp, dist. Greedy when temperature <= 0.
 - `runtime.rs`: Added `generate(&mut self, prompt, options) -> Result<GenerateOutput>` with prefill batch, decode loop, EOG detection, stop sequence support, timing metrics.
+- `runtime.rs`: `generate` now preserves actual stop reasons (`Eos`, `MaxTokens`, `Cancelled`) instead of always reporting EOS.
 - `lib.rs`: `GenerationPipeline` now wraps `Runtime` with `new(model_path, config)` and `generate(prompt, options)`.
 - `server.rs`: Added `from_toml_str` method alongside `from_toml_path`.
+- `server.rs`: Added non-model tests for chat completion finish-reason mapping and OpenAI-style response shape.
 - `generate.rs`: CLI wired up with model resolution, config loading, chat mode, and metrics output.
 - 28 tests pass (2 new env-gated generate tests: `test_generate_non_streaming`, `test_generate_with_stop_sequence`).
 
@@ -628,9 +638,11 @@ Acceptance:
 Completion notes:
 
 - `runtime.rs`: Added `generate_with_callback(prompt, options, on_token: FnMut(&str) -> bool) -> Result<GenerationMetrics>`. Callback returns `true` to continue, `false` to cancel. Refactored `generate` to delegate to `generate_with_callback`.
+- `runtime.rs`: Added `generate_with_callback_output` so server streaming can preserve final stop reason and usage metrics.
 - `lib.rs`: Added `GenerationPipeline::generate_stream` that delegates to `runtime.generate_with_callback`.
 - `generate.rs`: Added `--stream` flag. When set, prints tokens to stdout as they arrive, flushes after each piece, metrics to stderr.
-- 30 tests pass (2 new env-gated: `test_generate_streaming`, `test_generate_streaming_cancel`).
+- `server.rs`: Streaming chunks now send raw SSE event data through Axum, include usage metrics on the final chunk, map final finish reason from runtime stop reason, and cancel generation when the receiver is closed.
+- Tests cover streaming chunk shape, final usage chunk, raw SSE event data, and closed-channel cancellation.
 
 ### Milestone 1.9 - Server Load, Models, Health, Auth, Rate Limit
 
@@ -676,8 +688,8 @@ Completion notes:
   - Startup preload: loads model from `model_path` or `model` config key on startup.
   - `unsafe impl Send for Runtime` for single-threaded tokio runtime compatibility.
 - Dependencies: added `axum`, `tokio`, `tokio-stream`.
-- `mlx-server.rs`: Wired up with `#[tokio::main]`, CLI overrides for bind/port/model/api_key/rpm.
-- 38 tests pass (8 new server tests: auth x4, rate limiter x2, health handler, prompt building).
+- `llama-server.rs`: Wired up with `#[tokio::main]`, CLI overrides for bind/port/model/api_key/rpm.
+- Tests cover auth helpers and handler failure, rate limiting, health without model, model list before load, env-gated model list after load, invalid load path, and prompt building.
 
 ### Milestone 1.10 - Embeddings
 
@@ -716,10 +728,10 @@ Acceptance:
 
 Completion notes:
 
-- `runtime.rs`: Added `embed(text) -> Result<Vec<f32>>`. Tokenizes input, runs decode, gets embeddings via `context.embeddings_seq_ith(0)`, normalizes L2. Returns error if embeddings not enabled.
+- `runtime.rs`: Added `embed(text) -> Result<Vec<f32>>`. Tokenizes input, clears KV cache, runs decode, gets embeddings via `context.embeddings_seq_ith(0)`, normalizes L2. Returns error if embeddings not enabled.
 - `server.rs`: Added `POST /v1/embeddings` endpoint. Accepts string or array of strings. Returns OpenAI-style response with `object: "list"`, `data[*].embedding`, `usage.prompt_tokens`. Auth and rate limiting applied.
 - `types.rs`: `EmbeddingData`, `EmbeddingOutput`, `EmbeddingUsage` already defined in milestone 1.2.
-- 41 tests pass (3 new: embedding request single/array input deserialization, response JSON shape).
+- Tests cover embedding request single/array input deserialization, token-array rejection, response JSON shape, non-embedding model unsupported error, and env-gated real embedding generation via `MLX_RS_TEST_EMBED_GGUF`.
 
 ### Milestone 1.11 - Chat Template Strategy
 
@@ -755,9 +767,9 @@ Acceptance:
 
 Completion notes:
 
-- `runtime.rs`: Added `apply_chat_template(messages) -> Result<String>`. Uses `model.chat_template(None)` to get native GGUF template, falls back to Llama2-style `[INST]` format. Uses `add_ass=true` to include assistant prefix.
+- `runtime.rs`: Added `apply_chat_template(messages) -> Result<String>`. Uses `model.chat_template(None)` to get native GGUF template, falls back to tested Llama2-style `[INST]` rendering. Uses `add_ass=true` to include assistant prefix.
 - `server.rs`: Updated both streaming and non-streaming chat completions to use `runtime.apply_chat_template` instead of hardcoded `build_prompt_from_messages`. Moved fallback helper to `#[cfg(test)]` only.
-- 41 tests pass, zero warnings.
+- Tests cover simple user, system + user, assistant history, unsupported tool role fallback behavior, and env-gated native GGUF template rendering.
 
 ### Milestone 1.12 - Documentation And Cleanup
 
@@ -776,7 +788,7 @@ Actions:
   - GGUF requirement
   - supported routes
   - example `generate`
-  - example `mlx-server`
+  - example `llama-server`
   - Metal/GPU layer config
   - embeddings support
   - unsupported VLM/diffusion status
@@ -789,10 +801,13 @@ Acceptance:
 Completion notes:
 
 - `README.md`: Full rewrite. Documents GGUF requirement, all server endpoints, generate CLI flags, config.toml format, Metal/GPU layer config, embeddings, non-goals.
+- `README.md`: Quick start now uses a `MODEL=/path/to/model.gguf` variable, documents accepted GGUF path forms, includes `/llm/load`, API key header behavior, and all llama.cpp config knobs from `config.toml`.
 - `config.toml`: Updated with llama.cpp engine options (n_ctx, n_batch, n_gpu_layers, etc.). All commented out as examples.
 - `generate.rs`: Replaced hardcoded `build_chat_prompt` with `pipeline.apply_chat_template` for native GGUF template support.
 - `lib.rs`: Exposed `apply_chat_template` on `GenerationPipeline`.
-- 41 tests pass, zero warnings.
+- `llama-server` CLI help no longer describes the server as an MLX chat server.
+- Removed stale MLX/parity ignore entries from `.gitignore`.
+- User-facing docs now describe Phase 1 as GGUF/llama.cpp only and list safetensors/MLX as unsupported.
 
 ## Phase 2: Ollama-Style Multi-Backend Foundation
 
@@ -920,7 +935,7 @@ Reference:
 - Ollama `x/mlxrunner/mlx/array.go`
 - Ollama `x/mlxrunner/mlx/ops.go`
 - Ollama `x/mlxrunner/mlx/memory.go`
-- Current mlx-rs `crates/mlx-core/src/array.rs` only as cautionary prior art.
+- Current llama-rs `crates/mlx-core/src/array.rs` only as cautionary prior art.
 
 Acceptance:
 
@@ -950,7 +965,7 @@ Reference:
 
 - Ollama `x/mlxrunner/model/root.go`
 - Ollama `x/mlxrunner/runner.go` `loadTensorsFromManifest`
-- Current mlx-rs `crates/mlx-nn/src/var_builder.rs`
+- Current llama-rs `crates/mlx-nn/src/var_builder.rs`
 
 Acceptance:
 
@@ -983,7 +998,7 @@ Reference:
 - Ollama `x/models/llama/llama.go`
 - Ollama `x/models/nn`
 - Ollama `x/mlxrunner/model/base/base.go`
-- Current mlx-rs `crates/mlx-models/src/llama.rs`
+- Current llama-rs `crates/mlx-models/src/llama.rs`
 
 Acceptance:
 
@@ -1001,7 +1016,7 @@ Run the MLX backend in a subprocess like Ollama.
 Actions:
 
 - Add a runner binary mode:
-  - `mlx-rs-runner --mlx-engine --model <path> --port <port>`
+  - `llama-rs-runner --mlx-engine --model <path> --port <port>`
   - or reuse root binary with a hidden runner subcommand.
 - Serve internal runner endpoints from Milestone 2.2.
 - Main server starts subprocess for safetensors models.
@@ -1039,7 +1054,7 @@ Reference:
 
 - Ollama `server/routes.go` `chatModeForModel`
 - Ollama `x/mlxrunner/client.go` returns unsupported for native chat template.
-- Current mlx-rs `crates/mlx-lm/src/chat_template.rs`
+- Current llama-rs `crates/llama-lm/src/chat_template.rs`
 
 Acceptance:
 
@@ -1064,7 +1079,7 @@ Reference:
 
 - Ollama `x/mlxrunner/cache.go`
 - Ollama `x/mlxrunner/cache/`
-- Current mlx-rs `crates/mlx-nn/src/kv_cache.rs`
+- Current llama-rs `crates/mlx-nn/src/kv_cache.rs`
 
 Acceptance:
 
@@ -1094,7 +1109,7 @@ Reference:
 
 - Ollama `x/mlxrunner/imports.go`
 - Ollama `x/models/*`
-- Current mlx-rs `crates/mlx-models/src/*`
+- Current llama-rs `crates/mlx-models/src/*`
 
 Acceptance:
 
@@ -1185,7 +1200,7 @@ Acceptance:
 
 These are explicitly out of scope for the first llama.cpp rewrite:
 
-- Reproducing Python `mlx_lm` parity.
+- Reproducing Python `llama_lm` parity.
 - Keeping `mlx_core::Array` public APIs.
 - Supporting safetensors in Phase 1.
 - Supporting Gemma4 VLM in Phase 1.
@@ -1216,4 +1231,3 @@ Before implementing anything:
 5. Complete only the next milestone.
 6. Run the milestone acceptance checks.
 7. Update milestone status and notes in this file.
-

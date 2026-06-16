@@ -1,10 +1,6 @@
 .env
 /target
-/mlx
 /moe_harness_artifacts
-/parity_artifacts
 /clone
 /logs
 /tmp_models
-/mlx-vlm
-test_harness/target/

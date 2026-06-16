@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::Parser;
 
-/// MLX-RS local chat server (llama.cpp backend).
+/// Local chat server powered by llama.cpp and GGUF models.
 #[derive(Parser, Debug)]
-#[command(name = "mlx-server", about = "Start local MLX chat server")]
+#[command(name = "llama-server", about = "Start local llama.cpp/GGUF chat server")]
 struct Args {
     /// Path to TOML config file
     #[arg(long, default_value = "config.toml")]
@@ -34,7 +34,7 @@ struct Args {
 async fn main() -> Result<()> {
     let args = Args::parse();
 
-    let mut config = mlx_lm::ServerConfig::from_toml_path(&args.config)?;
+    let mut config = llama_lm::ServerConfig::from_toml_path(&args.config)?;
 
     if let Some(bind) = args.bind {
         config.bind = Some(bind);
@@ -52,5 +52,5 @@ async fn main() -> Result<()> {
         config.rate_limit_rpm = Some(rpm);
     }
 
-    mlx_lm::run_server(config).await
+    llama_lm::run_server(config).await
 }

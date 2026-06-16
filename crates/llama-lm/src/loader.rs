@@ -24,10 +24,7 @@ pub fn resolve_model_path(input: &str) -> Result<PathBuf> {
         if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
             return Ok(path.to_path_buf());
         }
-        bail!(
-            "Model file is not a GGUF file: {}",
-            path.display()
-        );
+        bail!("Model file is not a GGUF file: {}", path.display());
     }
 
     if !path.is_dir() {
@@ -51,12 +48,12 @@ fn resolve_from_dir(dir: &Path) -> Result<PathBuf> {
 
     if gguf_files.is_empty() {
         // Check if this looks like a safetensors/MLX directory
-        let has_safetensors = entries.iter().any(|p| {
-            p.extension().and_then(|e| e.to_str()) == Some("safetensors")
-        });
-        let has_config_json = entries.iter().any(|p| {
-            p.file_name().and_then(|n| n.to_str()) == Some("config.json")
-        });
+        let has_safetensors = entries
+            .iter()
+            .any(|p| p.extension().and_then(|e| e.to_str()) == Some("safetensors"));
+        let has_config_json = entries
+            .iter()
+            .any(|p| p.file_name().and_then(|n| n.to_str()) == Some("config.json"));
 
         if has_safetensors || has_config_json {
             bail!(
@@ -72,7 +69,7 @@ fn resolve_from_dir(dir: &Path) -> Result<PathBuf> {
         return Ok(gguf_files[0].clone());
     }
 
-    // Multiple GGUF files — check if they are split shards
+    // Multiple GGUF files - accept only one complete split shard set.
     if let Some(first_shard) = try_resolve_split_shards(&gguf_files) {
         return Ok(first_shard);
     }
@@ -94,14 +91,13 @@ fn try_resolve_split_shards(files: &[&PathBuf]) -> Option<PathBuf> {
     for file in files {
         let name = file.file_stem()?.to_str()?;
         if let Some((base, _shard_info)) = parse_shard_name(name) {
-            shard_groups
-                .entry(base.to_string())
-                .or_default()
-                .push(file);
+            shard_groups.entry(base.to_string()).or_default().push(file);
+        } else {
+            return None;
         }
     }
 
-    // Only accept if exactly one shard group exists
+    // Only accept if exactly one shard group exists.
     if shard_groups.len() != 1 {
         return None;
     }
@@ -111,7 +107,42 @@ fn try_resolve_split_shards(files: &[&PathBuf]) -> Option<PathBuf> {
         return None;
     }
 
-    // Sort by shard number to get the first shard
+    let mut indexes = Vec::with_capacity(shards.len());
+    let mut expected_total = None;
+
+    for shard in &shards {
+        let (_base, (idx, total)) = shard
+            .file_stem()
+            .and_then(|n| n.to_str())
+            .and_then(parse_shard_name)?;
+
+        if idx == 0 || idx > total {
+            return None;
+        }
+
+        if let Some(previous_total) = expected_total {
+            if previous_total != total {
+                return None;
+            }
+        } else {
+            expected_total = Some(total);
+        }
+
+        indexes.push(idx);
+    }
+
+    let total = expected_total?;
+    if shards.len() != total as usize {
+        return None;
+    }
+
+    indexes.sort_unstable();
+    indexes.dedup();
+    if indexes.len() != total as usize || indexes != (1..=total).collect::<Vec<_>>() {
+        return None;
+    }
+
+    // Sort by shard number to get the first shard.
     shards.sort_by_key(|p| {
         p.file_stem()
             .and_then(|n| n.to_str())
@@ -201,7 +232,10 @@ mod tests {
         fs::write(dir.path().join("model_b.gguf"), b"fake").unwrap();
         let result = resolve_model_path(dir.path().to_str().unwrap());
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("Multiple unrelated"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple unrelated"));
     }
 
     #[test]
@@ -258,5 +292,45 @@ mod tests {
         fs::write(dir.path().join("m-00002-of-00003.gguf"), b"fake").unwrap();
         let result = resolve_model_path(dir.path().to_str().unwrap()).unwrap();
         assert_eq!(result, dir.path().join("m-00001-of-00003.gguf"));
+    }
+
+    #[test]
+    fn test_dir_split_shards_with_unrelated_gguf_rejected() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("m-00001-of-00002.gguf"), b"fake").unwrap();
+        fs::write(dir.path().join("m-00002-of-00002.gguf"), b"fake").unwrap();
+        fs::write(dir.path().join("other.gguf"), b"fake").unwrap();
+        let result = resolve_model_path(dir.path().to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple unrelated"));
+    }
+
+    #[test]
+    fn test_dir_incomplete_split_shards_rejected() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("m-00001-of-00003.gguf"), b"fake").unwrap();
+        fs::write(dir.path().join("m-00002-of-00003.gguf"), b"fake").unwrap();
+        let result = resolve_model_path(dir.path().to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple unrelated"));
+    }
+
+    #[test]
+    fn test_dir_duplicate_split_shards_rejected() {
+        let dir = create_temp_dir();
+        fs::write(dir.path().join("m-00001-of-00002.gguf"), b"fake").unwrap();
+        fs::write(dir.path().join("m-copy-00001-of-00002.gguf"), b"fake").unwrap();
+        let result = resolve_model_path(dir.path().to_str().unwrap());
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("Multiple unrelated"));
     }
 }

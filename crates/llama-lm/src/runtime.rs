@@ -14,7 +14,9 @@ use llama_cpp_2::token::LlamaToken;
 
 use crate::config::LlamaCppConfig;
 use crate::sampler::Sampler;
-use crate::types::{GenerateOutput, GenerationMetrics, GenerationOptions, StopReason, LoadedModelInfo};
+use crate::types::{
+    GenerateOutput, GenerationMetrics, GenerationOptions, LoadedModelInfo, StopReason,
+};
 
 fn ensure_backend() -> &'static LlamaBackend {
     static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
@@ -22,8 +24,8 @@ fn ensure_backend() -> &'static LlamaBackend {
 }
 
 pub struct Runtime {
-    model: LlamaModel,
     context: LlamaContext<'static>,
+    model: Box<LlamaModel>,
     model_path: String,
     embeddings_enabled: bool,
 }
@@ -49,13 +51,14 @@ impl Runtime {
             model_params = model_params.with_use_mlock(use_mlock);
         }
 
-        let model = LlamaModel::load_from_file(backend, path, &model_params)
-            .map_err(|e| anyhow::anyhow!("Failed to load model from {}: {}", model_path, e))?;
+        let model = Box::new(
+            LlamaModel::load_from_file(backend, path, &model_params)
+                .map_err(|e| anyhow::anyhow!("Failed to load model from {}: {}", model_path, e))?,
+        );
 
         // Context params
         let embeddings_enabled = config.embedding.unwrap_or(false);
-        let mut ctx_params = LlamaContextParams::default()
-            .with_embeddings(embeddings_enabled);
+        let mut ctx_params = LlamaContextParams::default().with_embeddings(embeddings_enabled);
 
         if let Some(n_ctx) = config.n_ctx {
             ctx_params = ctx_params.with_n_ctx(NonZeroU32::new(n_ctx));
@@ -83,17 +86,16 @@ impl Runtime {
             ctx_params = ctx_params.with_pooling_type(pooling_type);
         }
 
-        // Safety: model lives as long as this Runtime, and context borrows from model.
-        // We transmute the lifetime to 'static, which is safe because we never move
-        // the model out of this struct.
-        let model_ref: &'static LlamaModel = unsafe { std::mem::transmute(&model) };
+        // Safety: the model allocation is stable behind Box, and Runtime declares
+        // context before model so the context is dropped first.
+        let model_ref: &'static LlamaModel = unsafe { std::mem::transmute(&*model) };
         let context = model_ref
             .new_context(backend, ctx_params)
             .map_err(|e| anyhow::anyhow!("Failed to create context: {}", e))?;
 
         Ok(Self {
-            model,
             context,
+            model,
             model_path: model_path.to_string(),
             embeddings_enabled,
         })
@@ -141,8 +143,13 @@ impl Runtime {
     }
 
     pub fn tokenize(&self, text: &str, add_bos: bool) -> Result<Vec<i32>> {
-        let bos = if add_bos { AddBos::Always } else { AddBos::Never };
-        let tokens = self.model
+        let bos = if add_bos {
+            AddBos::Always
+        } else {
+            AddBos::Never
+        };
+        let tokens = self
+            .model
             .str_to_token(text, bos)
             .map_err(|e| anyhow::anyhow!("Tokenization failed: {}", e))?;
         Ok(tokens.into_iter().map(|t| t.0).collect())
@@ -152,13 +159,25 @@ impl Runtime {
         let mut decoder = encoding_rs::UTF_8.new_decoder();
         let mut result = String::new();
         for &token_id in tokens {
-            let token = llama_cpp_2::token::LlamaToken(token_id);
-            let piece = self.model
-                .token_to_piece(token, &mut decoder, false, None)
-                .map_err(|e| anyhow::anyhow!("Detokenization failed for token {}: {}", token_id, e))?;
-            result.push_str(&piece);
+            result.push_str(&self.detokenize_piece_with_decoder(token_id, &mut decoder)?);
         }
         Ok(result)
+    }
+
+    pub fn detokenize_piece(&self, token_id: i32) -> Result<String> {
+        let mut decoder = encoding_rs::UTF_8.new_decoder();
+        self.detokenize_piece_with_decoder(token_id, &mut decoder)
+    }
+
+    fn detokenize_piece_with_decoder(
+        &self,
+        token_id: i32,
+        decoder: &mut encoding_rs::Decoder,
+    ) -> Result<String> {
+        let token = llama_cpp_2::token::LlamaToken(token_id);
+        self.model
+            .token_to_piece(token, decoder, false, None)
+            .map_err(|e| anyhow::anyhow!("Detokenization failed for token {}: {}", token_id, e))
     }
 
     pub fn is_eog(&self, token_id: i32) -> bool {
@@ -177,6 +196,8 @@ impl Runtime {
 
         let tokens = self.tokenize(text, true)?;
         let n_tokens = tokens.len();
+
+        self.context.clear_kv_cache();
 
         let mut batch = LlamaBatch::new(n_tokens, 1);
         for (i, &token_id) in tokens.iter().enumerate() {
@@ -220,51 +241,47 @@ impl Runtime {
             return Ok(result);
         }
 
-        // Fallback: Llama2-style template
-        let mut prompt = String::new();
-        for msg in messages {
-            match msg.role.as_str() {
-                "system" => {
-                    prompt.push_str(&format!("[INST] <<SYS>>\n{}\n<</SYS>>\n\n", msg.content));
-                }
-                "user" => {
-                    if prompt.is_empty() {
-                        prompt.push_str(&format!("[INST] {} [/INST]", msg.content));
-                    } else {
-                        prompt.push_str(&format!("{} [/INST]", msg.content));
-                    }
-                }
-                "assistant" => {
-                    prompt.push_str(&msg.content);
-                    prompt.push_str(" ");
-                }
-                _ => {}
-            }
-        }
-        Ok(prompt)
+        Ok(render_fallback_chat_template(messages))
     }
 
-    pub fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput> {
-        let mut text = String::new();
-
-        let metrics = self.generate_with_callback(prompt, options, |piece| {
-            text.push_str(piece);
-            true
-        })?;
-
-        Ok(GenerateOutput {
-            text,
-            stop_reason: StopReason::Eos,
-            metrics,
-        })
+    pub fn generate(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+    ) -> Result<GenerateOutput> {
+        self.generate_inner(prompt, options, |_| true)
     }
 
     pub fn generate_with_callback<F>(
         &mut self,
         prompt: &str,
         options: &GenerationOptions,
-        mut on_token: F,
+        on_token: F,
     ) -> Result<GenerationMetrics>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        Ok(self.generate_inner(prompt, options, on_token)?.metrics)
+    }
+
+    pub fn generate_with_callback_output<F>(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+        on_token: F,
+    ) -> Result<GenerateOutput>
+    where
+        F: FnMut(&str) -> bool,
+    {
+        self.generate_inner(prompt, options, on_token)
+    }
+
+    fn generate_inner<F>(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+        mut on_token: F,
+    ) -> Result<GenerateOutput>
     where
         F: FnMut(&str) -> bool,
     {
@@ -284,6 +301,14 @@ impl Runtime {
 
         let ttft = start.elapsed().as_secs_f64();
 
+        if max_tokens == 0 {
+            return Ok(GenerateOutput {
+                text: String::new(),
+                stop_reason: StopReason::MaxTokens,
+                metrics: self.generation_metrics(start, ttft, n_prompt, 0),
+            });
+        }
+
         // Build sampler
         let sampler_config = Sampler::new(options.temperature, options.top_p)
             .with_top_k(options.top_k)
@@ -292,34 +317,26 @@ impl Runtime {
 
         let mut generated_tokens = 0usize;
         let mut output_text = String::new();
+        let mut token_decoder = encoding_rs::UTF_8.new_decoder();
 
         // Sample first token from prefill logits
         let mut current_token = sampler.sample(self.context(), n_prompt as i32 - 1);
         sampler.accept(current_token);
 
         if self.is_eog(current_token.0) {
-            let total_s = start.elapsed().as_secs_f64();
-            return Ok(GenerationMetrics {
-                prompt_tokens: n_prompt,
-                generated_tokens: 0,
-                total_tokens: n_prompt,
-                ttft_s: Some(ttft),
-                total_s: Some(total_s),
-                tokens_per_s: None,
+            return Ok(GenerateOutput {
+                text: output_text,
+                stop_reason: StopReason::Eos,
+                metrics: self.generation_metrics(start, ttft, n_prompt, generated_tokens),
             });
         }
 
-        let piece = self.detokenize(&[current_token.0])?;
+        let piece = self.detokenize_piece_with_decoder(current_token.0, &mut token_decoder)?;
         if !on_token(&piece) {
-            let total_s = start.elapsed().as_secs_f64();
-            let tps = generated_tokens as f64 / (total_s - ttft).max(0.001);
-            return Ok(GenerationMetrics {
-                prompt_tokens: n_prompt,
-                generated_tokens,
-                total_tokens: n_prompt + generated_tokens,
-                ttft_s: Some(ttft),
-                total_s: Some(total_s),
-                tokens_per_s: Some(tps),
+            return Ok(GenerateOutput {
+                text: output_text,
+                stop_reason: StopReason::Cancelled,
+                metrics: self.generation_metrics(start, ttft, n_prompt, generated_tokens),
             });
         }
         output_text.push_str(&piece);
@@ -328,21 +345,17 @@ impl Runtime {
         // Check stop sequences
         if let Some(stops) = &options.stop {
             if stops.iter().any(|s| output_text.contains(s)) {
-                let total_s = start.elapsed().as_secs_f64();
-                let tps = generated_tokens as f64 / (total_s - ttft).max(0.001);
-                return Ok(GenerationMetrics {
-                    prompt_tokens: n_prompt,
-                    generated_tokens,
-                    total_tokens: n_prompt + generated_tokens,
-                    ttft_s: Some(ttft),
-                    total_s: Some(total_s),
-                    tokens_per_s: Some(tps),
+                return Ok(GenerateOutput {
+                    text: output_text,
+                    stop_reason: StopReason::Eos,
+                    metrics: self.generation_metrics(start, ttft, n_prompt, generated_tokens),
                 });
             }
         }
 
         // Continue decoding
         let mut pos = n_prompt as i32;
+        let mut stop_reason = StopReason::MaxTokens;
         while generated_tokens < max_tokens {
             let mut batch = LlamaBatch::new(1, 1);
             batch.add(current_token, pos, &[0], true)?;
@@ -352,11 +365,13 @@ impl Runtime {
             sampler.accept(next_token);
 
             if self.is_eog(next_token.0) {
+                stop_reason = StopReason::Eos;
                 break;
             }
 
-            let piece = self.detokenize(&[next_token.0])?;
+            let piece = self.detokenize_piece_with_decoder(next_token.0, &mut token_decoder)?;
             if !on_token(&piece) {
+                stop_reason = StopReason::Cancelled;
                 break;
             }
             output_text.push_str(&piece);
@@ -367,11 +382,26 @@ impl Runtime {
             // Check stop sequences
             if let Some(stops) = &options.stop {
                 if stops.iter().any(|s| output_text.contains(s)) {
+                    stop_reason = StopReason::Eos;
                     break;
                 }
             }
         }
 
+        Ok(GenerateOutput {
+            text: output_text,
+            stop_reason,
+            metrics: self.generation_metrics(start, ttft, n_prompt, generated_tokens),
+        })
+    }
+
+    fn generation_metrics(
+        &self,
+        start: Instant,
+        ttft: f64,
+        prompt_tokens: usize,
+        generated_tokens: usize,
+    ) -> GenerationMetrics {
         let total_s = start.elapsed().as_secs_f64();
         let decode_time = total_s - ttft;
         let tps = if decode_time > 0.001 {
@@ -380,20 +410,69 @@ impl Runtime {
             0.0
         };
 
-        Ok(GenerationMetrics {
-            prompt_tokens: n_prompt,
+        GenerationMetrics {
+            prompt_tokens,
             generated_tokens,
-            total_tokens: n_prompt + generated_tokens,
+            total_tokens: prompt_tokens + generated_tokens,
             ttft_s: Some(ttft),
             total_s: Some(total_s),
             tokens_per_s: Some(tps),
-        })
+        }
+    }
+}
+
+fn render_fallback_chat_template(messages: &[crate::types::ChatMessage]) -> String {
+    let system_prompt = messages
+        .iter()
+        .filter(|msg| msg.role == "system")
+        .map(|msg| msg.content.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut prompt = String::new();
+    let mut first_user = true;
+
+    for msg in messages {
+        match msg.role.as_str() {
+            "system" => {}
+            "user" => {
+                if first_user {
+                    prompt.push_str("[INST] ");
+                    if !system_prompt.is_empty() {
+                        prompt.push_str("<<SYS>>\n");
+                        prompt.push_str(&system_prompt);
+                        prompt.push_str("\n<</SYS>>\n\n");
+                    }
+                    prompt.push_str(&msg.content);
+                    prompt.push_str(" [/INST]");
+                    first_user = false;
+                } else {
+                    prompt.push_str(" [INST] ");
+                    prompt.push_str(&msg.content);
+                    prompt.push_str(" [/INST]");
+                }
+            }
+            "assistant" => {
+                if !prompt.is_empty() {
+                    prompt.push(' ');
+                }
+                prompt.push_str(&msg.content);
+            }
+            _ => {}
+        }
+    }
+
+    if prompt.is_empty() && !system_prompt.is_empty() {
+        format!("[INST] <<SYS>>\n{}\n<</SYS>>\n\n [/INST]", system_prompt)
+    } else {
+        prompt
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::ChatMessage;
 
     #[test]
     fn test_runtime_not_implemented_without_model() {
@@ -407,6 +486,48 @@ mod tests {
     fn test_backend_init() {
         // Should not panic
         let _backend = ensure_backend();
+    }
+
+    #[test]
+    fn test_fallback_chat_template_simple_user() {
+        let prompt = render_fallback_chat_template(&[ChatMessage::user("Hello")]);
+        assert_eq!(prompt, "[INST] Hello [/INST]");
+    }
+
+    #[test]
+    fn test_fallback_chat_template_system_user() {
+        let prompt = render_fallback_chat_template(&[
+            ChatMessage::system("You are helpful."),
+            ChatMessage::user("Hello"),
+        ]);
+        assert!(prompt.contains("[INST]"));
+        assert!(prompt.contains("<<SYS>>\nYou are helpful.\n<</SYS>>"));
+        assert!(prompt.ends_with("Hello [/INST]"));
+    }
+
+    #[test]
+    fn test_fallback_chat_template_assistant_history() {
+        let prompt = render_fallback_chat_template(&[
+            ChatMessage::user("Hello"),
+            ChatMessage::assistant("Hi there."),
+            ChatMessage::user("How are you?"),
+        ]);
+        assert_eq!(
+            prompt,
+            "[INST] Hello [/INST] Hi there. [INST] How are you? [/INST]"
+        );
+    }
+
+    #[test]
+    fn test_fallback_chat_template_ignores_unsupported_tool_role() {
+        let prompt = render_fallback_chat_template(&[
+            ChatMessage::user("Hello"),
+            ChatMessage {
+                role: "tool".to_string(),
+                content: "ignored".to_string(),
+            },
+        ]);
+        assert_eq!(prompt, "[INST] Hello [/INST]");
     }
 
     #[test]
@@ -440,6 +561,37 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_chat_template_with_real_model() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping real chat template test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let runtime = Runtime::new(
+            &model_path,
+            LlamaCppConfig {
+                n_ctx: Some(512),
+                n_gpu_layers: Some(0),
+                ..Default::default()
+            },
+        )
+        .expect("Failed to load model");
+
+        let prompt = runtime
+            .apply_chat_template(&[
+                ChatMessage::system("You are helpful."),
+                ChatMessage::user("Hello"),
+            ])
+            .expect("Chat template should render");
+
+        assert!(prompt.contains("Hello"));
+        assert!(!prompt.trim().is_empty());
+    }
+
+    #[test]
     fn test_runtime_with_embeddings() {
         let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
             Ok(p) => p,
@@ -457,6 +609,37 @@ mod tests {
 
         let runtime = Runtime::new(&model_path, config).expect("Failed to load model");
         assert!(runtime.embeddings_enabled());
+    }
+
+    #[test]
+    fn test_embed_with_real_embedding_model() {
+        let model_path = match std::env::var("MLX_RS_TEST_EMBED_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping real embedding test: MLX_RS_TEST_EMBED_GGUF not set");
+                return;
+            }
+        };
+
+        let config = LlamaCppConfig {
+            n_ctx: Some(512),
+            embedding: Some(true),
+            pooling: Some("mean".to_string()),
+            ..Default::default()
+        };
+
+        let mut runtime =
+            Runtime::new(&model_path, config).expect("Failed to load embedding model");
+        let embedding = runtime.embed("hello world").expect("Embedding failed");
+        assert_eq!(embedding.len(), runtime.embedding_dimension() as usize);
+
+        let norm = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        assert!((norm - 1.0).abs() < 1e-3 || norm == 0.0);
+
+        let second = runtime
+            .embed("goodbye world")
+            .expect("Second embedding failed");
+        assert_eq!(second.len(), embedding.len());
     }
 
     #[test]
@@ -481,6 +664,11 @@ mod tests {
 
         let detokenized = runtime.detokenize(&tokens).expect("Detokenization failed");
         assert_eq!(detokenized, text);
+
+        let first_piece = runtime
+            .detokenize_piece(tokens[0])
+            .expect("Piece detokenization failed");
+        assert!(!first_piece.is_empty());
     }
 
     #[test]
@@ -550,7 +738,9 @@ mod tests {
             ..Default::default()
         };
 
-        let output = runtime.generate("Hello", &options).expect("Generation failed");
+        let output = runtime
+            .generate("Hello", &options)
+            .expect("Generation failed");
 
         assert!(output.metrics.prompt_tokens > 0);
         assert!(output.metrics.total_tokens > output.metrics.prompt_tokens);
@@ -588,7 +778,9 @@ mod tests {
             ..Default::default()
         };
 
-        let output = runtime.generate("Count to five.", &options).expect("Generation failed");
+        let output = runtime
+            .generate("Count to five.", &options)
+            .expect("Generation failed");
 
         // Should have stopped - either by stop sequence or EOS
         assert!(output.metrics.generated_tokens <= 100);

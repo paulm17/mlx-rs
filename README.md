@@ -1,10 +1,10 @@
-# mlx-rs
+# llama-rs
 
 Local LLM inference server and CLI powered by **llama.cpp** and **GGUF** models.
 
 ## Features
 
-- OpenAI-compatible API server (`mlx-server`)
+- OpenAI-compatible API server (`llama-server`)
 - Direct text generation CLI (`generate`)
 - Streaming and non-streaming chat completions
 - Native GGUF chat templates (falls back to Llama2-style)
@@ -21,22 +21,26 @@ Local LLM inference server and CLI powered by **llama.cpp** and **GGUF** models.
 ## Quick Start
 
 ```bash
+MODEL=/path/to/model.gguf
+
 # Build
 cargo build --release
 
 # Generate text
-cargo run --release --bin generate -- --model /path/to/model.gguf --prompt "Hello!"
+cargo run --release --bin generate -- --model "$MODEL" --prompt "Hello!"
 
 # Chat mode with streaming
 cargo run --release --bin generate -- \
-  --model /path/to/model.gguf \
+  --model "$MODEL" \
   --chat \
   --stream \
   --prompt "What is Rust?"
 
 # Start server
-cargo run --release --bin mlx-server -- --model /path/to/model.gguf
+cargo run --release --bin llama-server -- --model "$MODEL"
 ```
+
+Model paths may point directly to a `.gguf` file, a directory containing one `.gguf`, or a complete split-GGUF shard set.
 
 ## Server API
 
@@ -65,6 +69,14 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
+### Load Model
+
+```bash
+curl http://localhost:8080/llm/load \
+  -H "Content-Type: application/json" \
+  -d '{"model_path": "/path/to/model.gguf"}'
+```
+
 ### Embeddings
 
 ```bash
@@ -87,13 +99,21 @@ model_path = "/path/to/model.gguf"
 # api_key = "secret"
 # rate_limit_rpm = 120
 
-# llama.cpp engine
+# llama.cpp engine options
 n_ctx = 4096
+n_batch = 512
+n_ubatch = 512
 n_gpu_layers = 99       # Metal/GPU offloading
 n_threads = 4
+n_threads_batch = 4
 # embedding = true      # for embeddings endpoint
 # pooling = "mean"      # pooling type for embeddings
+# use_mmap = true
+# use_mlock = false
+# flash_attn = false
 ```
+
+If `api_key` is set, pass either `x-api-key: <key>` or `Authorization: Bearer <key>`.
 
 ### Metal / GPU
 
@@ -122,9 +142,9 @@ Options:
 
 ## Non-Goals (Phase 1)
 
-- Safetensors model support
-- MLX tensor API
-- VLM / vision models
+- Safetensors or MLX model support
+- Legacy Rust tensor APIs
+- VLM or vision models
 - Diffusion generation
 
 ## License

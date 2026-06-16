@@ -3,8 +3,8 @@ use clap::Parser;
 use std::io::{self, Write};
 use std::path::PathBuf;
 
-use mlx_lm::config::LlamaCppConfig;
-use mlx_lm::{resolve_model_path, ChatMessage, GenerationOptions, GenerationPipeline};
+use llama_lm::config::LlamaCppConfig;
+use llama_lm::{resolve_model_path, ChatMessage, GenerationOptions, GenerationPipeline};
 
 #[derive(Parser, Debug)]
 #[command(name = "generate", about = "Generate text with GGUF models via llama.cpp")]
@@ -44,7 +44,7 @@ fn main() -> Result<()> {
 
     let llamacpp_config = if args.config.exists() {
         let toml_content = std::fs::read_to_string(&args.config)?;
-        let server_config = mlx_lm::ServerConfig::from_toml_str(&toml_content)?;
+        let server_config = llama_lm::ServerConfig::from_toml_str(&toml_content)?;
         server_config.to_llamacpp_config()
     } else {
         LlamaCppConfig {

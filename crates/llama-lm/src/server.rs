@@ -16,9 +16,7 @@ use tokio_stream::StreamExt;
 use crate::config::LlamaCppConfig;
 use crate::loader::resolve_model_path;
 use crate::runtime::Runtime;
-use crate::types::{
-    ChatMessage, GenerationOptions, StopReason,
-};
+use crate::types::{ChatMessage, GenerationOptions, StopReason};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
@@ -232,6 +230,8 @@ struct ChatCompletionChunk {
     created: i64,
     model: String,
     choices: Vec<ChatChunkChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    usage: Option<ChatUsage>,
 }
 
 #[derive(Serialize)]
@@ -353,13 +353,25 @@ async fn load_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<LoadRequest>,
 ) -> Result<Json<LoadResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let model_path = resolve_model_path(&req.model_path)
-        .map_err(|e| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: e.to_string() })))?;
+    let model_path = resolve_model_path(&req.model_path).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
 
     let llamacpp_config = state.config.to_llamacpp_config();
 
-    let rt = Runtime::new(model_path.to_str().unwrap(), llamacpp_config)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, Json(ErrorResponse { error: e.to_string() })))?;
+    let rt = Runtime::new(model_path.to_str().unwrap(), llamacpp_config).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: e.to_string(),
+            }),
+        )
+    })?;
 
     let info = rt.model_info();
 
@@ -452,10 +464,13 @@ async fn chat_completions_handler(
                     },
                     finish_reason: None,
                 }],
+                usage: None,
             };
-            let _ = tx.blocking_send(Ok(format!("data: {}\n\n", serde_json::to_string(&role_chunk).unwrap())));
+            if send_sse_data(&tx, &role_chunk).is_err() {
+                return;
+            }
 
-            let result = rt.generate_with_callback(&prompt, &options, |piece| {
+            let result = rt.generate_with_callback_output(&prompt, &options, |piece| {
                 let chunk = ChatCompletionChunk {
                     id: chunk_id.clone(),
                     object: "chat.completion.chunk".to_string(),
@@ -469,16 +484,16 @@ async fn chat_completions_handler(
                         },
                         finish_reason: None,
                     }],
+                    usage: None,
                 };
-                let _ = tx.blocking_send(Ok(format!("data: {}\n\n", serde_json::to_string(&chunk).unwrap())));
-                true
+                send_sse_data(&tx, &chunk).is_ok()
             });
 
             // Drop the runtime lock before sending final messages
             drop(runtime);
 
             match result {
-                Ok(_metrics) => {
+                Ok(output) => {
                     let final_chunk = ChatCompletionChunk {
                         id: chunk_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -490,11 +505,18 @@ async fn chat_completions_handler(
                                 role: None,
                                 content: None,
                             },
-                            finish_reason: Some("stop".to_string()),
+                            finish_reason: Some(
+                                finish_reason_for_stop(&output.stop_reason).to_string(),
+                            ),
                         }],
+                        usage: Some(ChatUsage {
+                            prompt_tokens: output.metrics.prompt_tokens,
+                            completion_tokens: output.metrics.generated_tokens,
+                            total_tokens: output.metrics.total_tokens,
+                        }),
                     };
-                    let _ = tx.blocking_send(Ok(format!("data: {}\n\n", serde_json::to_string(&final_chunk).unwrap())));
-                    let _ = tx.blocking_send(Ok("data: [DONE]\n\n".to_string()));
+                    let _ = send_sse_data(&tx, &final_chunk);
+                    let _ = tx.blocking_send(Ok("[DONE]".to_string()));
                 }
                 Err(e) => {
                     let _ = tx.blocking_send(Err(e.to_string()));
@@ -551,10 +573,7 @@ async fn chat_completions_handler(
                     role: "assistant".to_string(),
                     content: output.text,
                 },
-                finish_reason: Some(match output.stop_reason {
-                    StopReason::Eos | StopReason::Cancelled => "stop".to_string(),
-                    StopReason::MaxTokens => "length".to_string(),
-                }),
+                finish_reason: Some(finish_reason_for_stop(&output.stop_reason).to_string()),
             }],
             usage: ChatUsage {
                 prompt_tokens: output.metrics.prompt_tokens,
@@ -564,6 +583,20 @@ async fn chat_completions_handler(
         };
 
         Ok(Json(response).into_response())
+    }
+}
+
+fn send_sse_data<T: Serialize>(
+    tx: &mpsc::Sender<Result<String, String>>,
+    payload: &T,
+) -> Result<(), mpsc::error::SendError<Result<String, String>>> {
+    tx.blocking_send(Ok(serde_json::to_string(payload).unwrap()))
+}
+
+fn finish_reason_for_stop(stop_reason: &StopReason) -> &'static str {
+    match stop_reason {
+        StopReason::Eos | StopReason::Cancelled => "stop",
+        StopReason::MaxTokens => "length",
     }
 }
 
@@ -979,16 +1012,127 @@ n_gpu_layers = 99
         assert!(!check_auth(&headers, &Some("required".to_string())));
     }
 
-    #[test]
-    fn test_health_handler() {
+    #[tokio::test]
+    async fn test_health_handler_without_model() {
         let state = Arc::new(ServerState {
             runtime: Mutex::new(None),
             config: ServerConfig::default(),
             api_key: None,
             rate_limiter: None,
         });
-        // Just verify construction succeeds
-        assert!(state.runtime.lock().unwrap().is_none());
+
+        let Json(resp) = health_handler(State(state)).await;
+        assert_eq!(resp.status, "ok");
+        assert!(!resp.model_loaded);
+    }
+
+    #[tokio::test]
+    async fn test_models_handler_empty_before_load() {
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(None),
+            config: ServerConfig::default(),
+            api_key: None,
+            rate_limiter: None,
+        });
+
+        let Json(resp) = models_handler(State(state)).await;
+        assert_eq!(resp.object, "list");
+        assert!(resp.data.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_load_invalid_model_path() {
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(None),
+            config: ServerConfig::default(),
+            api_key: None,
+            rate_limiter: None,
+        });
+
+        let result = load_handler(
+            State(state),
+            Json(LoadRequest {
+                model_path: "/definitely/missing/model.gguf".to_string(),
+            }),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("missing model path should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(err.1 .0.error.contains("does not exist"));
+    }
+
+    #[tokio::test]
+    async fn test_chat_auth_failure_handler() {
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(None),
+            config: ServerConfig::default(),
+            api_key: Some("secret".to_string()),
+            rate_limiter: None,
+        });
+
+        let err = chat_completions_handler(
+            State(state),
+            HeaderMap::new(),
+            Json(ChatCompletionRequest {
+                model: "local".to_string(),
+                messages: vec![ChatMessage::user("hello")],
+                max_tokens: Some(1),
+                temperature: 0.0,
+                top_p: 1.0,
+                stream: false,
+                stop: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.0, StatusCode::UNAUTHORIZED);
+        assert_eq!(err.1 .0.error, "Invalid API key");
+    }
+
+    #[tokio::test]
+    async fn test_models_handler_after_env_gated_load() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("Skipping model load handler test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(None),
+            config: ServerConfig {
+                n_ctx: Some(512),
+                n_gpu_layers: Some(0),
+                ..Default::default()
+            },
+            api_key: None,
+            rate_limiter: None,
+        });
+
+        let result = load_handler(
+            State(state.clone()),
+            Json(LoadRequest {
+                model_path: model_path.clone(),
+            }),
+        )
+        .await;
+        if let Err((status, Json(error))) = result {
+            panic!(
+                "env-gated model should load, got {}: {}",
+                status, error.error
+            );
+        }
+
+        let Json(resp) = models_handler(State(state)).await;
+        assert_eq!(resp.object, "list");
+        assert_eq!(resp.data.len(), 1);
+        assert_eq!(resp.data[0].object, "model");
     }
 
     #[test]
@@ -1001,6 +1145,158 @@ n_gpu_layers = 99
         assert!(prompt.contains("You are helpful."));
         assert!(prompt.contains("Hello"));
         assert!(prompt.contains("[INST]"));
+    }
+
+    #[test]
+    fn test_chat_finish_reason_mapping() {
+        assert_eq!(finish_reason_for_stop(&StopReason::Eos), "stop");
+        assert_eq!(finish_reason_for_stop(&StopReason::Cancelled), "stop");
+        assert_eq!(finish_reason_for_stop(&StopReason::MaxTokens), "length");
+    }
+
+    #[test]
+    fn test_chat_completion_response_shape() {
+        let resp = ChatCompletionResponse {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion".to_string(),
+            created: 123,
+            model: "local".to_string(),
+            choices: vec![ChatChoice {
+                index: 0,
+                message: ChatMessage::assistant("hello"),
+                finish_reason: Some(finish_reason_for_stop(&StopReason::MaxTokens).to_string()),
+            }],
+            usage: ChatUsage {
+                prompt_tokens: 2,
+                completion_tokens: 3,
+                total_tokens: 5,
+            },
+        };
+
+        let json = serde_json::to_value(&resp).unwrap();
+        assert_eq!(json["object"], "chat.completion");
+        assert_eq!(json["choices"][0]["message"]["role"], "assistant");
+        assert_eq!(json["choices"][0]["message"]["content"], "hello");
+        assert_eq!(json["choices"][0]["finish_reason"], "length");
+        assert_eq!(json["usage"]["prompt_tokens"], 2);
+        assert_eq!(json["usage"]["completion_tokens"], 3);
+        assert_eq!(json["usage"]["total_tokens"], 5);
+    }
+
+    #[test]
+    fn test_streaming_chunk_shapes() {
+        let first = ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 123,
+            model: "local".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: Some("assistant".to_string()),
+                    content: None,
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let token = ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 123,
+            model: "local".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: None,
+                    content: Some("hello".to_string()),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+        let final_chunk = ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 123,
+            model: "local".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: None,
+                    content: None,
+                },
+                finish_reason: Some("length".to_string()),
+            }],
+            usage: Some(ChatUsage {
+                prompt_tokens: 2,
+                completion_tokens: 3,
+                total_tokens: 5,
+            }),
+        };
+
+        let chunks = vec![
+            serde_json::to_value(&first).unwrap(),
+            serde_json::to_value(&token).unwrap(),
+            serde_json::to_value(&final_chunk).unwrap(),
+        ];
+
+        assert_eq!(chunks[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(chunks[1]["choices"][0]["delta"]["content"], "hello");
+        assert_eq!(chunks[2]["choices"][0]["finish_reason"], "length");
+        assert_eq!(chunks[2]["usage"]["total_tokens"], 5);
+        assert!(chunks[0].get("usage").is_none());
+        assert_eq!(chunks.len(), 3);
+    }
+
+    #[test]
+    fn test_streaming_closed_channel_cancels_send() {
+        let (tx, rx) = mpsc::channel::<Result<String, String>>(1);
+        drop(rx);
+
+        let chunk = ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 123,
+            model: "local".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: None,
+                    content: Some("hello".to_string()),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+
+        assert!(send_sse_data(&tx, &chunk).is_err());
+    }
+
+    #[test]
+    fn test_streaming_send_uses_raw_event_data() {
+        let (tx, mut rx) = mpsc::channel::<Result<String, String>>(1);
+        let chunk = ChatCompletionChunk {
+            id: "chatcmpl-test".to_string(),
+            object: "chat.completion.chunk".to_string(),
+            created: 123,
+            model: "local".to_string(),
+            choices: vec![ChatChunkChoice {
+                index: 0,
+                delta: ChatDelta {
+                    role: None,
+                    content: Some("hello".to_string()),
+                },
+                finish_reason: None,
+            }],
+            usage: None,
+        };
+
+        send_sse_data(&tx, &chunk).unwrap();
+        let data = rx.blocking_recv().unwrap().unwrap();
+        assert!(data.starts_with('{'));
+        assert!(!data.starts_with("data:"));
+        assert!(data.contains("\"chat.completion.chunk\""));
     }
 
     #[test]
@@ -1021,6 +1317,61 @@ n_gpu_layers = 99
             EmbeddingInput::Multiple(v) => assert_eq!(v, vec!["hello", "world"]),
             _ => panic!("Expected Multiple"),
         }
+    }
+
+    #[test]
+    fn test_embedding_rejects_token_array_input() {
+        let json = r#"{"input": [1, 2, 3], "model": "test-model"}"#;
+        let err = match serde_json::from_str::<EmbeddingRequest>(json) {
+            Ok(_) => panic!("token arrays should not deserialize as embedding requests"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("data did not match any variant"));
+    }
+
+    #[tokio::test]
+    async fn test_embedding_non_embedding_model_returns_unsupported() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("Skipping non-embedding model handler test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let runtime = Runtime::new(
+            &model_path,
+            LlamaCppConfig {
+                n_ctx: Some(512),
+                embedding: Some(false),
+                ..Default::default()
+            },
+        )
+        .expect("Failed to load non-embedding model");
+
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(Some(runtime)),
+            config: ServerConfig::default(),
+            api_key: None,
+            rate_limiter: None,
+        });
+
+        let result = embeddings_handler(
+            State(state),
+            HeaderMap::new(),
+            Json(EmbeddingRequest {
+                input: EmbeddingInput::Single("hello".to_string()),
+                model: "local".to_string(),
+            }),
+        )
+        .await;
+
+        let err = match result {
+            Ok(_) => panic!("non-embedding runtime should reject embeddings"),
+            Err(err) => err,
+        };
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1 .0.error, "Model does not support embeddings");
     }
 
     #[test]
