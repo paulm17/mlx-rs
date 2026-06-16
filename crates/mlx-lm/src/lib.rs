@@ -42,6 +42,10 @@ impl GenerationPipeline {
         self.runtime.generate_with_callback(prompt, options, on_token)
     }
 
+    pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
+        self.runtime.apply_chat_template(messages)
+    }
+
     pub fn runtime(&self) -> &Runtime {
         &self.runtime
     }

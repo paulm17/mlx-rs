@@ -761,7 +761,7 @@ Completion notes:
 
 ### Milestone 1.12 - Documentation And Cleanup
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -785,6 +785,14 @@ Acceptance:
 
 - A new user can run one GGUF model from README instructions.
 - No docs claim safetensors/MLX support in Phase 1.
+
+Completion notes:
+
+- `README.md`: Full rewrite. Documents GGUF requirement, all server endpoints, generate CLI flags, config.toml format, Metal/GPU layer config, embeddings, non-goals.
+- `config.toml`: Updated with llama.cpp engine options (n_ctx, n_batch, n_gpu_layers, etc.). All commented out as examples.
+- `generate.rs`: Replaced hardcoded `build_chat_prompt` with `pipeline.apply_chat_template` for native GGUF template support.
+- `lib.rs`: Exposed `apply_chat_template` on `GenerationPipeline`.
+- 41 tests pass, zero warnings.
 
 ## Phase 2: Ollama-Style Multi-Backend Foundation
 

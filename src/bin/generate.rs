@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use mlx_lm::config::LlamaCppConfig;
-use mlx_lm::{resolve_model_path, GenerationOptions, GenerationPipeline};
+use mlx_lm::{resolve_model_path, ChatMessage, GenerationOptions, GenerationPipeline};
 
 #[derive(Parser, Debug)]
 #[command(name = "generate", about = "Generate text with GGUF models via llama.cpp")]
@@ -37,16 +37,6 @@ struct Args {
     stream: bool,
 }
 
-fn build_chat_prompt(system: &str, user: &str) -> String {
-    let mut s = String::new();
-    s.push_str("[INST] <<SYS>>\n");
-    s.push_str(system);
-    s.push_str("\n<</SYS>>\n\n");
-    s.push_str(user);
-    s.push_str(" [/INST]");
-    s
-}
-
 fn main() -> Result<()> {
     let args = Args::parse();
 
@@ -69,7 +59,11 @@ fn main() -> Result<()> {
     )?;
 
     let prompt = if args.chat {
-        build_chat_prompt(&args.system_prompt, &args.prompt)
+        let messages = vec![
+            ChatMessage::system(&args.system_prompt),
+            ChatMessage::user(&args.prompt),
+        ];
+        pipeline.apply_chat_template(&messages)?
     } else {
         args.prompt
     };
