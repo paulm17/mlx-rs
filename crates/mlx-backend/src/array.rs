@@ -80,6 +80,23 @@ impl Array {
         Ok(Self { ctx })
     }
 
+    pub fn from_data(data: &[u8], shape: &[usize], dtype: MlxDtype) -> anyhow::Result<Self> {
+        let syms = loader::symbols()?;
+        let c_shape: Vec<i32> = shape.iter().map(|&s| s as i32).collect();
+        let ctx = unsafe {
+            (syms.mlx_array_new_data)(
+                data.as_ptr() as *const std::ffi::c_void,
+                c_shape.as_ptr(),
+                shape.len() as i32,
+                dtype as i32,
+            )
+        };
+        if ctx.ctx.is_null() {
+            return Err(anyhow::anyhow!("mlx_array_new_data returned null"));
+        }
+        Ok(Self { ctx })
+    }
+
     pub fn size(&self) -> usize {
         let syms = loader::symbols().expect("MLX not initialized");
         unsafe { (syms.mlx_array_size)(self.ctx) }

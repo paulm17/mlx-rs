@@ -984,7 +984,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 2.5 - MLX Manifest And Safetensors Loader
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -1011,6 +1011,16 @@ Acceptance:
 
 - Can list tensors and config for one safetensors model.
 - Can load selected tensor into MLX array.
+
+Completion notes (2026-06-16):
+
+- Model package format: direct HuggingFace snapshot directory (config.json + .safetensors files, with optional model.safetensors.index.json for sharded models).
+- `tensors.rs` (new): `SafetensorsFile` loads safetensors files via `safetensors` crate. `from_bytes()`/`load()` deserialize tensors. `tensor_names()`, `tensor_info()`, `get_tensor()`, `load_all()`, `metadata()`, `num_tensors()`, `total_bytes()`. Maps safetensors dtypes to MlxDtype (Bool through Complex64). Parses metadata from raw header JSON (`__metadata__` key). 6 tests.
+- `manifest.rs` (new): `ModelManifest::open(dir)` discovers config.json + safetensors files. Supports sharded models via model.safetensors.index.json weight_map. Accessors: `config()`, `model_type()`, `num_hidden_layers()`, `hidden_size()`, `vocab_size()`, `safetensors_files()`, `load_all_tensors()`, `tensor_names()`, `total_tensor_bytes()`, `metadata()`. 8 tests.
+- `array.rs` (modified): Added generic `Array::from_data(data: &[u8], shape: &[usize], dtype: MlxDtype)` that passes raw bytes through `mlx_array_new_data` with any dtype. Supports all MlxDtype variants.
+- `Cargo.toml`: Added `safetensors = "0.4"`, `serde_json` workspace dep, `tempfile` dev-dep.
+- `lib.rs`: Added `manifest`, `tensors` modules. Exports `ModelManifest`, `SafetensorsFile`.
+- All 132 tests pass (87 llama-lm + 45 mlx-backend), cargo check clean, zero warnings.
 
 ### Milestone 2.6 - MLX Llama Minimal Inference
 

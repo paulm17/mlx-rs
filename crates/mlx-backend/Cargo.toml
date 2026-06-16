@@ -8,3 +8,8 @@ description = "Dynamic loader for Apple MLX-C runtime"
 anyhow.workspace = true
 libloading = "0.8"
 glob = "0.3"
+safetensors = "0.4"
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
