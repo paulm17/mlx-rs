@@ -3,6 +3,7 @@ bind = "127.0.0.1"
 port = 8080
 # model_path = "/path/to/model.gguf"
 # rate_limit_rpm = 120
+# api_key is loaded from .env file (HF_API_KEY)
 
 # llama.cpp engine options
 # n_ctx = 4096            # context window size

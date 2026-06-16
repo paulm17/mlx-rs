@@ -44,11 +44,30 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn from_toml_path(path: &Path) -> Result<Self> {
-        if !path.exists() {
-            return Ok(Self::default());
+        let mut cfg = if !path.exists() {
+            Self::default()
+        } else {
+            let content = std::fs::read_to_string(path)?;
+            Self::from_toml_str(&content)?
+        };
+        if cfg.api_key.is_none() {
+            let env_path = path.parent().unwrap_or(Path::new(".")).join(".env");
+            if let Ok(env_content) = std::fs::read_to_string(&env_path) {
+                for line in env_content.lines() {
+                    let line = line.trim();
+                    if line.is_empty() || line.starts_with('#') {
+                        continue;
+                    }
+                    if let Some(val) = line.strip_prefix("HF_API_KEY=") {
+                        let val = val.trim().trim_matches('"').trim_matches('\'');
+                        if !val.is_empty() {
+                            cfg.api_key = Some(val.to_string());
+                        }
+                    }
+                }
+            }
         }
-        let content = std::fs::read_to_string(path)?;
-        Self::from_toml_str(&content)
+        Ok(cfg)
     }
 
     pub fn from_toml_str(content: &str) -> Result<Self> {
