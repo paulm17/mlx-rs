@@ -7,6 +7,8 @@ use crate::backend::Backend;
 use crate::config::LlamaCppConfig;
 use crate::llamacpp::LlamaCppBackend;
 use crate::loader::resolve_model_path;
+use crate::subprocess::RunnerSubprocess;
+use crate::types::LoadedModelInfo;
 
 pub enum ModelFormat {
     Gguf,
@@ -82,10 +84,17 @@ pub fn create_backend(path: &str, config: LlamaCppConfig) -> Result<Box<dyn Back
                 let raw = PathBuf::from(path);
                 return factory(&raw);
             }
-            anyhow::bail!(
-                "safetensors/MLX model directories are not yet supported; \
-                 MLX backend is reserved for a future release. Provide a GGUF model file."
-            )
+
+            let raw = PathBuf::from(path);
+            let subprocess = RunnerSubprocess::spawn(&raw)?;
+            let model_info = LoadedModelInfo {
+                model_path: raw.display().to_string(),
+                context_length: None,
+                embedding_dimension: None,
+                vocab_size: None,
+            };
+            let client = subprocess.client(model_info);
+            Ok(Box::new(client))
         }
     }
 }
@@ -127,14 +136,25 @@ mod tests {
     }
 
     #[test]
-    fn test_create_backend_safetensors_rejected() {
+    fn test_create_backend_safetensors_spawns_subprocess() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("model.safetensors"), b"fake").unwrap();
         fs::write(dir.path().join("config.json"), b"{}").unwrap();
+        std::env::set_var("MLX_RS_RUNNER_TIMEOUT", "5");
         let result = create_backend(dir.path().to_str().unwrap(), LlamaCppConfig::default());
+        std::env::remove_var("MLX_RS_RUNNER_TIMEOUT");
         match result {
-            Ok(_) => panic!("safetensors should be rejected"),
-            Err(e) => assert!(e.to_string().contains("not yet supported")),
+            Ok(_) => panic!("safetensors subprocess spawning should fail without runner binary"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("failed to spawn")
+                        || msg.contains("not yet supported")
+                        || msg.contains("did not become ready"),
+                    "unexpected error: {}",
+                    msg
+                );
+            }
         }
     }
 

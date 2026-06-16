@@ -7,6 +7,7 @@ pub mod runner;
 pub mod runtime;
 pub mod sampler;
 pub mod server;
+pub mod subprocess;
 pub mod types;
 
 pub use backend::Backend;

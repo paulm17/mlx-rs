@@ -1072,7 +1072,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 2.7 - MLX Runner Subprocess
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -1098,6 +1098,16 @@ Acceptance:
 - Main server can load a safetensors model by spawning MLX runner.
 - Process cleanup works on unload/server exit.
 - llama.cpp GGUF path still works.
+
+Completion notes (2026-06-16):
+
+- `src/bin/llama-rs-runner.rs` (new): Runner subprocess binary with `--mlx-engine`, `--model`, `--port` flags. Serves HTTP endpoints: `GET /v1/status` (health check), `POST /v1/completions` (text generation), `POST /v1/tokenize` (tokenization). Uses `MlxBackend::load()` for model initialization.
+- `crates/llama-lm/src/subprocess.rs` (new): `RunnerSubprocess` struct that spawns the runner binary, waits for health check with configurable timeout (`MLX_RS_RUNNER_TIMEOUT` env var), and provides `client()` method returning `RunnerClient`. Implements `Drop` for process cleanup (kill + wait). `spawn_with_timeout()` for test control.
+- `crates/llama-lm/src/registry.rs` (modified): `create_backend()` now spawns `RunnerSubprocess` for safetensors models instead of returning "not yet supported" error. Falls back to registered factories if available.
+- `Cargo.toml` (root): Added `llama-rs-runner` binary, added `backend-trait`, `mlx-backend`, `axum`, `tokio` (with `rt-multi-thread`) dependencies.
+- `Cargo.toml` (llama-lm): Added `reqwest` (blocking) as regular dependency for health checks.
+- `lib.rs` (llama-lm): Added `subprocess` module.
+- All 140 tests pass (88 llama-lm + 52 mlx-backend), cargo check clean, zero warnings.
 
 ### Milestone 2.8 - MLX Chat Rendering And Tokenizer
 
