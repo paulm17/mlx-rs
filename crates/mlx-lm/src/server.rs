@@ -281,6 +281,40 @@ struct LoadResponse {
     vocab_size: Option<usize>,
 }
 
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EmbeddingInput {
+    Single(String),
+    Multiple(Vec<String>),
+}
+
+#[derive(Deserialize)]
+struct EmbeddingRequest {
+    input: EmbeddingInput,
+    model: String,
+}
+
+#[derive(Serialize)]
+struct EmbeddingObject {
+    object: String,
+    index: usize,
+    embedding: Vec<f32>,
+}
+
+#[derive(Serialize)]
+struct EmbeddingResponse {
+    object: String,
+    data: Vec<EmbeddingObject>,
+    model: String,
+    usage: EmbeddingUsageResponse,
+}
+
+#[derive(Serialize)]
+struct EmbeddingUsageResponse {
+    prompt_tokens: usize,
+    total_tokens: usize,
+}
+
 #[derive(Serialize)]
 struct ErrorResponse {
     error: String,
@@ -518,6 +552,101 @@ async fn chat_completions_handler(
     }
 }
 
+async fn embeddings_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    Json(req): Json<EmbeddingRequest>,
+) -> Result<Json<EmbeddingResponse>, (StatusCode, Json<ErrorResponse>)> {
+    // Auth check
+    if !check_auth(&headers, &state.api_key) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Invalid API key".to_string(),
+            }),
+        ));
+    }
+
+    // Rate limit check
+    if let Some(ref rl) = state.rate_limiter {
+        if !rl.check() {
+            return Err((
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(ErrorResponse {
+                    error: "Rate limit exceeded".to_string(),
+                }),
+            ));
+        }
+    }
+
+    let inputs = match req.input {
+        EmbeddingInput::Single(s) => vec![s],
+        EmbeddingInput::Multiple(v) => v,
+    };
+
+    let mut runtime = state.runtime.lock().unwrap();
+    let rt = match runtime.as_mut() {
+        Some(rt) => rt,
+        None => {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "No model loaded".to_string(),
+                }),
+            ));
+        }
+    };
+
+    if !rt.embeddings_enabled() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "Model does not support embeddings".to_string(),
+            }),
+        ));
+    }
+
+    let mut data = Vec::new();
+    let mut total_tokens = 0usize;
+
+    for (i, input) in inputs.iter().enumerate() {
+        let tokens = rt.tokenize(input, true).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Tokenization failed: {}", e),
+                }),
+            )
+        })?;
+        total_tokens += tokens.len();
+
+        let embedding = rt.embed(input).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Embedding failed: {}", e),
+                }),
+            )
+        })?;
+
+        data.push(EmbeddingObject {
+            object: "embedding".to_string(),
+            index: i,
+            embedding,
+        });
+    }
+
+    Ok(Json(EmbeddingResponse {
+        object: "list".to_string(),
+        data,
+        model: req.model,
+        usage: EmbeddingUsageResponse {
+            prompt_tokens: total_tokens,
+            total_tokens,
+        },
+    }))
+}
+
 // --- Helpers ---
 
 fn build_prompt_from_messages(messages: &[ChatMessage]) -> String {
@@ -634,6 +763,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         .route("/v1/models", get(models_handler))
         .route("/llm/load", post(load_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/embeddings", post(embeddings_handler))
         .with_state(state);
 
     let bind = config.bind.as_deref().unwrap_or("127.0.0.1");
@@ -855,5 +985,46 @@ n_gpu_layers = 99
         assert!(prompt.contains("You are helpful."));
         assert!(prompt.contains("Hello"));
         assert!(prompt.contains("[INST]"));
+    }
+
+    #[test]
+    fn test_embedding_request_single_input() {
+        let json = r#"{"input": "hello world", "model": "test-model"}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        match req.input {
+            EmbeddingInput::Single(s) => assert_eq!(s, "hello world"),
+            _ => panic!("Expected Single"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_request_array_input() {
+        let json = r#"{"input": ["hello", "world"], "model": "test-model"}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        match req.input {
+            EmbeddingInput::Multiple(v) => assert_eq!(v, vec!["hello", "world"]),
+            _ => panic!("Expected Multiple"),
+        }
+    }
+
+    #[test]
+    fn test_embedding_response_shape() {
+        let resp = EmbeddingResponse {
+            object: "list".to_string(),
+            data: vec![EmbeddingObject {
+                object: "embedding".to_string(),
+                index: 0,
+                embedding: vec![0.1, 0.2, 0.3],
+            }],
+            model: "test".to_string(),
+            usage: EmbeddingUsageResponse {
+                prompt_tokens: 5,
+                total_tokens: 5,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains("\"object\":\"list\""));
+        assert!(json.contains("\"embedding\":[0.1,0.2,0.3]"));
+        assert!(json.contains("\"prompt_tokens\":5"));
     }
 }

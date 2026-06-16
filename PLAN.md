@@ -681,7 +681,7 @@ Completion notes:
 
 ### Milestone 1.10 - Embeddings
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -713,6 +713,13 @@ Acceptance:
 - Unit tests cover JSON shape and validation.
 - Env-gated GGUF embedding test passes if `MLX_RS_TEST_EMBED_GGUF` is set.
 - Non-embedding model returns a clear unsupported error.
+
+Completion notes:
+
+- `runtime.rs`: Added `embed(text) -> Result<Vec<f32>>`. Tokenizes input, runs decode, gets embeddings via `context.embeddings_seq_ith(0)`, normalizes L2. Returns error if embeddings not enabled.
+- `server.rs`: Added `POST /v1/embeddings` endpoint. Accepts string or array of strings. Returns OpenAI-style response with `object: "list"`, `data[*].embedding`, `usage.prompt_tokens`. Auth and rate limiting applied.
+- `types.rs`: `EmbeddingData`, `EmbeddingOutput`, `EmbeddingUsage` already defined in milestone 1.2.
+- 41 tests pass (3 new: embedding request single/array input deserialization, response JSON shape).
 
 ### Milestone 1.11 - Chat Template Strategy
 

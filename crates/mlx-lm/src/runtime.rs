@@ -170,6 +170,35 @@ impl Runtime {
         self.model.token_eos().0
     }
 
+    pub fn embed(&mut self, text: &str) -> Result<Vec<f32>> {
+        if !self.embeddings_enabled {
+            anyhow::bail!("Embeddings not enabled for this model");
+        }
+
+        let tokens = self.tokenize(text, true)?;
+        let n_tokens = tokens.len();
+
+        let mut batch = LlamaBatch::new(n_tokens, 1);
+        for (i, &token_id) in tokens.iter().enumerate() {
+            let is_last = i == n_tokens - 1;
+            batch.add(LlamaToken(token_id), i as i32, &[0], is_last)?;
+        }
+        self.context.decode(&mut batch)?;
+
+        let embedding = self
+            .context
+            .embeddings_seq_ith(0)
+            .map_err(|e| anyhow::anyhow!("Failed to get embeddings: {}", e))?;
+
+        // Normalize the embedding vector
+        let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if norm > 0.0 {
+            Ok(embedding.iter().map(|x| x / norm).collect())
+        } else {
+            Ok(embedding.to_vec())
+        }
+    }
+
     pub fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput> {
         let mut text = String::new();
 
