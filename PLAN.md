@@ -944,7 +944,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 2.4 - MLX Array And Ops Minimal Binding
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -969,8 +969,18 @@ Reference:
 
 Acceptance:
 
-- Unit tests create arrays and evaluate basic operations when MLX is available.
+- Unit tests create arrays and evaluate basic operations when MLX are available.
 - Tests skip cleanly when MLX is unavailable.
+
+Completion notes (2026-06-16):
+
+- `ffi.rs`: Added `MlxArray`, `MlxStream`, `MlxVectorArray` opaque types, `MlxDtype` enum (14 variants with `TryFrom<c_int>` and `size_bytes()`), 30+ function pointer types for array creation/metadata/data/eval, stream, vector array, ops (add, multiply, matmul, reshape, transpose, astype, concatenate, zeros, sum_axis, gather_mm), and memory management. Updated `MlxSymbols` with all new fields. Used `load_sym!` macro for concise symbol loading.
+- `loader.rs`: Added `symbols()` public accessor returning `&'static MlxSymbols`.
+- `array.rs` (new): `Array` struct wrapping `MlxArray` with `Drop` for automatic cleanup. Creation: `from_f32`, `from_f64`, `from_i32`, `from_data_f32`, `from_data_i32`. Metadata: `size`, `nbytes`, `ndim`, `shape`, `dim`, `dtype`. Data access: `item_f64`, `item_i64`, `data_f32`, `data_i32`. Eval: `eval`, `to_string_val`. 10 tests.
+- `ops.rs` (new): `VectorArray` internal helper for multi-array operations. Functions: `add`, `multiply`, `matmul`, `reshape`, `transpose`, `astype`, `concatenate`, `zeros`, `sum_axis`, `eval` (multi-array). All ops pass null stream for default. 10 tests.
+- `memory.rs` (new): `active_memory`, `cache_memory`, `peak_memory`, `reset_peak_memory`, `clear_cache`. 5 tests.
+- `lib.rs`: Added `array`, `ops`, `memory` modules. Exports `Array`, `MlxDtype`, `symbols`.
+- All 118 tests pass (87 llama-lm + 31 mlx-backend), cargo check clean, zero warnings.
 
 ### Milestone 2.5 - MLX Manifest And Safetensors Loader
 

@@ -240,6 +240,12 @@ pub fn default_device_available() -> anyhow::Result<bool> {
     }
 }
 
+pub fn symbols() -> anyhow::Result<&'static MlxSymbols> {
+    init()?;
+    let state = MLX.get().unwrap().as_ref().unwrap();
+    Ok(&state.symbols)
+}
+
 pub fn device_count(device_type: MlxDeviceType) -> anyhow::Result<c_int> {
     init()?;
     let state = MLX.get().unwrap().as_ref().unwrap();
