@@ -1,0 +1,9 @@
+[package]
+name = "backend-trait"
+version = "0.1.0"
+edition = "2021"
+description = "Backend trait for model inference backends"
+
+[dependencies]
+anyhow.workspace = true
+serde = { workspace = true }

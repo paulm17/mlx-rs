@@ -189,6 +189,81 @@ pub type MlxGatherMmFn = unsafe extern "C" fn(
     *const MlxStream,
 ) -> c_int;
 
+// Fast ops (from mlx/c/fast.h)
+pub type MlxFastRmsNormFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,
+    MlxArray, // weight (nullable)
+    f32,      // eps
+    *const MlxStream,
+) -> c_int;
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MlxOptionalFloat {
+    pub value: f32,
+    pub has_value: bool,
+}
+
+pub type MlxFastRopeFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,
+    c_int,             // dims
+    bool,              // traditional
+    MlxOptionalFloat,  // base
+    f32,               // scale
+    c_int,             // offset
+    MlxArray,          // freqs (nullable)
+    *const MlxStream,
+) -> c_int;
+
+pub type MlxFastSdpaFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,          // queries
+    MlxArray,          // keys
+    MlxArray,          // values
+    f32,               // scale
+    *const std::ffi::c_char, // mask_mode
+    MlxArray,          // mask (nullable)
+    MlxArray,          // sinks (nullable)
+    *const MlxStream,
+) -> c_int;
+
+// Additional ops
+pub type MlxTakeAxisFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,
+    MlxArray,
+    c_int, // axis
+    *const MlxStream,
+) -> c_int;
+
+pub type MlxExpandDimsFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,
+    c_int, // axis
+    *const MlxStream,
+) -> c_int;
+
+pub type MlxTriFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    c_int, // n
+    c_int, // m
+    c_int, // k
+    c_int, // dtype
+    *const MlxStream,
+) -> c_int;
+
+pub type MlxWhereFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray, // condition
+    MlxArray, // x
+    MlxArray, // y
+    *const MlxStream,
+) -> c_int;
+
+pub type MlxUnaryOpFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, *const MlxStream) -> c_int;
+
 // Memory
 pub type MlxGetActiveMemoryFn = unsafe extern "C" fn(*mut usize) -> c_int;
 pub type MlxGetCacheMemoryFn = unsafe extern "C" fn(*mut usize) -> c_int;
@@ -245,6 +320,20 @@ pub struct MlxSymbols {
     pub mlx_zeros: MlxZerosFn,
     pub mlx_sum_axis: MlxSumAxisFn,
     pub mlx_gather_mm: MlxGatherMmFn,
+    // Fast ops
+    pub mlx_fast_rms_norm: MlxFastRmsNormFn,
+    pub mlx_fast_rope: MlxFastRopeFn,
+    pub mlx_fast_sdpa: MlxFastSdpaFn,
+    // Additional ops
+    pub mlx_take_axis: MlxTakeAxisFn,
+    pub mlx_expand_dims: MlxExpandDimsFn,
+    pub mlx_tri: MlxTriFn,
+    pub mlx_where: MlxWhereFn,
+    pub mlx_divide: MlxBinaryOpFn,
+    pub mlx_negative: MlxUnaryOpFn,
+    pub mlx_softmax: MlxUnaryOpFn,
+    pub mlx_sigmoid: MlxUnaryOpFn,
+    pub mlx_sqrt: MlxUnaryOpFn,
     // Memory
     pub mlx_get_active_memory: MlxGetActiveMemoryFn,
     pub mlx_get_cache_memory: MlxGetCacheMemoryFn,
@@ -310,6 +399,20 @@ impl MlxSymbols {
                 mlx_zeros: load_sym!(lib, b"mlx_zeros\0", MlxZerosFn),
                 mlx_sum_axis: load_sym!(lib, b"mlx_sum_axis\0", MlxSumAxisFn),
                 mlx_gather_mm: load_sym!(lib, b"mlx_gather_mm\0", MlxGatherMmFn),
+                // Fast ops
+                mlx_fast_rms_norm: load_sym!(lib, b"mlx_fast_rms_norm\0", MlxFastRmsNormFn),
+                mlx_fast_rope: load_sym!(lib, b"mlx_fast_rope\0", MlxFastRopeFn),
+                mlx_fast_sdpa: load_sym!(lib, b"mlx_fast_scaled_dot_product_attention\0", MlxFastSdpaFn),
+                // Additional ops
+                mlx_take_axis: load_sym!(lib, b"mlx_take_axis\0", MlxTakeAxisFn),
+                mlx_expand_dims: load_sym!(lib, b"mlx_expand_dims\0", MlxExpandDimsFn),
+                mlx_tri: load_sym!(lib, b"mlx_tri\0", MlxTriFn),
+                mlx_where: load_sym!(lib, b"mlx_where\0", MlxWhereFn),
+                mlx_divide: load_sym!(lib, b"mlx_divide\0", MlxBinaryOpFn),
+                mlx_negative: load_sym!(lib, b"mlx_negative\0", MlxUnaryOpFn),
+                mlx_softmax: load_sym!(lib, b"mlx_softmax\0", MlxUnaryOpFn),
+                mlx_sigmoid: load_sym!(lib, b"mlx_sigmoid\0", MlxUnaryOpFn),
+                mlx_sqrt: load_sym!(lib, b"mlx_sqrt\0", MlxUnaryOpFn),
                 mlx_get_active_memory: load_sym!(lib, b"mlx_get_active_memory\0", MlxGetActiveMemoryFn),
                 mlx_get_cache_memory: load_sym!(lib, b"mlx_get_cache_memory\0", MlxGetCacheMemoryFn),
                 mlx_get_peak_memory: load_sym!(lib, b"mlx_get_peak_memory\0", MlxGetPeakMemoryFn),

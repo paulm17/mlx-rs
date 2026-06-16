@@ -1,5 +1,6 @@
 [workspace]
 members = [
+    "crates/backend-trait",
     "crates/llama-lm",
     "crates/mlx-backend",
 ]

@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = { workspace = true }
 axum = "0.8"
+backend-trait = { path = "../backend-trait" }
 encoding_rs = "0.8"
 llama-cpp-2 = "=0.1.146"
 serde = { workspace = true }

@@ -185,6 +185,173 @@ pub fn eval(arrays: &[&Array]) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn take(a: &Array, indices: &Array, axis: i32) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_take_axis)(&mut res, a.raw(), indices.raw(), axis, null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_take_axis returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn expand_dims(a: &Array, axis: i32) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_expand_dims)(&mut res, a.raw(), axis, null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_expand_dims returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn tri_matrix(n: i32, m: i32, k: i32, dtype: crate::ffi::MlxDtype) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_tri)(&mut res, n, m, k, dtype as i32, null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_tri returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn where_op(condition: &Array, x: &Array, y: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_where)(&mut res, condition.raw(), x.raw(), y.raw(), null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_where returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn divide(a: &Array, b: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_divide)(&mut res, a.raw(), b.raw(), null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_divide returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn negative(a: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_negative)(&mut res, a.raw(), null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_negative returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn softmax(a: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_softmax)(&mut res, a.raw(), null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_softmax returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn sigmoid(a: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_sigmoid)(&mut res, a.raw(), null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_sigmoid returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn sqrt(a: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_sqrt)(&mut res, a.raw(), null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_sqrt returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn fast_rms_norm(x: &Array, weight: &Array, eps: f32) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_fast_rms_norm)(&mut res, x.raw(), weight.raw(), eps, null_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_fast_rms_norm returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn fast_rope(
+    x: &Array,
+    dims: i32,
+    traditional: bool,
+    base: Option<f32>,
+    scale: f32,
+    offset: i32,
+) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let optional_base = crate::ffi::MlxOptionalFloat {
+        value: base.unwrap_or(0.0),
+        has_value: base.is_some(),
+    };
+    let null_freqs = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe {
+        (syms.mlx_fast_rope)(
+            &mut res,
+            x.raw(),
+            dims,
+            traditional,
+            optional_base,
+            scale,
+            offset,
+            null_freqs,
+            null_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_fast_rope returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn fast_sdpa(
+    queries: &Array,
+    keys: &Array,
+    values: &Array,
+    scale: f32,
+    mask_mode: &str,
+    mask: Option<&Array>,
+) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let c_mode = std::ffi::CString::new(mask_mode).unwrap_or_else(|_| std::ffi::CString::new("").unwrap());
+    let null_mask = MlxArray { ctx: std::ptr::null_mut() };
+    let null_sinks = MlxArray { ctx: std::ptr::null_mut() };
+    let mask_arr = mask.map(|m| m.raw()).unwrap_or(null_mask);
+    let rc = unsafe {
+        (syms.mlx_fast_sdpa)(
+            &mut res,
+            queries.raw(),
+            keys.raw(),
+            values.raw(),
+            scale,
+            c_mode.as_ptr(),
+            mask_arr,
+            null_sinks,
+            null_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_fast_sdpa returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

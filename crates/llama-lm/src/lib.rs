@@ -12,7 +12,7 @@ pub mod types;
 pub use backend::Backend;
 pub use llamacpp::LlamaCppBackend;
 pub use loader::resolve_model_path;
-pub use registry::{create_backend, detect_format, ModelFormat};
+pub use registry::{create_backend, detect_format, register_safetensors_backend, ModelFormat};
 pub use runner::{CompletionOptions, CompletionRequest, CompletionResponse, RunnerClient};
 pub use sampler::Sampler;
 pub use server::{run_server, run_server_from_toml_path, ServerConfig};

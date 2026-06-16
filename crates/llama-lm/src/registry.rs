@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
 
@@ -12,16 +13,29 @@ pub enum ModelFormat {
     Safetensors,
 }
 
+type SafetensorsFactory = Box<dyn Fn(&std::path::Path) -> Result<Box<dyn Backend>> + Send + Sync>;
+
+fn safetensors_registry() -> &'static Mutex<Vec<SafetensorsFactory>> {
+    static REGISTRY: OnceLock<Mutex<Vec<SafetensorsFactory>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+pub fn register_safetensors_backend<F>(factory: F)
+where
+    F: Fn(&std::path::Path) -> Result<Box<dyn Backend>> + Send + Sync + 'static,
+{
+    let mut reg = safetensors_registry().lock().unwrap();
+    reg.push(Box::new(factory));
+}
+
 pub fn detect_format(path: &str) -> Result<ModelFormat> {
     let raw = PathBuf::from(path);
 
-    // Check raw path extension first (before resolve_model_path rejects safetensors)
     if raw.extension().map_or(false, |e| e == "gguf") {
         let _resolved = resolve_model_path(path)?;
         return Ok(ModelFormat::Gguf);
     }
 
-    // Check for safetensors in directory before resolve_model_path rejects it
     if raw.is_dir() {
         let has_safetensors = raw
             .read_dir()
@@ -41,7 +55,6 @@ pub fn detect_format(path: &str) -> Result<ModelFormat> {
         }
     }
 
-    // Fall through to resolve_model_path for GGUF directories, HuggingFace refs, etc.
     let resolved: PathBuf = resolve_model_path(path)?;
 
     if resolved.extension().map_or(false, |e| e == "gguf") {
@@ -64,6 +77,11 @@ pub fn create_backend(path: &str, config: LlamaCppConfig) -> Result<Box<dyn Back
             Ok(Box::new(backend))
         }
         ModelFormat::Safetensors => {
+            let reg = safetensors_registry().lock().unwrap();
+            if let Some(factory) = reg.first() {
+                let raw = PathBuf::from(path);
+                return factory(&raw);
+            }
             anyhow::bail!(
                 "safetensors/MLX model directories are not yet supported; \
                  MLX backend is reserved for a future release. Provide a GGUF model file."

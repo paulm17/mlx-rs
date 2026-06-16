@@ -7,6 +7,17 @@ pub struct Array {
 
 unsafe impl Send for Array {}
 
+impl Clone for Array {
+    fn clone(&self) -> Self {
+        let syms = loader::symbols().expect("MLX not initialized");
+        let mut new_ctx = MlxArray { ctx: std::ptr::null_mut() };
+        unsafe {
+            let _rc = (syms.mlx_array_set)(&mut new_ctx, self.ctx);
+        }
+        Self { ctx: new_ctx }
+    }
+}
+
 impl Drop for Array {
     fn drop(&mut self) {
         if !self.ctx.ctx.is_null() {

@@ -1024,7 +1024,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 2.6 - MLX Llama Minimal Inference
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -1054,6 +1054,21 @@ Acceptance:
 
 - Env-gated tiny Llama safetensors model produces logits.
 - One-token generation works through backend trait.
+
+Completion notes (2026-06-16):
+
+- Extracted `Backend` trait and types into new `crates/backend-trait` crate to avoid circular dependency between `llama-lm` and `mlx-backend`. Both crates now depend on `backend-trait`.
+- `llama-lm/src/backend.rs` and `llama-lm/src/types.rs` now re-export from `backend_trait`.
+- `llama-lm/src/registry.rs`: Added `register_safetensors_backend()` global factory registry. External crates can register a factory; `create_backend()` checks the registry for safetensors models.
+- `ffi.rs`: Added FFI function pointer types and symbols for `mlx_fast_rms_norm`, `mlx_fast_rope`, `mlx_fast_scaled_dot_product_attention`, `mlx_take_axis`, `mlx_expand_dims`, `mlx_tri`, `mlx_where`, `mlx_divide`, `mlx_negative`, `mlx_softmax`, `mlx_sigmoid`, `mlx_sqrt`. Added `MlxOptionalFloat` repr(C) struct for rope base parameter.
+- `ops.rs`: Added safe wrappers: `take`, `expand_dims`, `tri_matrix`, `where_op`, `divide`, `negative`, `softmax`, `sigmoid`, `sqrt`, `fast_rms_norm`, `fast_rope`, `fast_sdpa`.
+- `llama.rs` (new): Llama model implementation. `Linear` (weight+bias, forward=x@W.T+b), `Embedding` (take on axis 0), `RmsNorm` (via fast_rms_norm), `Attention` (Q/K/V projections, reshape, transpose, RoPE, SDPA with causal mask, O projection), `Mlp` (gate+up → SwiGLU → down), `KvCache` (concatenate on axis 2), `LlamaConfig` (from JSON), `LlamaModel` (embed → layer loop → norm → lm_head), `argmax` sampler. 7 unit tests.
+- `mlx_backend.rs` (new): `MlxBackend` implements `backend_trait::Backend`. Loads model from HuggingFace directory via `ModelManifest`, constructs `LlamaModel` from tensors, loads tokenizer from `tokenizer.json`. Implements `tokenize`, `detokenize`, `generate`, `generate_stream`, `generate_stream_output`. Uses argmax sampling for temperature=0. Registers itself as safetensors backend via `register_safetensors_backend`.
+- `array.rs`: Added `Clone` implementation using `mlx_array_set`.
+- `lib.rs`: Added `llama`, `mlx_backend` modules. Exports `MlxBackend`.
+- `Cargo.toml` (mlx-backend): Added `backend-trait`, `serde`, `tokenizers` dependencies.
+- `Cargo.toml` (workspace): Added `backend-trait` to members.
+- All 139 tests pass (87 llama-lm + 52 mlx-backend), cargo check clean, zero warnings.
 
 ### Milestone 2.7 - MLX Runner Subprocess
 
