@@ -13,9 +13,9 @@ use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
+use crate::backend::Backend;
 use crate::config::LlamaCppConfig;
-use crate::loader::resolve_model_path;
-use crate::runtime::Runtime;
+use crate::registry;
 use crate::types::{ChatMessage, GenerationOptions, StopReason};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -188,7 +188,7 @@ impl RateLimiter {
 }
 
 struct ServerState {
-    runtime: Mutex<Option<Runtime>>,
+    runtime: Mutex<Option<Box<dyn Backend>>>,
     config: ServerConfig,
     api_key: Option<String>,
     rate_limiter: Option<RateLimiter>,
@@ -372,7 +372,9 @@ async fn load_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<LoadRequest>,
 ) -> Result<Json<LoadResponse>, (StatusCode, Json<ErrorResponse>)> {
-    let model_path = resolve_model_path(&req.model_path).map_err(|e| {
+    let llamacpp_config = state.config.to_llamacpp_config();
+
+    let backend = registry::create_backend(&req.model_path, llamacpp_config).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -381,21 +383,10 @@ async fn load_handler(
         )
     })?;
 
-    let llamacpp_config = state.config.to_llamacpp_config();
-
-    let rt = Runtime::new(model_path.to_str().unwrap(), llamacpp_config).map_err(|e| {
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: e.to_string(),
-            }),
-        )
-    })?;
-
-    let info = rt.model_info();
+    let info = backend.model_info();
 
     let mut runtime = state.runtime.lock().unwrap();
-    *runtime = Some(rt);
+    *runtime = Some(backend);
 
     Ok(Json(LoadResponse {
         status: "ok".to_string(),
@@ -489,12 +480,15 @@ async fn chat_completions_handler(
                 return;
             }
 
-            let result = rt.generate_with_callback_output(&prompt, &options, |piece| {
+            let stream_chunk_id = chunk_id.clone();
+            let stream_model = model.clone();
+            let stream_tx = tx.clone();
+            let result = rt.generate_stream_output(&prompt, &options, Box::new(move |piece| {
                 let chunk = ChatCompletionChunk {
-                    id: chunk_id.clone(),
+                    id: stream_chunk_id.clone(),
                     object: "chat.completion.chunk".to_string(),
                     created,
-                    model: model.clone(),
+                    model: stream_model.clone(),
                     choices: vec![ChatChunkChoice {
                         index: 0,
                         delta: ChatDelta {
@@ -505,8 +499,8 @@ async fn chat_completions_handler(
                     }],
                     usage: None,
                 };
-                send_sse_data(&tx, &chunk).is_ok()
-            });
+                send_sse_data(&stream_tx, &chunk).is_ok()
+            }));
 
             // Drop the runtime lock before sending final messages
             drop(runtime);
@@ -673,7 +667,7 @@ async fn embeddings_handler(
         ));
     }
 
-    let mut data = Vec::new();
+    let mut all_embeddings = Vec::new();
     let mut total_tokens = 0usize;
 
     for (i, input) in inputs.iter().enumerate() {
@@ -687,7 +681,7 @@ async fn embeddings_handler(
         })?;
         total_tokens += tokens.len();
 
-        let embedding = rt.embed(input).map_err(|e| {
+        let embed_result = rt.embed(input).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -696,16 +690,19 @@ async fn embeddings_handler(
             )
         })?;
 
-        data.push(EmbeddingObject {
-            object: "embedding".to_string(),
-            index: i,
-            embedding,
-        });
+        for mut item in embed_result.data {
+            item.index = i;
+            all_embeddings.push(EmbeddingObject {
+                object: item.object,
+                index: item.index,
+                embedding: item.embedding,
+            });
+        }
     }
 
     Ok(Json(EmbeddingResponse {
         object: "list".to_string(),
-        data,
+        data: all_embeddings,
         model: req.model,
         usage: EmbeddingUsageResponse {
             prompt_tokens: total_tokens,
@@ -801,24 +798,22 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
 
     // Preload model if configured
     if let Some(ref model_path) = config.model_path {
-        let resolved = resolve_model_path(model_path)?;
         let llamacpp_config = config.to_llamacpp_config();
-        match Runtime::new(resolved.to_str().unwrap(), llamacpp_config) {
-            Ok(rt) => {
-                eprintln!("Preloaded model: {}", rt.model_path());
-                *state.runtime.lock().unwrap() = Some(rt);
+        match registry::create_backend(model_path, llamacpp_config) {
+            Ok(backend) => {
+                eprintln!("Preloaded model: {}", backend.model_info().model_path);
+                *state.runtime.lock().unwrap() = Some(backend);
             }
             Err(e) => {
                 eprintln!("Warning: failed to preload model {}: {}", model_path, e);
             }
         }
     } else if let Some(ref model) = config.model {
-        let resolved = resolve_model_path(model)?;
         let llamacpp_config = config.to_llamacpp_config();
-        match Runtime::new(resolved.to_str().unwrap(), llamacpp_config) {
-            Ok(rt) => {
-                eprintln!("Preloaded model: {}", rt.model_path());
-                *state.runtime.lock().unwrap() = Some(rt);
+        match registry::create_backend(model, llamacpp_config) {
+            Ok(backend) => {
+                eprintln!("Preloaded model: {}", backend.model_info().model_path);
+                *state.runtime.lock().unwrap() = Some(backend);
             }
             Err(e) => {
                 eprintln!("Warning: failed to preload model {}: {}", model, e);
@@ -1358,7 +1353,7 @@ n_gpu_layers = 99
             }
         };
 
-        let runtime = Runtime::new(
+        let backend = crate::llamacpp::LlamaCppBackend::new(
             &model_path,
             LlamaCppConfig {
                 n_ctx: Some(512),
@@ -1369,7 +1364,7 @@ n_gpu_layers = 99
         .expect("Failed to load non-embedding model");
 
         let state = Arc::new(ServerState {
-            runtime: Mutex::new(Some(runtime)),
+            runtime: Mutex::new(Some(Box::new(backend))),
             config: ServerConfig::default(),
             api_key: None,
             rate_limiter: None,

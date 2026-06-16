@@ -816,7 +816,7 @@ Phase 2 starts only after Phase 1 is stable.
 
 ### Milestone 2.1 - Backend Trait And Runtime Registry
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -844,6 +844,15 @@ Acceptance:
 
 - No behavior changes from Phase 1.
 - Tests pass with llama.cpp backend through the trait.
+
+Completion notes (2026-06-16):
+
+- `backend.rs`: Defined `Backend` trait with methods: `model_info`, `tokenize`, `detokenize`, `detokenize_piece`, `is_eog`, `token_eos`, `embeddings_enabled`, `supports_chat_template`, `apply_chat_template`, `generate`, `generate_stream`, `generate_stream_output`, `embed`, `memory_info`. Trait requires `Send`.
+- `llamacpp.rs`: `LlamaCppBackend` wraps existing `Runtime` and implements `Backend`. Provides `runtime()` and `runtime_mut()` accessors for direct runtime access.
+- `registry.rs`: `detect_format(path)` resolves model format (Gguf vs Safetensors) by checking file extension and directory contents before calling `resolve_model_path`. `create_backend(path, config)` dispatches to `LlamaCppBackend` for GGUF, returns clear error for safetensors.
+- `server.rs`: `ServerState.runtime` changed from `Mutex<Option<Runtime>>` to `Mutex<Option<Box<dyn Backend>>>`. All handlers now use `Backend` trait methods. `load_handler` and `run_server` use `registry::create_backend`.
+- `lib.rs`: Exports `Backend`, `LlamaCppBackend`, `ModelFormat`, `detect_format`, `create_backend`. `GenerationPipeline` now uses `Box<dyn Backend>` internally, with `backend()` and `backend_mut()` accessors.
+- 79 tests pass (13 new: 7 llamacpp backend trait tests, 6 registry tests including format detection and safetensors rejection)
 
 ### Milestone 2.2 - Runner Process Protocol
 

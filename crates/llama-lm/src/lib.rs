@@ -1,11 +1,17 @@
+pub mod backend;
 pub mod config;
+pub mod llamacpp;
 pub mod loader;
+pub mod registry;
 pub mod runtime;
 pub mod sampler;
 pub mod server;
 pub mod types;
 
+pub use backend::Backend;
+pub use llamacpp::LlamaCppBackend;
 pub use loader::resolve_model_path;
+pub use registry::{create_backend, detect_format, ModelFormat};
 pub use sampler::Sampler;
 pub use server::{run_server, run_server_from_toml_path, ServerConfig};
 pub use types::{
@@ -14,20 +20,19 @@ pub use types::{
 };
 
 use config::LlamaCppConfig;
-use runtime::Runtime;
 
 pub struct GenerationPipeline {
-    runtime: Runtime,
+    backend: Box<dyn Backend>,
 }
 
 impl GenerationPipeline {
     pub fn new(model_path: &str, config: LlamaCppConfig) -> anyhow::Result<Self> {
-        let runtime = Runtime::new(model_path, config)?;
-        Ok(Self { runtime })
+        let backend = create_backend(model_path, config)?;
+        Ok(Self { backend })
     }
 
     pub fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> anyhow::Result<GenerateOutput> {
-        self.runtime.generate(prompt, options)
+        self.backend.generate(prompt, options)
     }
 
     pub fn generate_stream<F>(
@@ -37,20 +42,20 @@ impl GenerationPipeline {
         on_token: F,
     ) -> anyhow::Result<GenerationMetrics>
     where
-        F: FnMut(&str) -> bool,
+        F: FnMut(&str) -> bool + Send + 'static,
     {
-        self.runtime.generate_with_callback(prompt, options, on_token)
+        self.backend.generate_stream(prompt, options, Box::new(on_token))
     }
 
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
-        self.runtime.apply_chat_template(messages)
+        self.backend.apply_chat_template(messages)
     }
 
-    pub fn runtime(&self) -> &Runtime {
-        &self.runtime
+    pub fn backend(&self) -> &dyn Backend {
+        &*self.backend
     }
 
-    pub fn runtime_mut(&mut self) -> &mut Runtime {
-        &mut self.runtime
+    pub fn backend_mut(&mut self) -> &mut dyn Backend {
+        &mut *self.backend
     }
 }
