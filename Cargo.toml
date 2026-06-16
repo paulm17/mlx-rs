@@ -1,27 +1,14 @@
 [workspace]
 members = [
-    "crates/mlx-sys",
-    "crates/mlx-core",
-    "crates/mlx-nn",
-    "crates/mlx-models",
     "crates/mlx-lm",
-    "crates/mlx-vlm",
 ]
 resolver = "2"
 
 [workspace.dependencies]
 anyhow = "1"
-thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-tokenizers = "0.20"
-minijinja = { version = "2", features = ["loader"] }
 clap = { version = "4", features = ["derive"] }
-bindgen = "0.69"
-rand = "0.8"
-hf-hub = { version = "0.4.3", default-features = false, features = ["ureq"] }
-image = "0.25"
-dotenvy = "0.15"
 
 [package]
 name = "mlx-rs"
@@ -36,28 +23,9 @@ path = "src/bin/generate.rs"
 name = "mlx-server"
 path = "src/bin/mlx-server.rs"
 
-[[bin]]
-name = "embed_bench"
-path = "src/bin/embed_bench.rs"
-
-[[bin]]
-name = "simple_vision_test"
-path = "src/bin/simple_vision_test.rs"
-
-[[bin]]
-name = "diffusion_gemma_trace"
-path = "src/bin/diffusion_gemma_trace.rs"
-
 [dependencies]
 mlx-lm = { path = "crates/mlx-lm" }
-mlx-models = { path = "crates/mlx-models" }
-mlx-nn = { path = "crates/mlx-nn" }
-mlx-core = { path = "crates/mlx-core" }
-mlx-vlm = { path = "crates/mlx-vlm" }
 anyhow.workspace = true
 clap.workspace = true
-tokenizers.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-dotenvy.workspace = true
-ctrlc = "3"

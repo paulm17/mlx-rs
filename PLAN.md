@@ -253,7 +253,7 @@ Status legend:
 
 ### Milestone 1.1 - Workspace Demolition And Skeleton
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -299,6 +299,16 @@ Acceptance:
 - `README.md` says the project is being rewritten around llama.cpp/GGUF.
 
 Do not implement llama.cpp yet in this milestone.
+
+Completion notes (2026-06-16):
+
+- Deleted crates: mlx-sys, mlx-core, mlx-nn, mlx-models, mlx-vlm
+- Deleted binaries: check_tokens, compare_all, compare_llm_layers, compare_logits, diagnose_first_token, diffusion_gemma_trace, embed_bench, generate_diag, simple_vision_test, test_gemma4, test_gemma4_vision
+- Deleted directories: python_tests/, scripts/, test_harness/, tests/, config/, crates/mlx-lm/src/bin/
+- Root Cargo.toml: workspace members reduced to `crates/mlx-lm` only; root package kept for generate + mlx-server binaries
+- mlx-lm placeholder modules: config, runtime, sampler, server, types
+- Binaries stub with "not yet implemented" exit
+- README updated to reflect llama.cpp rewrite status
 
 ### Milestone 1.2 - Public Types And Config Contract
 

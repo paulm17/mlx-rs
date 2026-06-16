@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
+/// MLX-RS local chat server (llama.cpp backend - not yet implemented).
 #[derive(Parser, Debug)]
 #[command(name = "mlx-server", about = "Start local MLX chat server")]
 struct Args {
@@ -8,11 +9,11 @@ struct Args {
     #[arg(long, default_value = "config.toml")]
     config: std::path::PathBuf,
 
-    /// Override bind address (e.g. 0.0.0.0:3000)
+    /// Override bind address
     #[arg(long)]
     bind: Option<String>,
 
-    /// Override port (used when --bind is not set)
+    /// Override port
     #[arg(long)]
     port: Option<u16>,
 
@@ -20,50 +21,21 @@ struct Args {
     #[arg(long)]
     model: Option<String>,
 
-    /// Optional API key (x-api-key or Authorization: Bearer)
+    /// Optional API key
     #[arg(long)]
     api_key: Option<String>,
 
-    /// Optional global chat rate limit (requests per minute), 0 disables
+    /// Optional rate limit (requests per minute)
     #[arg(long)]
     rate_limit_rpm: Option<u32>,
 
-    /// Enable/disable thinking mode in chat templates
+    /// Enable/disable thinking mode
     #[arg(long)]
     thinking: Option<bool>,
-
-    /// Maximum number of same-length embedding inputs to batch per forward pass
-    #[arg(long)]
-    embeddings_batch_size: Option<usize>,
 }
 
 fn main() -> Result<()> {
-    dotenvy::dotenv().ok();
-    let args = Args::parse();
-    let mut cfg = mlx_lm::ServerConfig::from_toml_path(&args.config)?;
-
-    if let Some(v) = args.bind {
-        cfg.bind = Some(v);
-    }
-    if let Some(v) = args.port {
-        cfg.port = Some(v);
-    }
-    if let Some(v) = args.model {
-        cfg.model_path = Some(v);
-        cfg.model = None;
-    }
-    if let Some(v) = args.api_key {
-        cfg.api_key = Some(v);
-    }
-    if let Some(v) = args.rate_limit_rpm {
-        cfg.rate_limit_rpm = Some(v);
-    }
-    if let Some(v) = args.thinking {
-        cfg.thinking = Some(v);
-    }
-    if let Some(v) = args.embeddings_batch_size {
-        cfg.embeddings_batch_size = Some(v);
-    }
-
-    mlx_lm::run_server(cfg)
+    let _args = Args::parse();
+    eprintln!("mlx-rs is being rewritten around llama.cpp/GGUF. Server is not yet implemented.");
+    std::process::exit(1);
 }
