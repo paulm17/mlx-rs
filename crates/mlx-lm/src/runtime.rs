@@ -199,6 +199,51 @@ impl Runtime {
         }
     }
 
+    pub fn apply_chat_template(&self, messages: &[crate::types::ChatMessage]) -> Result<String> {
+        use llama_cpp_2::model::LlamaChatMessage;
+
+        // Try to get the native chat template from the model
+        let template = self.model.chat_template(None).ok();
+
+        let chat_messages: Vec<LlamaChatMessage> = messages
+            .iter()
+            .map(|m| LlamaChatMessage::new(m.role.clone(), m.content.clone()))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| anyhow::anyhow!("Failed to create chat message: {}", e))?;
+
+        if let Some(ref tmpl) = template {
+            // Use native template with add_ass=true to get the assistant prefix
+            let result = self
+                .model
+                .apply_chat_template(tmpl, &chat_messages, true)
+                .map_err(|e| anyhow::anyhow!("Failed to apply chat template: {}", e))?;
+            return Ok(result);
+        }
+
+        // Fallback: Llama2-style template
+        let mut prompt = String::new();
+        for msg in messages {
+            match msg.role.as_str() {
+                "system" => {
+                    prompt.push_str(&format!("[INST] <<SYS>>\n{}\n<</SYS>>\n\n", msg.content));
+                }
+                "user" => {
+                    if prompt.is_empty() {
+                        prompt.push_str(&format!("[INST] {} [/INST]", msg.content));
+                    } else {
+                        prompt.push_str(&format!("{} [/INST]", msg.content));
+                    }
+                }
+                "assistant" => {
+                    prompt.push_str(&msg.content);
+                    prompt.push_str(" ");
+                }
+                _ => {}
+            }
+        }
+        Ok(prompt)
+    }
+
     pub fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput> {
         let mut text = String::new();
 

@@ -402,8 +402,6 @@ async fn chat_completions_handler(
         }
     }
 
-    let prompt = build_prompt_from_messages(&req.messages);
-
     let options = GenerationOptions {
         max_tokens: req.max_tokens,
         temperature: req.temperature,
@@ -416,7 +414,7 @@ async fn chat_completions_handler(
         let (tx, rx) = mpsc::channel::<Result<String, String>>(64);
         let state = state.clone();
         let model = req.model.clone();
-        let prompt = prompt.clone();
+        let messages = req.messages.clone();
         let options = options.clone();
 
         tokio::task::spawn_blocking(move || {
@@ -425,6 +423,14 @@ async fn chat_completions_handler(
                 Some(rt) => rt,
                 None => {
                     let _ = tx.blocking_send(Err("No model loaded".to_string()));
+                    return;
+                }
+            };
+
+            let prompt = match rt.apply_chat_template(&messages) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(format!("Template error: {}", e)));
                     return;
                 }
             };
@@ -515,6 +521,15 @@ async fn chat_completions_handler(
                 ));
             }
         };
+
+        let prompt = rt.apply_chat_template(&req.messages).map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("Template error: {}", e),
+                }),
+            )
+        })?;
 
         let output = rt.generate(&prompt, &options).map_err(|e| {
             (
@@ -649,6 +664,7 @@ async fn embeddings_handler(
 
 // --- Helpers ---
 
+#[cfg(test)]
 fn build_prompt_from_messages(messages: &[ChatMessage]) -> String {
     let mut prompt = String::new();
     for msg in messages {

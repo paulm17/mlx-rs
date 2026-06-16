@@ -723,7 +723,7 @@ Completion notes:
 
 ### Milestone 1.11 - Chat Template Strategy
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -752,6 +752,12 @@ Acceptance:
   - system + user
   - assistant history
   - fallback when native template unavailable
+
+Completion notes:
+
+- `runtime.rs`: Added `apply_chat_template(messages) -> Result<String>`. Uses `model.chat_template(None)` to get native GGUF template, falls back to Llama2-style `[INST]` format. Uses `add_ass=true` to include assistant prefix.
+- `server.rs`: Updated both streaming and non-streaming chat completions to use `runtime.apply_chat_template` instead of hardcoded `build_prompt_from_messages`. Moved fallback helper to `#[cfg(test)]` only.
+- 41 tests pass, zero warnings.
 
 ### Milestone 1.12 - Documentation And Cleanup
 
