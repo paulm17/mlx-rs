@@ -1,0 +1,10 @@
+[package]
+name = "mlx-backend"
+version = "0.1.0"
+edition = "2021"
+description = "Dynamic loader for Apple MLX-C runtime"
+
+[dependencies]
+anyhow.workspace = true
+libloading = "0.8"
+glob = "0.3"

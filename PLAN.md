@@ -901,7 +901,7 @@ Completion notes:
 
 ### Milestone 2.3 - MLX Dynamic Loader Skeleton
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -932,6 +932,15 @@ Acceptance:
 
 - On a machine with MLX-C runtime, loader reports version/device.
 - Without MLX-C runtime, loader returns a clear unavailable error.
+
+Completion notes (2026-06-16):
+
+- Created `crates/mlx-backend` workspace crate with `libloading`, `glob` dependencies.
+- `ffi.rs`: `MlxString`/`MlxDevice` (`#[repr(C)]` wrappers around `*mut c_void`), `MlxDeviceType` enum, 8 function pointer types (`MlxVersionFn`, `MlxStringDataFn`, `MlxStringFreeFn`, `MlxDeviceIsAvailableFn`, `MlxGetDefaultDeviceFn`, `MlxDeviceGetTypeFn`, `MlxDeviceCountFn`, `MlxDeviceFreeFn`), `MlxSymbols` struct with `load()` method.
+- `loader.rs`: `OnceLock<Result<MlxState>>` for thread-safe once-init. Library search mirrors Ollama's `libOllamaRoots()`: exe-relative `lib/ollama` dirs, `build/lib/ollama`, `mlx_*` subdirs (reverse-sorted for version preference), env overrides `MLX_RS_MLX_LIBRARY` + `OLLAMA_LLM_LIBRARY` (compat). Platform-specific lib names: `libmlxc.dylib` (macOS), `libmlxc.so` (Linux), `libmlxc.dll`/`mlxc.dll` (Windows). `prepend_library_path` sets `DYLD_LIBRARY_PATH`/`LD_LIBRARY_PATH`. Public API: `check_init()`, `loaded_library_path()`, `version()`, `default_device_available()`, `device_count()`.
+- Symbol loading pattern: MLX-C exports actual functions from `libmlxc`, not function-pointer-to-pointer (that's the `generated.h` indirection for C). Rust `libloading::Library::get()` returns `*const MlxVersionFn` which we dereference to get the function pointer.
+- 6 tests: platform lib names, forced variant env, OLLAMA_LLM_LIBRARY compat, candidate dirs, loaded_library_path before init, init without library (graceful failure).
+- All 93 tests pass (87 llama-lm + 6 mlx-backend), cargo check clean, zero warnings.
 
 ### Milestone 2.4 - MLX Array And Ops Minimal Binding
 

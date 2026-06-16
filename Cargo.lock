@@ -962,6 +962,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "mlx-backend"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "glob",
+ "libloading",
+]
+
+[[package]]
 name = "native-tls"
 version = "0.2.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

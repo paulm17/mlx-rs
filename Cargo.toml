@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/llama-lm",
+    "crates/mlx-backend",
 ]
 resolver = "2"
 
