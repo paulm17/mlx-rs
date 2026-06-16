@@ -35,7 +35,11 @@ impl ServerConfig {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(path)?;
-        let parsed: serde_json::Value = basic_toml_to_json(&content)
+        Self::from_toml_str(&content)
+    }
+
+    pub fn from_toml_str(content: &str) -> Result<Self> {
+        let parsed: serde_json::Value = basic_toml_to_json(content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config: {e}"))?;
         let server = parsed
             .get("server")

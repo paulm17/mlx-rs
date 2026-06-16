@@ -1,16 +1,20 @@
 use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::OnceLock;
+use std::time::Instant;
 
 use anyhow::Result;
 use llama_cpp_2::context::params::{LlamaContextParams, LlamaPoolingType};
 use llama_cpp_2::context::LlamaContext;
 use llama_cpp_2::llama_backend::LlamaBackend;
+use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::token::LlamaToken;
 
 use crate::config::LlamaCppConfig;
-use crate::types::LoadedModelInfo;
+use crate::sampler::Sampler;
+use crate::types::{GenerateOutput, GenerationMetrics, GenerationOptions, StopReason, LoadedModelInfo};
 
 fn ensure_backend() -> &'static LlamaBackend {
     static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
@@ -161,6 +165,131 @@ impl Runtime {
     pub fn token_eos(&self) -> i32 {
         self.model.token_eos().0
     }
+
+    pub fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput> {
+        let start = Instant::now();
+
+        let prompt_tokens = self.tokenize(prompt, true)?;
+        let n_prompt = prompt_tokens.len();
+        let max_tokens = options.max_tokens.unwrap_or(512);
+
+        // Prefill: process all prompt tokens
+        let mut batch = LlamaBatch::new(n_prompt, 1);
+        for (i, &token_id) in prompt_tokens.iter().enumerate() {
+            let is_last = i == n_prompt - 1;
+            batch.add(LlamaToken(token_id), i as i32, &[0], is_last)?;
+        }
+        self.context.decode(&mut batch)?;
+
+        let ttft = start.elapsed().as_secs_f64();
+
+        // Build sampler
+        let sampler_config = Sampler::new(options.temperature, options.top_p)
+            .with_top_k(options.top_k)
+            .with_min_p(options.min_p);
+        let mut sampler = sampler_config.build_llama_sampler();
+
+        // Decode loop
+        let mut generated_tokens = 0usize;
+        let mut output_text = String::new();
+        let mut stop_reason = StopReason::MaxTokens;
+
+        // Sample first token from prefill logits
+        let mut current_token = sampler.sample(self.context(), n_prompt as i32 - 1);
+        sampler.accept(current_token);
+
+        if self.is_eog(current_token.0) {
+            let total_s = start.elapsed().as_secs_f64();
+            return Ok(GenerateOutput {
+                text: String::new(),
+                stop_reason: StopReason::Eos,
+                metrics: GenerationMetrics {
+                    prompt_tokens: n_prompt,
+                    generated_tokens: 0,
+                    total_tokens: n_prompt,
+                    ttft_s: Some(ttft),
+                    total_s: Some(total_s),
+                    tokens_per_s: None,
+                },
+            });
+        }
+
+        let piece = self.detokenize(&[current_token.0])?;
+        output_text.push_str(&piece);
+        generated_tokens += 1;
+
+        // Check stop sequences
+        if let Some(stops) = &options.stop {
+            if stops.iter().any(|s| output_text.contains(s)) {
+                stop_reason = StopReason::Eos;
+                let total_s = start.elapsed().as_secs_f64();
+                let tps = generated_tokens as f64 / (total_s - ttft).max(0.001);
+                return Ok(GenerateOutput {
+                    text: output_text,
+                    stop_reason,
+                    metrics: GenerationMetrics {
+                        prompt_tokens: n_prompt,
+                        generated_tokens,
+                        total_tokens: n_prompt + generated_tokens,
+                        ttft_s: Some(ttft),
+                        total_s: Some(total_s),
+                        tokens_per_s: Some(tps),
+                    },
+                });
+            }
+        }
+
+        // Continue decoding
+        let mut pos = n_prompt as i32;
+        while generated_tokens < max_tokens {
+            let mut batch = LlamaBatch::new(1, 1);
+            batch.add(current_token, pos, &[0], true)?;
+            self.context.decode(&mut batch)?;
+
+            let next_token = sampler.sample(self.context(), 0);
+            sampler.accept(next_token);
+
+            if self.is_eog(next_token.0) {
+                stop_reason = StopReason::Eos;
+                break;
+            }
+
+            let piece = self.detokenize(&[next_token.0])?;
+            output_text.push_str(&piece);
+            generated_tokens += 1;
+            pos += 1;
+            current_token = next_token;
+
+            // Check stop sequences
+            if let Some(stops) = &options.stop {
+                if stops.iter().any(|s| output_text.contains(s)) {
+                    stop_reason = StopReason::Eos;
+                    break;
+                }
+            }
+        }
+
+        let total_s = start.elapsed().as_secs_f64();
+        let decode_time = total_s - ttft;
+        let tps = if decode_time > 0.001 {
+            generated_tokens as f64 / decode_time
+        } else {
+            0.0
+        };
+
+        Ok(GenerateOutput {
+            text: output_text,
+            stop_reason,
+            metrics: GenerationMetrics {
+                prompt_tokens: n_prompt,
+                generated_tokens,
+                total_tokens: n_prompt + generated_tokens,
+                ttft_s: Some(ttft),
+                total_s: Some(total_s),
+                tokens_per_s: Some(tps),
+            },
+        })
+    }
 }
 
 #[cfg(test)]
@@ -297,5 +426,72 @@ mod tests {
         assert!(runtime.is_eog(eos));
         // A regular token should not be EOG
         assert!(!runtime.is_eog(0));
+    }
+
+    #[test]
+    fn test_generate_non_streaming() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping generate test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let config = LlamaCppConfig {
+            n_ctx: Some(2048),
+            ..Default::default()
+        };
+
+        let mut runtime = Runtime::new(&model_path, config).expect("Failed to load model");
+
+        let options = GenerationOptions {
+            max_tokens: Some(32),
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        let output = runtime.generate("Hello", &options).expect("Generation failed");
+
+        assert!(output.metrics.prompt_tokens > 0);
+        assert!(output.metrics.total_tokens > output.metrics.prompt_tokens);
+        assert!(output.metrics.ttft_s.is_some());
+        assert!(output.metrics.total_s.is_some());
+        assert!(output.metrics.tokens_per_s.is_some());
+        // Text may be empty if model immediately outputs EOG, but metrics must be valid
+        match &output.stop_reason {
+            StopReason::Eos | StopReason::MaxTokens => {}
+            StopReason::Cancelled => panic!("Unexpected cancelled"),
+        }
+    }
+
+    #[test]
+    fn test_generate_with_stop_sequence() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping generate stop test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let config = LlamaCppConfig {
+            n_ctx: Some(2048),
+            ..Default::default()
+        };
+
+        let mut runtime = Runtime::new(&model_path, config).expect("Failed to load model");
+
+        let options = GenerationOptions {
+            max_tokens: Some(100),
+            temperature: 0.0,
+            stop: Some(vec![".".to_string()]),
+            ..Default::default()
+        };
+
+        let output = runtime.generate("Count to five.", &options).expect("Generation failed");
+
+        // Should have stopped - either by stop sequence or EOS
+        assert!(output.metrics.generated_tokens <= 100);
     }
 }

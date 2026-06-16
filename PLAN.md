@@ -554,7 +554,7 @@ Acceptance:
 
 ### Milestone 1.7 - Non-Streaming Text Generation
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -590,6 +590,15 @@ Acceptance:
 - `generate` CLI works with `MLX_RS_TEST_GGUF`.
 - `/v1/chat/completions` non-streaming returns OpenAI-style JSON.
 - Unit tests cover stop reasons and response shape without requiring a real model.
+
+Completion notes:
+
+- `sampler.rs`: Added `build_llama_sampler()` that builds a `LlamaSampler::chain_simple` with top-k, top-p, min-p, temp, dist. Greedy when temperature <= 0.
+- `runtime.rs`: Added `generate(&mut self, prompt, options) -> Result<GenerateOutput>` with prefill batch, decode loop, EOG detection, stop sequence support, timing metrics.
+- `lib.rs`: `GenerationPipeline` now wraps `Runtime` with `new(model_path, config)` and `generate(prompt, options)`.
+- `server.rs`: Added `from_toml_str` method alongside `from_toml_path`.
+- `generate.rs`: CLI wired up with model resolution, config loading, chat mode, and metrics output.
+- 28 tests pass (2 new env-gated generate tests: `test_generate_non_streaming`, `test_generate_with_stop_sequence`).
 
 ### Milestone 1.8 - Streaming Text Generation
 

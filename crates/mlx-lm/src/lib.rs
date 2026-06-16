@@ -13,10 +13,28 @@ pub use types::{
     GenerationMetrics, GenerationOptions, LoadedModelInfo, StopReason,
 };
 
-pub struct GenerationPipeline;
+use config::LlamaCppConfig;
+use runtime::Runtime;
+
+pub struct GenerationPipeline {
+    runtime: Runtime,
+}
 
 impl GenerationPipeline {
-    pub fn new() -> anyhow::Result<Self> {
-        anyhow::bail!("GenerationPipeline not yet implemented; llama.cpp backend coming in milestone 1.7")
+    pub fn new(model_path: &str, config: LlamaCppConfig) -> anyhow::Result<Self> {
+        let runtime = Runtime::new(model_path, config)?;
+        Ok(Self { runtime })
+    }
+
+    pub fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> anyhow::Result<GenerateOutput> {
+        self.runtime.generate(prompt, options)
+    }
+
+    pub fn runtime(&self) -> &Runtime {
+        &self.runtime
+    }
+
+    pub fn runtime_mut(&mut self) -> &mut Runtime {
+        &mut self.runtime
     }
 }
