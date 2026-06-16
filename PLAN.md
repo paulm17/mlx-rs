@@ -312,7 +312,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 1.2 - Public Types And Config Contract
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -365,9 +365,20 @@ Acceptance:
 - `cargo check --workspace` passes.
 - Existing config files parse.
 
+Completion notes (2026-06-16):
+
+- Public types defined in `types.rs`: ChatMessage (with system/user/assistant constructors), GenerationOptions, GenerationMetrics, GenerateOutput, StopReason, EmbeddingData, EmbeddingUsage, EmbeddingOutput, LoadedModelInfo
+- ServerConfig extended with all llama.cpp keys: n_ctx, n_batch, n_ubatch, n_gpu_layers, n_threads, n_threads_batch, embedding, pooling, use_mmap, use_mlock, flash_attn
+- ServerConfig::to_llamacpp_config() bridge method
+- LlamaCppConfig kept in config.rs for runtime use
+- GenerationPipeline facade stub in lib.rs
+- Sampler has builder methods: with_top_k, with_min_p
+- 7 config parsing tests: empty, basic, llamacpp keys, comments/blanks, partial, to_llamacpp_config, toml value types
+- Added tempfile dev-dependency for tests
+
 ### Milestone 1.3 - GGUF Model Path Resolution
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -393,9 +404,18 @@ Acceptance:
 - Unit tests cover all path cases.
 - Server `/llm/load` can validate a path but still does not run inference.
 
+Completion notes (2026-06-16):
+
+- `resolve_model_path` implemented in `loader.rs`
+- Handles: direct .gguf file, directory with single .gguf, directory with split GGUF shards (NNNNN-of-NNNNN pattern)
+- Rejects: missing path, non-gguf file, safetensors/config.json directories, empty dirs, ambiguous multi-gguf dirs
+- Shard detection: parses `-NNNNN-of-NNNNN` suffix, groups by base name, returns first shard sorted by index
+- 12 loader tests: direct file, nonexistent, non-gguf, single in dir, split shards, multiple unrelated, safetensors, config.json only, empty dir, shard name parsing, not-shard patterns, unsorted shards
+- Re-exported as `mlx_lm::resolve_model_path`
+
 ### Milestone 1.4 - Choose And Pin llama.cpp Binding
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -426,9 +446,34 @@ Acceptance:
 - `cargo check -p mlx-lm` links or at least compiles wrapper types.
 - Document exact crate version and API mapping in this file.
 
+Completion notes (2026-06-16):
+
+- Selected `llama-cpp-2` v0.1.146 (with `llama-cpp-sys-2` v0.1.146)
+- No `build.rs` needed; crate builds llama.cpp from source via cmake
+- API mapping to llama.cpp C API:
+  - `llama_backend_init` -> `llama_cpp_2::llama_backend::LlamaBackend`
+  - `llama_model_load_from_file` -> `llama_cpp_2::model::LlamaModel`
+  - `llama_init_from_model` -> `llama_cpp_2::context::LlamaContext`
+  - `llama_tokenize` -> `LlamaModel::tokenize()`
+  - `llama_token_to_piece` -> `LlamaModel::token_to_str()`
+  - `llama_decode` -> `LlamaContext::decode()`
+  - `llama_get_logits_ith` -> `LlamaContext::get_logits_ith()`
+  - `llama_sampler_chain_init/add/sample/free` -> `llama_cpp_2::sampling::LlamaSampler`
+  - `llama_chat_apply_template` -> `LlamaModel::apply_chat_template()`
+  - `llama_get_embeddings` -> `LlamaContext::embeddings()`
+  - `llama_model_n_embd` -> `LlamaModel::n_embd()`
+  - `llama_model_n_ctx_train` -> `LlamaModel::n_ctx_train()`
+  - `llama_n_ctx` -> `LlamaContext::n_ctx()`
+  - `llama_vocab_is_eog` -> `LlamaModel::is_eog_token()`
+  - `llama_vocab_eos` -> `LlamaModel::token_eos()`
+  - `list_llama_ggml_backend_devices` -> GPU/Metal device discovery
+  - `llama_memory_clear/seq_rm/seq_cp` -> `LlamaContext::kv_cache_*`
+- Modules confirmed: model, context, context::params, context::kv_cache, context::session, llama_batch, sampling, token, gguf, llama_backend, openai
+- `openai` module provides `OpenAIChatTemplateParams` for OpenAI-compatible chat templates
+
 ### Milestone 1.5 - llama.cpp Model Load And Metadata
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -467,9 +512,21 @@ Acceptance:
 - Non-env unit tests do not require a real model.
 - `cargo check --workspace` passes.
 
+Completion notes (2026-06-16):
+
+- Runtime struct holds LlamaModel + LlamaContext<'static> (lifetime transmute safe because model never moves)
+- Backend initialization via `OnceLock<LlamaBackend>` (thread-safe, once-only)
+- Model params: n_gpu_layers, use_mmap, use_mlock via `LlamaModelParams::with_*`
+- Context params: n_ctx, n_batch, n_ubatch, n_threads, n_threads_batch, embeddings, pooling_type via `LlamaContextParams::with_*`
+- Pooling type mapping: "mean"->Mean, "cls"->Cls, "last"->Last, "none"->None, else Unspecified
+- Metadata exposed: model_path, context_length (n_ctx), embedding_dimension (n_embd), vocab_size (n_vocab), n_ctx_train, embeddings_enabled
+- model() and context() accessors for downstream use
+- 4 runtime tests: backend_init, nonexistent_model (catch_unwind for panic), real_model (env-gated), embeddings (env-gated)
+- Note: LlamaModel::load_from_file panics on nonexistent paths (upstream behavior)
+
 ### Milestone 1.6 - Tokenization And Detokenization
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 

@@ -5,5 +5,10 @@ edition = "2021"
 
 [dependencies]
 anyhow = { workspace = true }
+encoding_rs = "0.8"
+llama-cpp-2 = "0.1.146"
 serde = { workspace = true }
 serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"

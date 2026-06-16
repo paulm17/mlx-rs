@@ -1,4 +1,3 @@
-#[derive(Debug, Clone)]
 pub struct Sampler {
     pub temperature: f32,
     pub top_p: f32,
@@ -18,6 +17,16 @@ impl Sampler {
 
     pub fn greedy() -> Self {
         Self::new(0.0, 1.0)
+    }
+
+    pub fn with_top_k(mut self, top_k: usize) -> Self {
+        self.top_k = top_k;
+        self
+    }
+
+    pub fn with_min_p(mut self, min_p: f32) -> Self {
+        self.min_p = min_p;
+        self
     }
 }
 
