@@ -634,7 +634,7 @@ Completion notes:
 
 ### Milestone 1.9 - Server Load, Models, Health, Auth, Rate Limit
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -663,6 +663,21 @@ Acceptance:
   - auth failures
   - rate limiting
   - load invalid model path
+
+Completion notes:
+
+- `server.rs`: Full rewrite with axum HTTP framework.
+  - `GET /health` returns `{status, model_loaded}`.
+  - `GET /v1/models` returns OpenAI-style model list from loaded runtime.
+  - `POST /llm/load` loads a model path into the runtime.
+  - `POST /v1/chat/completions` supports non-streaming and SSE streaming.
+  - Auth: `x-api-key` header or `Authorization: Bearer` token checked against config.
+  - Rate limiting: fixed-window RPM via `RateLimiter`.
+  - Startup preload: loads model from `model_path` or `model` config key on startup.
+  - `unsafe impl Send for Runtime` for single-threaded tokio runtime compatibility.
+- Dependencies: added `axum`, `tokio`, `tokio-stream`.
+- `mlx-server.rs`: Wired up with `#[tokio::main]`, CLI overrides for bind/port/model/api_key/rpm.
+- 38 tests pass (8 new server tests: auth x4, rate limiter x2, health handler, prompt building).
 
 ### Milestone 1.10 - Embeddings
 

@@ -28,6 +28,10 @@ pub struct Runtime {
     embeddings_enabled: bool,
 }
 
+// Safety: Runtime is only used within a Mutex on a single-threaded tokio runtime.
+// The LlamaContext pointers are never accessed concurrently.
+unsafe impl Send for Runtime {}
+
 impl Runtime {
     pub fn new(model_path: &str, config: LlamaCppConfig) -> Result<Self> {
         let path = Path::new(model_path);

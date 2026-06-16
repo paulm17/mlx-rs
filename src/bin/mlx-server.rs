@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::Parser;
 
-/// MLX-RS local chat server (llama.cpp backend - not yet implemented).
+/// MLX-RS local chat server (llama.cpp backend).
 #[derive(Parser, Debug)]
 #[command(name = "mlx-server", about = "Start local MLX chat server")]
 struct Args {
@@ -28,14 +28,29 @@ struct Args {
     /// Optional rate limit (requests per minute)
     #[arg(long)]
     rate_limit_rpm: Option<u32>,
-
-    /// Enable/disable thinking mode
-    #[arg(long)]
-    thinking: Option<bool>,
 }
 
-fn main() -> Result<()> {
-    let _args = Args::parse();
-    eprintln!("mlx-rs is being rewritten around llama.cpp/GGUF. Server is not yet implemented.");
-    std::process::exit(1);
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<()> {
+    let args = Args::parse();
+
+    let mut config = mlx_lm::ServerConfig::from_toml_path(&args.config)?;
+
+    if let Some(bind) = args.bind {
+        config.bind = Some(bind);
+    }
+    if let Some(port) = args.port {
+        config.port = Some(port);
+    }
+    if let Some(model) = args.model {
+        config.model_path = Some(model);
+    }
+    if let Some(api_key) = args.api_key {
+        config.api_key = Some(api_key);
+    }
+    if let Some(rpm) = args.rate_limit_rpm {
+        config.rate_limit_rpm = Some(rpm);
+    }
+
+    mlx_lm::run_server(config).await
 }
