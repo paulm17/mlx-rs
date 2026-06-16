@@ -1146,7 +1146,7 @@ Completion notes (2026-06-16):
 
 ### Milestone 2.9 - MLX KV Cache And Prefix Reuse
 
-Status: `[ ]`
+Status: `[x]`
 
 Objective:
 
@@ -1168,6 +1168,13 @@ Acceptance:
 
 - Multi-turn generation does not leak memory.
 - Repeated prompt smoke test has stable output and memory.
+
+Completion notes (2026-06-16):
+
+- `cache.rs` (new): `PrefixCache` with compressed trie for token prefix matching. `find(tokens)` returns `(match_len, Option<&caches>)`. `insert(tokens, caches)` stores cache snapshots at token boundaries. `clear()` resets the trie. `entry_count()` for diagnostics. 5 tests.
+- `llama.rs` (modified): `KvCache` now derives `Clone` to support cache snapshot/restore.
+- `mlx_backend.rs` (modified): All three generate methods (`generate`, `generate_stream`, `generate_stream_output`) now use `PrefixCache` for prefix reuse. On each call: (1) check prefix cache for matching token prefix, (2) skip forward pass for matched prefix, (3) only process remaining tokens, (4) insert final cache state into prefix cache after generation, (5) call `memory::clear_cache()` to prevent unbounded memory growth. `MlxBackend` now holds `prefix_cache: PrefixCache` field initialized in `load()`.
+- All 150 tests pass (88 llama-lm + 62 mlx-backend), cargo check clean, zero warnings.
 
 ### Milestone 2.10 - Additional MLX Model Families
 

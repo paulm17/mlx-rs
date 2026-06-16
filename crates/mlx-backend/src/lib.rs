@@ -1,4 +1,5 @@
 pub mod array;
+pub mod cache;
 pub mod chat_template;
 pub mod ffi;
 pub mod llama;

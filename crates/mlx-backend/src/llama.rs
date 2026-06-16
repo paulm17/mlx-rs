@@ -149,6 +149,7 @@ impl Layer {
     }
 }
 
+#[derive(Clone)]
 pub struct KvCache {
     k_cache: Option<Array>,
     v_cache: Option<Array>,

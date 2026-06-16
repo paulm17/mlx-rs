@@ -8,6 +8,7 @@ use backend_trait::types::{
 };
 
 use crate::array::Array;
+use crate::cache::PrefixCache;
 use crate::chat_template::ChatTemplate;
 use crate::llama::{argmax, KvCache, LlamaConfig, LlamaModel};
 use crate::manifest::ModelManifest;
@@ -18,6 +19,7 @@ pub struct MlxBackend {
     config: LlamaConfig,
     model_path: String,
     chat_template: ChatTemplate,
+    prefix_cache: PrefixCache,
 }
 
 impl MlxBackend {
@@ -45,12 +47,16 @@ impl MlxBackend {
         let chat_template = ChatTemplate::load(dir)
             .unwrap_or_else(|_| ChatTemplate::default_llama3());
 
+        let num_layers = config.num_hidden_layers as usize;
+        let prefix_cache = PrefixCache::new(num_layers, 64);
+
         Ok(Self {
             model,
             tokenizer,
             config,
             model_path: dir.display().to_string(),
             chat_template,
+            prefix_cache,
         })
     }
 }
@@ -129,24 +135,35 @@ impl backend_trait::Backend for MlxBackend {
         let tokens = self.tokenize(prompt, true)?;
         let prompt_len = tokens.len();
         let max_tokens = options.max_tokens.unwrap_or(512);
-        let mut all_tokens = tokens.clone();
-        let mut caches: Vec<KvCache> = (0..self.model.num_layers()).map(|_| KvCache::new()).collect();
         let start = Instant::now();
+
+        let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
+        let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
+            cached.clone()
+        } else {
+            (0..self.model.num_layers()).map(|_| KvCache::new()).collect()
+        };
+
+        let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
+        let mut all_tokens = tokens.clone();
+
+        if !prefill_tokens.is_empty() {
+            let input_ids = make_input_ids(prefill_tokens)?;
+            let positions = make_positions(prefix_len, prefill_tokens.len())?;
+            self.model.forward(&input_ids, &mut caches, &positions)?;
+        }
 
         let eos_token = self.token_eos();
         let mut generated = 0;
         let mut text = String::new();
 
         for _ in 0..max_tokens {
-            let input_ids = make_input_ids(&all_tokens)?;
-            let positions = make_positions(all_tokens.len() - all_tokens.len(), all_tokens.len())?;
+            let last_token = *all_tokens.last().unwrap();
+            let input_ids = make_input_ids(&[last_token])?;
+            let positions = make_positions(all_tokens.len() - 1, 1)?;
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
-            let next_token = if options.temperature <= 0.0 {
-                argmax(&logits)?
-            } else {
-                argmax(&logits)?
-            };
+            let next_token = argmax(&logits)?;
 
             if next_token == eos_token {
                 break;
@@ -158,6 +175,11 @@ impl backend_trait::Backend for MlxBackend {
             let piece = self.detokenize_piece(next_token)?;
             text.push_str(&piece);
         }
+
+        if generated > 0 {
+            self.prefix_cache.insert(&all_tokens, caches);
+        }
+        let _ = crate::memory::clear_cache();
 
         let elapsed = start.elapsed().as_secs_f64();
         Ok(GenerateOutput {
@@ -183,16 +205,31 @@ impl backend_trait::Backend for MlxBackend {
         let tokens = self.tokenize(prompt, true)?;
         let prompt_len = tokens.len();
         let max_tokens = options.max_tokens.unwrap_or(512);
-        let mut all_tokens = tokens.clone();
-        let mut caches: Vec<KvCache> = (0..self.model.num_layers()).map(|_| KvCache::new()).collect();
         let start = Instant::now();
+
+        let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
+        let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
+            cached.clone()
+        } else {
+            (0..self.model.num_layers()).map(|_| KvCache::new()).collect()
+        };
+
+        let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
+        let mut all_tokens = tokens.clone();
+
+        if !prefill_tokens.is_empty() {
+            let input_ids = make_input_ids(prefill_tokens)?;
+            let positions = make_positions(prefix_len, prefill_tokens.len())?;
+            self.model.forward(&input_ids, &mut caches, &positions)?;
+        }
 
         let eos_token = self.token_eos();
         let mut generated = 0;
 
         for _ in 0..max_tokens {
-            let input_ids = make_input_ids(&all_tokens)?;
-            let positions = make_positions(0, all_tokens.len())?;
+            let last_token = *all_tokens.last().unwrap();
+            let input_ids = make_input_ids(&[last_token])?;
+            let positions = make_positions(all_tokens.len() - 1, 1)?;
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
             let next_token = argmax(&logits)?;
@@ -209,6 +246,11 @@ impl backend_trait::Backend for MlxBackend {
                 break;
             }
         }
+
+        if generated > 0 {
+            self.prefix_cache.insert(&all_tokens, caches);
+        }
+        let _ = crate::memory::clear_cache();
 
         let elapsed = start.elapsed().as_secs_f64();
         Ok(GenerationMetrics {
@@ -230,17 +272,32 @@ impl backend_trait::Backend for MlxBackend {
         let tokens = self.tokenize(prompt, true)?;
         let prompt_len = tokens.len();
         let max_tokens = options.max_tokens.unwrap_or(512);
-        let mut all_tokens = tokens.clone();
-        let mut caches: Vec<KvCache> = (0..self.model.num_layers()).map(|_| KvCache::new()).collect();
         let start = Instant::now();
+
+        let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
+        let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
+            cached.clone()
+        } else {
+            (0..self.model.num_layers()).map(|_| KvCache::new()).collect()
+        };
+
+        let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
+        let mut all_tokens = tokens.clone();
+
+        if !prefill_tokens.is_empty() {
+            let input_ids = make_input_ids(prefill_tokens)?;
+            let positions = make_positions(prefix_len, prefill_tokens.len())?;
+            self.model.forward(&input_ids, &mut caches, &positions)?;
+        }
 
         let eos_token = self.token_eos();
         let mut generated = 0;
         let mut text = String::new();
 
         for _ in 0..max_tokens {
-            let input_ids = make_input_ids(&all_tokens)?;
-            let positions = make_positions(0, all_tokens.len())?;
+            let last_token = *all_tokens.last().unwrap();
+            let input_ids = make_input_ids(&[last_token])?;
+            let positions = make_positions(all_tokens.len() - 1, 1)?;
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
             let next_token = argmax(&logits)?;
@@ -258,6 +315,11 @@ impl backend_trait::Backend for MlxBackend {
                 break;
             }
         }
+
+        if generated > 0 {
+            self.prefix_cache.insert(&all_tokens, caches);
+        }
+        let _ = crate::memory::clear_cache();
 
         let elapsed = start.elapsed().as_secs_f64();
         Ok(GenerateOutput {
