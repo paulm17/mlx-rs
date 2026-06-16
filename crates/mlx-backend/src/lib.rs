@@ -20,3 +20,10 @@ pub use loader::{check_init, default_device_available, device_count, loaded_libr
 pub use manifest::ModelManifest;
 pub use mlx_backend::MlxBackend;
 pub use tensors::SafetensorsFile;
+
+#[ctor::ctor]
+fn register_mlx_backend() {
+    llama_lm::register_safetensors_backend(|path: &std::path::Path| -> anyhow::Result<Box<dyn backend_trait::Backend>> {
+        Ok(Box::new(MlxBackend::load(path)?))
+    });
+}
