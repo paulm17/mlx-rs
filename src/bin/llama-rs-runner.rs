@@ -12,6 +12,7 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 use backend_trait::Backend;
+use llama_lm::MlxConfig;
 use mlx_backend::MlxBackend;
 
 #[derive(Parser)]
@@ -207,7 +208,7 @@ async fn main() -> Result<()> {
         anyhow::bail!("model path does not exist: {}", model_path.display());
     }
 
-    let backend = MlxBackend::load(&model_path)?;
+    let backend = MlxBackend::load(&model_path, &MlxConfig::default())?;
 
     let state = RunnerState {
         backend: Arc::new(Mutex::new(Some(backend))),

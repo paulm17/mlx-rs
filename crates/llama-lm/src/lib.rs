@@ -13,7 +13,7 @@ pub mod types;
 pub use backend::Backend;
 pub use llamacpp::LlamaCppBackend;
 pub use loader::{resolve_model_path, resolve_hf_safetensors_dir};
-pub use registry::{create_backend, detect_format, register_safetensors_backend, ModelFormat};
+pub use registry::{create_backend, create_backend_with_mlx, detect_format, register_safetensors_backend, ModelFormat};
 pub use runner::{CompletionOptions, CompletionRequest, CompletionResponse, RunnerClient};
 pub use sampler::Sampler;
 pub use server::{run_server, run_server_from_toml_path, ServerConfig};
@@ -22,7 +22,7 @@ pub use types::{
     GenerationMetrics, GenerationOptions, LoadedModelInfo, StopReason,
 };
 
-use config::LlamaCppConfig;
+pub use config::{LlamaCppConfig, MlxConfig};
 
 pub struct GenerationPipeline {
     backend: Box<dyn Backend>,

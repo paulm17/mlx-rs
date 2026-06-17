@@ -25,7 +25,7 @@ pub use tensors::SafetensorsFile;
 
 #[ctor::ctor]
 fn register_mlx_backend() {
-    llama_lm::register_safetensors_backend(|path: &std::path::Path| -> anyhow::Result<Box<dyn backend_trait::Backend>> {
-        Ok(Box::new(MlxBackend::load(path)?))
+    llama_lm::register_safetensors_backend(|path: &std::path::Path, mlx_config: &llama_lm::MlxConfig| -> anyhow::Result<Box<dyn backend_trait::Backend>> {
+        Ok(Box::new(MlxBackend::load(path, mlx_config)?))
     });
 }

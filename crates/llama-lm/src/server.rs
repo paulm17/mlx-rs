@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
 
 use crate::backend::Backend;
-use crate::config::LlamaCppConfig;
+use crate::config::{LlamaCppConfig, MlxConfig};
 use crate::registry;
 use crate::types::{ChatMessage, GenerationOptions, StopReason};
 
@@ -40,6 +40,10 @@ pub struct ServerConfig {
     pub use_mmap: Option<bool>,
     pub use_mlock: Option<bool>,
     pub flash_attn: Option<bool>,
+    // MLX runtime config
+    pub mlx_cache_limit: Option<usize>,
+    pub mlx_compile: Option<bool>,
+    pub mlx_prefill_chunk_size: Option<usize>,
 }
 
 impl ServerConfig {
@@ -95,6 +99,14 @@ impl ServerConfig {
             use_mmap: self.use_mmap,
             use_mlock: self.use_mlock,
             flash_attn: self.flash_attn,
+        }
+    }
+
+    pub fn to_mlx_config(&self) -> MlxConfig {
+        MlxConfig {
+            cache_limit: self.mlx_cache_limit,
+            compile: self.mlx_compile,
+            prefill_chunk_size: self.mlx_prefill_chunk_size,
         }
     }
 }
@@ -373,8 +385,9 @@ async fn load_handler(
     Json(req): Json<LoadRequest>,
 ) -> Result<Json<LoadResponse>, (StatusCode, Json<ErrorResponse>)> {
     let llamacpp_config = state.config.to_llamacpp_config();
+    let mlx_config = state.config.to_mlx_config();
 
-    let backend = registry::create_backend(&req.model_path, llamacpp_config).map_err(|e| {
+    let backend = registry::create_backend_with_mlx(&req.model_path, llamacpp_config, mlx_config).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -799,7 +812,8 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
     // Preload model if configured
     if let Some(ref model_path) = config.model_path {
         let llamacpp_config = config.to_llamacpp_config();
-        match registry::create_backend(model_path, llamacpp_config) {
+        let mlx_config = config.to_mlx_config();
+        match registry::create_backend_with_mlx(model_path, llamacpp_config, mlx_config) {
             Ok(backend) => {
                 eprintln!("Preloaded model: {}", backend.model_info().model_path);
                 *state.runtime.lock().unwrap() = Some(backend);
@@ -810,7 +824,8 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         }
     } else if let Some(ref model) = config.model {
         let llamacpp_config = config.to_llamacpp_config();
-        match registry::create_backend(model, llamacpp_config) {
+        let mlx_config = config.to_mlx_config();
+        match registry::create_backend_with_mlx(model, llamacpp_config, mlx_config) {
             Ok(backend) => {
                 eprintln!("Preloaded model: {}", backend.model_info().model_path);
                 *state.runtime.lock().unwrap() = Some(backend);
@@ -920,6 +935,21 @@ flash_attn = true
     }
 
     #[test]
+    fn test_parse_mlx_config_keys() {
+        let toml = r#"
+[server]
+mlx_cache_limit = 128
+mlx_compile = false
+mlx_prefill_chunk_size = 512
+"#;
+        let f = write_temp_toml(toml);
+        let cfg = ServerConfig::from_toml_path(f.path()).unwrap();
+        assert_eq!(cfg.mlx_cache_limit, Some(128));
+        assert_eq!(cfg.mlx_compile, Some(false));
+        assert_eq!(cfg.mlx_prefill_chunk_size, Some(512));
+    }
+
+    #[test]
     fn test_parse_comments_and_blanks() {
         let toml = r#"
 # This is a comment
@@ -964,6 +994,29 @@ n_gpu_layers = 99
         assert_eq!(llamacpp.n_gpu_layers, Some(32));
         assert_eq!(llamacpp.flash_attn, Some(true));
         assert!(llamacpp.n_batch.is_none());
+    }
+
+    #[test]
+    fn test_to_mlx_config() {
+        let cfg = ServerConfig {
+            mlx_cache_limit: Some(128),
+            mlx_compile: Some(false),
+            mlx_prefill_chunk_size: Some(512),
+            ..Default::default()
+        };
+        let mlx = cfg.to_mlx_config();
+        assert_eq!(mlx.cache_limit, Some(128));
+        assert_eq!(mlx.compile, Some(false));
+        assert_eq!(mlx.prefill_chunk_size, Some(512));
+    }
+
+    #[test]
+    fn test_to_mlx_config_default() {
+        let cfg = ServerConfig::default();
+        let mlx = cfg.to_mlx_config();
+        assert!(mlx.cache_limit.is_none());
+        assert!(mlx.compile.is_none());
+        assert!(mlx.prefill_chunk_size.is_none());
     }
 
     #[test]

@@ -17,3 +17,8 @@ port = 8080
 # use_mmap = true         # memory-map model file
 # use_mlock = false       # lock model in RAM
 # flash_attn = false      # flash attention
+
+# MLX engine options
+# mlx_cache_limit = 64        # max prefix cache entries
+# mlx_compile = true          # enable MLX compilation
+# mlx_prefill_chunk_size = 2048  # prefill chunk size in tokens

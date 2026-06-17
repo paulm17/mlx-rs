@@ -11,6 +11,7 @@ use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_sys_2::llama_flash_attn_type;
 
 use crate::config::LlamaCppConfig;
 use crate::sampler::Sampler;
@@ -84,6 +85,14 @@ impl Runtime {
                 _ => LlamaPoolingType::Unspecified,
             };
             ctx_params = ctx_params.with_pooling_type(pooling_type);
+        }
+        if let Some(flash_attn) = config.flash_attn {
+            let policy: llama_flash_attn_type = if flash_attn {
+                unsafe { std::mem::transmute(1i32) }
+            } else {
+                unsafe { std::mem::transmute(0i32) }
+            };
+            ctx_params = ctx_params.with_flash_attention_policy(policy);
         }
 
         // Safety: the model allocation is stable behind Box, and Runtime declares

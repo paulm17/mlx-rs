@@ -16,12 +16,18 @@ use crate::model::Model;
 use crate::registry;
 use crate::sampler::Sampler;
 
+const DEFAULT_CACHE_CAPACITY: usize = 64;
+const DEFAULT_PREFILL_CHUNK_SIZE: usize = 2048;
+
 pub struct MlxBackend {
     model: Box<dyn Model>,
     tokenizer: tokenizers::Tokenizer,
     model_path: String,
     chat_template: ChatTemplate,
     prefix_cache: PrefixCache,
+    prefill_chunk_size: usize,
+    #[allow(dead_code)]
+    compile_enabled: bool,
     max_position_embeddings: i32,
     hidden_size: i32,
     vocab_size: i32,
@@ -40,7 +46,7 @@ fn choose_next_token(logits: &Array, sampler: &Sampler) -> anyhow::Result<i32> {
 }
 
 impl MlxBackend {
-    pub fn load(dir: &Path) -> Result<Self> {
+    pub fn load(dir: &Path, mlx_config: &llama_lm::MlxConfig) -> Result<Self> {
         // Check MLX availability before loading files
         crate::loader::check_init()
             .context("MLX-C runtime (libmlxc.dylib) not found; safetensors models require \
@@ -100,7 +106,10 @@ impl MlxBackend {
         let max_position_embeddings = model.max_position_embeddings();
         let hidden_size = model.hidden_size();
         let vocab_size = model.vocab_size();
-        let prefix_cache = PrefixCache::new(num_layers, 64);
+        let cache_capacity = mlx_config.cache_limit.unwrap_or(DEFAULT_CACHE_CAPACITY);
+        let prefix_cache = PrefixCache::new(num_layers, cache_capacity);
+        let prefill_chunk_size = mlx_config.prefill_chunk_size.unwrap_or(DEFAULT_PREFILL_CHUNK_SIZE);
+        let compile_enabled = mlx_config.compile.unwrap_or(true);
 
         Ok(Self {
             model,
@@ -108,6 +117,8 @@ impl MlxBackend {
             model_path: dir.display().to_string(),
             chat_template,
             prefix_cache,
+            prefill_chunk_size,
+            compile_enabled,
             max_position_embeddings,
             hidden_size,
             vocab_size,
@@ -137,21 +148,18 @@ fn make_input_ids(tokens: &[i32]) -> Result<Array> {
     Array::from_data_i32(tokens, &[1, n])
 }
 
-const PREFILL_CHUNK_SIZE: usize = 2048;
-
-/// Run prefill in fixed-size chunks, evaluating logits (and therefore the KV
-/// cache graph) after each chunk so the GPU stream encoder stays valid.
 fn prefill_chunked(
     model: &dyn Model,
     tokens: &[i32],
     start_pos: usize,
     caches: &mut [KvCache],
+    chunk_size: usize,
 ) -> anyhow::Result<()> {
     if tokens.is_empty() {
         return Ok(());
     }
     let mut pos = start_pos;
-    for chunk in tokens.chunks(PREFILL_CHUNK_SIZE) {
+    for chunk in tokens.chunks(chunk_size) {
         let input_ids = make_input_ids(chunk)?;
         let positions = make_positions(pos, chunk.len())?;
         let logits = model.forward(&input_ids, caches, &positions)?;
@@ -242,7 +250,7 @@ impl backend_trait::Backend for MlxBackend {
         let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
         let mut all_tokens = tokens.clone();
 
-        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches)?;
+        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches, self.prefill_chunk_size)?;
 
         let mut generated = 0;
         let mut text = String::new();
@@ -309,7 +317,7 @@ impl backend_trait::Backend for MlxBackend {
         let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
         let mut all_tokens = tokens.clone();
 
-        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches)?;
+        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches, self.prefill_chunk_size)?;
 
         let mut generated = 0;
 
@@ -373,7 +381,7 @@ impl backend_trait::Backend for MlxBackend {
         let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
         let mut all_tokens = tokens.clone();
 
-        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches)?;
+        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches, self.prefill_chunk_size)?;
 
         let mut generated = 0;
         let mut text = String::new();

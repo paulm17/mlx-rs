@@ -4,7 +4,7 @@ use std::sync::{Mutex, OnceLock};
 use anyhow::Result;
 
 use crate::backend::Backend;
-use crate::config::LlamaCppConfig;
+use crate::config::{LlamaCppConfig, MlxConfig};
 use crate::llamacpp::LlamaCppBackend;
 use crate::loader::{resolve_model_path, resolve_hf_safetensors_dir, looks_like_hf_repo_id, looks_like_hf_gguf_ref};
 use crate::subprocess::RunnerSubprocess;
@@ -15,7 +15,7 @@ pub enum ModelFormat {
     Safetensors,
 }
 
-type SafetensorsFactory = Box<dyn Fn(&std::path::Path) -> Result<Box<dyn Backend>> + Send + Sync>;
+type SafetensorsFactory = Box<dyn Fn(&std::path::Path, &MlxConfig) -> Result<Box<dyn Backend>> + Send + Sync>;
 
 fn safetensors_registry() -> &'static Mutex<Vec<SafetensorsFactory>> {
     static REGISTRY: OnceLock<Mutex<Vec<SafetensorsFactory>>> = OnceLock::new();
@@ -24,7 +24,7 @@ fn safetensors_registry() -> &'static Mutex<Vec<SafetensorsFactory>> {
 
 pub fn register_safetensors_backend<F>(factory: F)
 where
-    F: Fn(&std::path::Path) -> Result<Box<dyn Backend>> + Send + Sync + 'static,
+    F: Fn(&std::path::Path, &MlxConfig) -> Result<Box<dyn Backend>> + Send + Sync + 'static,
 {
     let mut reg = safetensors_registry().lock().unwrap();
     reg.push(Box::new(factory));
@@ -80,12 +80,16 @@ pub fn detect_format(path: &str) -> Result<ModelFormat> {
 }
 
 pub fn create_backend(path: &str, config: LlamaCppConfig) -> Result<Box<dyn Backend>> {
+    create_backend_with_mlx(path, config, MlxConfig::default())
+}
+
+pub fn create_backend_with_mlx(path: &str, llamacpp_config: LlamaCppConfig, mlx_config: MlxConfig) -> Result<Box<dyn Backend>> {
     let format = detect_format(path)?;
 
     match format {
         ModelFormat::Gguf => {
             let resolved = resolve_model_path(path)?;
-            let backend = LlamaCppBackend::new(resolved.to_str().unwrap(), config)?;
+            let backend = LlamaCppBackend::new(resolved.to_str().unwrap(), llamacpp_config)?;
             Ok(Box::new(backend))
         }
         ModelFormat::Safetensors => {
@@ -97,7 +101,7 @@ pub fn create_backend(path: &str, config: LlamaCppConfig) -> Result<Box<dyn Back
 
             let reg = safetensors_registry().lock().unwrap();
             if let Some(factory) = reg.first() {
-                return factory(&resolved);
+                return factory(&resolved, &mlx_config);
             }
 
             let subprocess = RunnerSubprocess::spawn(&resolved)?;
