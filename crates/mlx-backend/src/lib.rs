@@ -13,6 +13,7 @@ pub mod model;
 pub mod ops;
 pub mod qwen3;
 pub mod registry;
+pub mod sampler;
 pub mod tensors;
 
 pub use array::Array;

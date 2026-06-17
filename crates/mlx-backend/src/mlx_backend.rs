@@ -10,10 +10,11 @@ use backend_trait::types::{
 use crate::array::Array;
 use crate::cache::PrefixCache;
 use crate::chat_template::ChatTemplate;
-use crate::llama::{argmax, KvCache};
+use crate::llama::KvCache;
 use crate::manifest::ModelManifest;
 use crate::model::Model;
 use crate::registry;
+use crate::sampler::Sampler;
 
 pub struct MlxBackend {
     model: Box<dyn Model>,
@@ -25,6 +26,13 @@ pub struct MlxBackend {
     hidden_size: i32,
     vocab_size: i32,
     eog_token_ids: std::collections::HashSet<i32>,
+}
+
+fn choose_next_token(logits: &Array, sampler: &Sampler) -> anyhow::Result<i32> {
+    crate::ops::eval(&[logits])?;
+    let data = logits.data_f32()?;
+    let idx = sampler.sample(data);
+    Ok(idx as i32)
 }
 
 impl MlxBackend {
@@ -58,8 +66,8 @@ impl MlxBackend {
             anyhow::bail!("tokenizer.json not found in {}", dir.display());
         };
 
-        let chat_template = ChatTemplate::load(dir)
-            .unwrap_or_else(|_| ChatTemplate::default_llama3());
+        let chat_template = ChatTemplate::load(dir, Some(&architecture))
+            .unwrap_or_else(|_| ChatTemplate::default_for_architecture(Some(&architecture)));
 
         let mut eog_token_ids = Self::eog_token_ids_from_tokenizer(&tokenizer);
         if let Ok(config_str) = std::fs::read_to_string(dir.join("tokenizer_config.json")) {
@@ -166,9 +174,9 @@ impl backend_trait::Backend for MlxBackend {
             .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
         let mut ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
         if add_bos {
-            if let Some(bos_id) = self.tokenizer.get_vocab(true).get("<|begin_of_text|>") {
-                if ids.first() != Some(&(*bos_id as i32)) {
-                    ids.insert(0, *bos_id as i32);
+            if let Some(&bos_id) = self.tokenizer.get_vocab(true).get(self.chat_template.bos_token()) {
+                if ids.first() != Some(&(bos_id as i32)) {
+                    ids.insert(0, bos_id as i32);
                 }
             }
         }
@@ -219,6 +227,8 @@ impl backend_trait::Backend for MlxBackend {
         let max_tokens = options.max_tokens.unwrap_or(512);
         let start = Instant::now();
 
+        let sampler = Sampler::new(options.temperature, options.top_p, options.top_k, options.min_p);
+
         let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
         let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
             cached.clone()
@@ -242,8 +252,7 @@ impl backend_trait::Backend for MlxBackend {
             eprintln!("[MLX_DECODE] step position={} token={}", pos, last_token);
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
-            crate::ops::eval(&[&logits])?;
-            let next_token = argmax(&logits)?;
+            let next_token = choose_next_token(&logits, &sampler)?;
 
             if self.is_eog(next_token) {
                 break;
@@ -287,6 +296,8 @@ impl backend_trait::Backend for MlxBackend {
         let max_tokens = options.max_tokens.unwrap_or(512);
         let start = Instant::now();
 
+        let sampler = Sampler::new(options.temperature, options.top_p, options.top_k, options.min_p);
+
         let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
         let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
             cached.clone()
@@ -307,8 +318,7 @@ impl backend_trait::Backend for MlxBackend {
             let positions = make_positions(all_tokens.len() - 1, 1)?;
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
-            crate::ops::eval(&[&logits])?;
-            let next_token = argmax(&logits)?;
+            let next_token = choose_next_token(&logits, &sampler)?;
 
             if self.is_eog(next_token) {
                 break;
@@ -350,6 +360,8 @@ impl backend_trait::Backend for MlxBackend {
         let max_tokens = options.max_tokens.unwrap_or(512);
         let start = Instant::now();
 
+        let sampler = Sampler::new(options.temperature, options.top_p, options.top_k, options.min_p);
+
         let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
         let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
             cached.clone()
@@ -371,8 +383,7 @@ impl backend_trait::Backend for MlxBackend {
             let positions = make_positions(all_tokens.len() - 1, 1)?;
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
-            crate::ops::eval(&[&logits])?;
-            let next_token = argmax(&logits)?;
+            let next_token = choose_next_token(&logits, &sampler)?;
 
             if self.is_eog(next_token) {
                 break;

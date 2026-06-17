@@ -687,8 +687,6 @@ mod tests {
         if !mlx_available() {
             return;
         }
-        use crate::ffi::MlxDtype;
-
         // Create a small U32 packed weight: 4 rows, 2 U32 per row (16 4-bit values)
         // Each U32 packs 8 4-bit values. For a 4x16 matrix:
         //   group_size = 16*8/2 = 64? No. group_size for 4-bit: weight_cols * 8 / scale_cols

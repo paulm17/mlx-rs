@@ -1439,6 +1439,7 @@ dependencies = [
  "libloading",
  "llama-lm",
  "minijinja",
+ "rand",
  "safetensors",
  "serde",
  "serde_json",
