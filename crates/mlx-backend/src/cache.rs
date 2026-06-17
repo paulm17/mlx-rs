@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
-use crate::llama::KvCache;
+use crate::llama::LayerCache;
 
 #[derive(Clone)]
 struct TrieNode {
     children: HashMap<i32, TrieNode>,
-    caches: Option<Vec<KvCache>>,
+    caches: Option<Vec<LayerCache>>,
     token_count: usize,
 }
 
@@ -36,10 +36,10 @@ impl PrefixCache {
         }
     }
 
-    pub fn find(&self, tokens: &[i32]) -> (usize, Option<&Vec<KvCache>>) {
+    pub fn find(&self, tokens: &[i32]) -> (usize, Option<&Vec<LayerCache>>) {
         let mut node = &self.root;
         let mut matched = 0;
-        let mut last_cache: Option<&Vec<KvCache>> = None;
+        let mut last_cache: Option<&Vec<LayerCache>> = None;
 
         for &tok in tokens {
             if let Some(child) = node.children.get(&tok) {
@@ -56,7 +56,7 @@ impl PrefixCache {
         (matched, last_cache)
     }
 
-    pub fn insert(&mut self, tokens: &[i32], caches: Vec<KvCache>) {
+    pub fn insert(&mut self, tokens: &[i32], caches: Vec<LayerCache>) {
         let mut node = &mut self.root;
         for &tok in tokens {
             node = node.children.entry(tok).or_insert_with(TrieNode::new);

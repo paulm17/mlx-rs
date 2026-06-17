@@ -287,6 +287,7 @@ pub type MlxWhereFn = unsafe extern "C" fn(
 ) -> c_int;
 
 pub type MlxUnaryOpFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, MlxStream) -> c_int;
+pub type MlxSoftmaxAxisFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, c_int, MlxStream) -> c_int;
 
 // Argmax (no-axis variant: reduces entire array to scalar index)
 pub type MlxArgmaxFn = unsafe extern "C" fn(
@@ -501,6 +502,9 @@ pub struct MlxSymbols {
     pub mlx_sigmoid: MlxUnaryOpFn,
     pub mlx_sqrt: MlxUnaryOpFn,
     pub mlx_tanh: MlxUnaryOpFn,
+    pub mlx_exp: MlxUnaryOpFn,
+    pub mlx_log: MlxUnaryOpFn,
+    pub mlx_softmax_axis: MlxSoftmaxAxisFn,
     // Argmax
     pub mlx_argmax: MlxArgmaxFn,
     pub mlx_argmax_axis: MlxArgmaxAxisFn,
@@ -613,6 +617,9 @@ impl MlxSymbols {
                 mlx_sigmoid: load_sym!(lib, b"mlx_sigmoid\0", MlxUnaryOpFn),
                 mlx_sqrt: load_sym!(lib, b"mlx_sqrt\0", MlxUnaryOpFn),
                 mlx_tanh: load_sym!(lib, b"mlx_tanh\0", MlxUnaryOpFn),
+                mlx_exp: load_sym!(lib, b"mlx_exp\0", MlxUnaryOpFn),
+                mlx_log: load_sym!(lib, b"mlx_log\0", MlxUnaryOpFn),
+                mlx_softmax_axis: load_sym!(lib, b"mlx_softmax_axis\0", MlxSoftmaxAxisFn),
                 // Quantization ops
                 mlx_argmax: load_sym!(lib, b"mlx_argmax\0", MlxArgmaxFn),
                 mlx_argmax_axis: load_sym!(lib, b"mlx_argmax_axis\0", MlxArgmaxAxisFn),

@@ -4,11 +4,78 @@ use crate::ops;
 
 pub trait LinearLayer: Send {
     fn forward(&self, x: &Array) -> anyhow::Result<Array>;
+    fn as_dense_weight(&self) -> Option<&Array> { None }
 }
 
 pub trait EmbeddingLayer: Send {
     fn forward(&self, indices: &Array) -> anyhow::Result<Array>;
     fn weight(&self) -> &Array;
+}
+
+#[derive(Clone)]
+pub enum LayerCache {
+    Attention(KvCache),
+    Recurrent(RecurrentCache),
+}
+
+impl LayerCache {
+    pub fn as_attention_mut(&mut self) -> Option<&mut KvCache> {
+        match self {
+            LayerCache::Attention(kv) => Some(kv),
+            _ => None,
+        }
+    }
+
+    pub fn as_recurrent_mut(&mut self) -> Option<&mut RecurrentCache> {
+        match self {
+            LayerCache::Recurrent(rc) => Some(rc),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct RecurrentCache {
+    pub conv_state: Option<Array>,
+    pub delta_state: Option<Array>,
+    pub conv_tail: usize,
+    pub conv_dim: usize,
+    pub num_v_heads: usize,
+    pub head_v_dim: usize,
+    pub head_k_dim: usize,
+}
+
+impl RecurrentCache {
+    pub fn new(conv_tail: usize, conv_dim: usize, num_v_heads: usize, head_v_dim: usize, head_k_dim: usize) -> Self {
+        Self {
+            conv_state: None,
+            delta_state: None,
+            conv_tail,
+            conv_dim,
+            num_v_heads,
+            head_v_dim,
+            head_k_dim,
+        }
+    }
+
+    pub fn get_states(&mut self, batch_size: usize, dtype: crate::ffi::MlxDtype) -> anyhow::Result<(&Array, &Array)> {
+        if self.conv_state.is_none() {
+            self.conv_state = Some(ops::zeros(
+                &[batch_size, self.conv_tail, self.conv_dim],
+                dtype,
+            )?);
+            self.delta_state = Some(ops::zeros(
+                &[batch_size, self.num_v_heads, self.head_v_dim, self.head_k_dim],
+                crate::ffi::MlxDtype::Float32,
+            )?);
+        }
+        Ok((self.conv_state.as_ref().unwrap(), self.delta_state.as_ref().unwrap()))
+    }
+
+    pub fn put_states(&mut self, conv_state: Array, delta_state: Array) {
+        self.conv_state = Some(conv_state);
+        self.delta_state = Some(delta_state);
+    }
 }
 
 pub struct Linear {
@@ -24,6 +91,10 @@ impl Linear {
     pub fn forward(&self, x: &Array) -> anyhow::Result<Array> {
         <Self as LinearLayer>::forward(self, x)
     }
+
+    pub fn weight(&self) -> &Array {
+        &self.weight
+    }
 }
 
 impl LinearLayer for Linear {
@@ -34,6 +105,10 @@ impl LinearLayer for Linear {
             Some(b) => ops::add(&out, b),
             None => Ok(out),
         }
+    }
+
+    fn as_dense_weight(&self) -> Option<&Array> {
+        Some(&self.weight)
     }
 }
 
@@ -384,12 +459,14 @@ impl Model for LlamaModel {
     fn forward(
         &self,
         input_ids: &Array,
-        caches: &mut [KvCache],
+        caches: &mut [LayerCache],
         positions: &Array,
     ) -> anyhow::Result<Array> {
         let mut h = self.embed_tokens.forward(input_ids)?;
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &mut caches[i], positions, &self.config)?;
+            if let Some(LayerCache::Attention(kv)) = caches.get_mut(i) {
+                h = layer.forward(&h, kv, positions, &self.config)?;
+            }
         }
         let h = self.norm.forward(&h)?;
         self.lm_head.forward(&h)
@@ -411,8 +488,8 @@ impl Model for LlamaModel {
         self.config.vocab_size
     }
 
-    fn new_caches(&self) -> Vec<KvCache> {
-        (0..self.layers.len()).map(|_| KvCache::new()).collect()
+    fn new_caches(&self) -> Vec<LayerCache> {
+        (0..self.layers.len()).map(|_| LayerCache::Attention(KvCache::new())).collect()
     }
 }
 

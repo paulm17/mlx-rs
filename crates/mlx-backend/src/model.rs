@@ -1,11 +1,11 @@
 use crate::array::Array;
-use crate::llama::KvCache;
+use crate::llama::LayerCache;
 
 pub trait Model: Send {
     fn forward(
         &self,
         input_ids: &Array,
-        caches: &mut [KvCache],
+        caches: &mut [LayerCache],
         positions: &Array,
     ) -> anyhow::Result<Array>;
 
@@ -17,7 +17,5 @@ pub trait Model: Send {
 
     fn vocab_size(&self) -> i32;
 
-    /// Create a fresh KV cache for each layer. Models with sliding-window
-    /// attention should return rotating caches for the appropriate layers.
-    fn new_caches(&self) -> Vec<KvCache>;
+    fn new_caches(&self) -> Vec<LayerCache>;
 }

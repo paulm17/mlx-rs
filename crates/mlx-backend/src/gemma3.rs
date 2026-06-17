@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::array::Array;
-use crate::llama::{Embedding, KvCache, Linear, RmsNorm, resolve_weight_prefix};
+use crate::llama::{Embedding, KvCache, LayerCache, Linear, RmsNorm, resolve_weight_prefix};
 use crate::model::Model;
 use crate::ops;
 
@@ -189,7 +189,7 @@ impl Model for Gemma3Model {
     fn forward(
         &self,
         input_ids: &Array,
-        caches: &mut [KvCache],
+        caches: &mut [LayerCache],
         positions: &Array,
     ) -> anyhow::Result<Array> {
         let mut h = self.embed_tokens.forward(input_ids)?;
@@ -197,7 +197,9 @@ impl Model for Gemma3Model {
         h = ops::multiply(&h, &Array::from_f32(scale)?)?;
 
         for (i, layer) in self.layers.iter().enumerate() {
-            h = layer.forward(&h, &mut caches[i], positions, &self.config)?;
+            if let Some(LayerCache::Attention(kv)) = caches.get_mut(i) {
+                h = layer.forward(&h, kv, positions, &self.config)?;
+            }
         }
         let h = self.norm.forward(&h)?;
         self.lm_head.forward(&h)
@@ -219,8 +221,8 @@ impl Model for Gemma3Model {
         self.config.vocab_size
     }
 
-    fn new_caches(&self) -> Vec<KvCache> {
-        (0..self.layers.len()).map(|_| KvCache::new()).collect()
+    fn new_caches(&self) -> Vec<LayerCache> {
+        (0..self.layers.len()).map(|_| LayerCache::Attention(KvCache::new())).collect()
     }
 }
 

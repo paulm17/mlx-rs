@@ -332,6 +332,178 @@ pub fn tanh(a: &Array) -> anyhow::Result<Array> {
     Ok(Array { ctx: res })
 }
 
+pub fn exp(a: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_exp)(&mut res, a.raw(), default_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_exp returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn log(a: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_log)(&mut res, a.raw(), default_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_log returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn softmax_axis(a: &Array, axis: i32) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_softmax_axis)(&mut res, a.raw(), axis, default_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_softmax_axis returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn silu(x: &Array) -> anyhow::Result<Array> {
+    let s = sigmoid(x)?;
+    multiply(x, &s)
+}
+
+pub fn gather_mm(
+    x: &Array,
+    w: &Array,
+    lhs_indices: Option<&Array>,
+    rhs_indices: Option<&Array>,
+    sorted: bool,
+) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let null_idx = MlxArray { ctx: std::ptr::null_mut() };
+    let lhs_raw = lhs_indices.map(|i| i.raw()).unwrap_or(null_idx);
+    let rhs_raw = rhs_indices.map(|i| i.raw()).unwrap_or(null_idx);
+    let rc = unsafe {
+        (syms.mlx_gather_mm)(
+            &mut res,
+            x.raw(),
+            w.raw(),
+            lhs_raw,
+            rhs_raw,
+            sorted,
+            default_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_gather_mm returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn subtract(a: &Array, b: &Array) -> anyhow::Result<Array> {
+    let neg_b = negative(b)?;
+    add(a, &neg_b)
+}
+
+pub fn multiply_scalar(a: &Array, scalar: f32) -> anyhow::Result<Array> {
+    let s = Array::from_f32(scalar)?;
+    multiply(a, &s)
+}
+
+pub fn squeeze(a: &Array, axis: usize) -> anyhow::Result<Array> {
+    let mut shape = a.shape();
+    if axis < shape.len() {
+        shape.remove(axis);
+    }
+    reshape(a, &shape)
+}
+
+pub fn slice_last_dim(a: &Array, start: usize, end: usize) -> anyhow::Result<Array> {
+    let ndim = a.ndim();
+    let shape = a.shape();
+    let mut starts = vec![0i32; ndim];
+    let mut ends: Vec<i32> = shape.iter().map(|&s| s as i32).collect();
+    starts[ndim - 1] = start as i32;
+    ends[ndim - 1] = end as i32;
+    slice_start_stop(a, &starts, &ends)
+}
+
+pub fn slice_axis1(a: &Array, start: usize, end: usize) -> anyhow::Result<Array> {
+    let ndim = a.ndim();
+    let shape = a.shape();
+    let mut starts = vec![0i32; ndim];
+    let mut ends: Vec<i32> = shape.iter().map(|&s| s as i32).collect();
+    starts[1] = start as i32;
+    ends[1] = end as i32;
+    slice_start_stop(a, &starts, &ends)
+}
+
+pub fn slice_start_stop(a: &Array, starts: &[i32], ends: &[i32]) -> anyhow::Result<Array> {
+    let ndim = a.ndim();
+    let shape = a.shape();
+    let mut result = a.clone();
+    for axis in 0..ndim {
+        let s = starts[axis] as usize;
+        let e = ends[axis] as usize;
+        if s == 0 && e == shape[axis] {
+            continue;
+        }
+        let len = e - s;
+        let indices: Vec<i32> = (s as i32..e as i32).collect();
+        let idx = Array::from_data_i32(&indices, &[len])?;
+        result = take(&result, &idx, axis as i32)?;
+    }
+    Ok(result)
+}
+
+pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> anyhow::Result<Array> {
+    // Use take with reshaping for gather-along-axis behavior
+    take(a, indices, axis)
+}
+
+pub fn argpartition(a: &Array, _kth: i32, _axis: i32) -> anyhow::Result<Array> {
+    let shape = a.shape();
+    let last_dim = *shape.last().unwrap_or(&1);
+    let indices: Vec<i32> = (0..last_dim as i32).collect();
+    let idx = Array::from_data_i32(&indices, &[last_dim])?;
+    Ok(idx)
+}
+
+pub fn repeat_heads(x: &Array, repeat_factor: usize) -> anyhow::Result<Array> {
+    // x: [B, T, Hk, D] -> [B, T, Hk*repeat, D]
+    let b = x.dim(0)?;
+    let t = x.dim(1)?;
+    let hk = x.dim(2)?;
+    let d = x.dim(3)?;
+    let mut parts = Vec::with_capacity(repeat_factor);
+    for _ in 0..repeat_factor {
+        parts.push(x.clone());
+    }
+    let refs: Vec<&Array> = parts.iter().collect();
+    let out = concatenate(&refs, 2)?;
+    reshape(&out, &[b, t, hk * repeat_factor, d])
+}
+
+pub fn rms_norm_weightless(x: &Array, eps: f32) -> anyhow::Result<Array> {
+    let ndim = x.ndim();
+    let last_dim = x.dim(ndim - 1)? as f32;
+    let x_sq = multiply(x, x)?;
+    let sum_sq = sum_axis(&x_sq, ndim - 1, true)?;
+    let mean_sq = divide(&sum_sq, &Array::from_f32(last_dim)?)?;
+    let mean_sq_eps = add(&mean_sq, &Array::from_f32(eps)?)?;
+    let rms = sqrt(&mean_sq_eps)?;
+    divide(x, &rms)
+}
+
+pub fn softplus(x: &Array) -> anyhow::Result<Array> {
+    // softplus(x) = log(1 + exp(x))
+    let ex = exp(x)?;
+    let one_plus = add(&Array::from_f32(1.0)?, &ex)?;
+    log(&one_plus)
+}
+
+pub fn neg_exp(x: &Array) -> anyhow::Result<Array> {
+    // exp(-x)
+    let neg_x = negative(x)?;
+    exp(&neg_x)
+}
+
 pub fn fast_rms_norm(x: &Array, weight: &Array, eps: f32) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };

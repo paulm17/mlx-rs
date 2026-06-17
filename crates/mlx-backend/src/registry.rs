@@ -4,6 +4,7 @@ use crate::array::Array;
 use crate::llama::{LlamaConfig, LlamaModel};
 use crate::model::Model;
 use crate::qwen3::{Qwen3Config, Qwen3Model};
+use crate::qwen3_5::{Qwen3_5Config, Qwen3_5Model};
 use crate::gemma3::{Gemma3Config, Gemma3Model};
 use crate::gemma4::{Gemma4Config, Gemma4Model};
 
@@ -33,6 +34,14 @@ pub fn create_model(
             let model = Qwen3Model::load_from_tensors(tensors, cfg)?;
             Ok(Box::new(model))
         }
+        "Qwen3_5ForCausalLM" | "Qwen3_5ForConditionalGeneration"
+        | "Qwen3NextForCausalLM" | "Qwen3NextForConditionalGeneration"
+        | "Qwen3_5MoeForConditionalGeneration" | "Qwen3_5MoeForCausalLM"
+        | "Qwen3NextMoeForConditionalGeneration" | "Qwen3NextMoeForCausalLM" => {
+            let cfg = Qwen3_5Config::from_json(config)?;
+            let model = Qwen3_5Model::load_from_tensors(tensors, cfg)?;
+            Ok(Box::new(model))
+        }
         "Gemma3ForCausalLM" | "Gemma3ForConditionalGeneration" => {
             let cfg = Gemma3Config::from_json(config)?;
             let model = Gemma3Model::load_from_tensors(tensors, cfg)?;
@@ -52,6 +61,14 @@ pub fn supported_architectures() -> Vec<&'static str> {
         "LlamaForCausalLM",
         "LlamaForSequenceClassification",
         "Qwen3ForCausalLM",
+        "Qwen3_5ForCausalLM",
+        "Qwen3_5ForConditionalGeneration",
+        "Qwen3NextForCausalLM",
+        "Qwen3NextForConditionalGeneration",
+        "Qwen3_5MoeForConditionalGeneration",
+        "Qwen3_5MoeForCausalLM",
+        "Qwen3NextMoeForConditionalGeneration",
+        "Qwen3NextMoeForCausalLM",
         "Gemma3ForCausalLM",
         "Gemma3ForConditionalGeneration",
         "Gemma4ForCausalLM",

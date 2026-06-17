@@ -10,7 +10,7 @@ use backend_trait::types::{
 use crate::array::Array;
 use crate::cache::PrefixCache;
 use crate::chat_template::ChatTemplate;
-use crate::llama::KvCache;
+use crate::llama::LayerCache;
 use crate::manifest::ModelManifest;
 use crate::model::Model;
 use crate::registry;
@@ -152,7 +152,7 @@ fn prefill_chunked(
     model: &dyn Model,
     tokens: &[i32],
     start_pos: usize,
-    caches: &mut [KvCache],
+    caches: &mut [LayerCache],
     chunk_size: usize,
 ) -> anyhow::Result<()> {
     if tokens.is_empty() {
@@ -241,7 +241,7 @@ impl backend_trait::Backend for MlxBackend {
         let sampler = Sampler::new(options.temperature, options.top_p, options.top_k, options.min_p);
 
         let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
-        let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
+        let mut caches: Vec<LayerCache> = if let Some(cached) = cached_caches {
             cached.clone()
         } else {
             self.model.new_caches()
@@ -308,7 +308,7 @@ impl backend_trait::Backend for MlxBackend {
         let sampler = Sampler::new(options.temperature, options.top_p, options.top_k, options.min_p);
 
         let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
-        let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
+        let mut caches: Vec<LayerCache> = if let Some(cached) = cached_caches {
             cached.clone()
         } else {
             self.model.new_caches()
@@ -372,7 +372,7 @@ impl backend_trait::Backend for MlxBackend {
         let sampler = Sampler::new(options.temperature, options.top_p, options.top_k, options.min_p);
 
         let (prefix_len, cached_caches) = self.prefix_cache.find(&tokens);
-        let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
+        let mut caches: Vec<LayerCache> = if let Some(cached) = cached_caches {
             cached.clone()
         } else {
             self.model.new_caches()

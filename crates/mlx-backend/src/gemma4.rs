@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use crate::array::Array;
-use crate::llama::{EmbeddingLayer, KvCache, LinearLayer, RmsNorm, resolve_weight_prefix};
+use crate::llama::{EmbeddingLayer, KvCache, LayerCache, LinearLayer, RmsNorm, resolve_weight_prefix};
 use crate::model::Model;
 use crate::ops;
 
@@ -556,7 +556,7 @@ impl Model for Gemma4Model {
     fn forward(
         &self,
         input_ids: &Array,
-        caches: &mut [KvCache],
+        caches: &mut [LayerCache],
         positions: &Array,
     ) -> anyhow::Result<Array> {
         let b = input_ids.dim(0)?;
@@ -576,40 +576,41 @@ impl Model for Gemma4Model {
         let mut shared_kv: HashMap<i32, (Array, Array)> = HashMap::new();
 
         for i in 0..self.config.num_hidden_layers as usize {
-            // Set up donor KV for shared layers
-            if let Some(&donor) = self.config.kv_share_map.get(&(i as i32)) {
-                if let Some((dk, dv)) = shared_kv.get(&donor) {
-                    caches[i].donor = Some((dk.clone(), dv.clone(), 1.0));
+            if let LayerCache::Attention(ref mut cache) = caches[i] {
+                // Set up donor KV for shared layers
+                if let Some(&donor) = self.config.kv_share_map.get(&(i as i32)) {
+                    if let Some((dk, dv)) = shared_kv.get(&donor) {
+                        cache.donor = Some((dk.clone(), dv.clone(), 1.0));
+                    }
                 }
-            }
 
-            // Slice PLE input for this layer: [B,L,NumLayers,PLEDim] -> [B,L,PLEDim]
-            let ple_input: Option<Array> = ple_tensor.as_ref().map(|pt| {
-                let dim = self.ple.as_ref().unwrap().ple_dim();
-                let flat = ops::reshape(
-                    pt,
-                    &[b * l, self.config.num_hidden_layers as usize, dim],
-                )
-                .unwrap();
-                let idx = Array::from_i32(i as i32).unwrap();
-                let sliced = ops::take(&flat, &idx, 1).unwrap();
-                ops::reshape(&sliced, &[b, l, dim]).unwrap()
-            });
+                // Slice PLE input for this layer: [B,L,NumLayers,PLEDim] -> [B,L,PLEDim]
+                let ple_input: Option<Array> = ple_tensor.as_ref().map(|pt| {
+                    let dim = self.ple.as_ref().unwrap().ple_dim();
+                    let flat = ops::reshape(
+                        pt,
+                        &[b * l, self.config.num_hidden_layers as usize, dim],
+                    )
+                    .unwrap();
+                    let idx = Array::from_i32(i as i32).unwrap();
+                    let sliced = ops::take(&flat, &idx, 1).unwrap();
+                    ops::reshape(&sliced, &[b, l, dim]).unwrap()
+                });
 
-            h = self.layers[i].forward(&h, &mut caches[i], positions, ple_input.as_ref())?;
-            let _is_sliding = is_layer_sliding(i as i32, self.config.sliding_window_pattern, &self.config.layer_types);
+                h = self.layers[i].forward(&h, cache, positions, ple_input.as_ref())?;
 
-            // If this is a donor layer, store its KV for donees
-            if self
-                .config
-                .kv_donors
-                .get(&(i as i32))
-                .copied()
-                .unwrap_or(false)
-                && caches[i].donor.is_none()
-            {
-                if let (Some(k), Some(v)) = (&caches[i].k_cache, &caches[i].v_cache) {
-                    shared_kv.insert(i as i32, (k.clone(), v.clone()));
+                // If this is a donor layer, store its KV for donees
+                if self
+                    .config
+                    .kv_donors
+                    .get(&(i as i32))
+                    .copied()
+                    .unwrap_or(false)
+                    && cache.donor.is_none()
+                {
+                    if let (Some(k), Some(v)) = (&cache.k_cache, &cache.v_cache) {
+                        shared_kv.insert(i as i32, (k.clone(), v.clone()));
+                    }
                 }
             }
         }
@@ -642,15 +643,15 @@ impl Model for Gemma4Model {
         self.config.vocab_size
     }
 
-    fn new_caches(&self) -> Vec<KvCache> {
+    fn new_caches(&self) -> Vec<LayerCache> {
         let sw = self.config.sliding_window as usize;
         (0..self.config.num_hidden_layers as usize)
             .map(|i| {
                 let is_sliding = is_layer_sliding(i as i32, self.config.sliding_window_pattern, &self.config.layer_types);
                 if is_sliding && sw > 0 {
-                    KvCache::new_rotating(sw)
+                    LayerCache::Attention(KvCache::new_rotating(sw))
                 } else {
-                    KvCache::new()
+                    LayerCache::Attention(KvCache::new())
                 }
             })
             .collect()

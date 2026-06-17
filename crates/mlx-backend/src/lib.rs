@@ -12,6 +12,7 @@ pub mod mlx_backend;
 pub mod model;
 pub mod ops;
 pub mod qwen3;
+pub mod qwen3_5;
 pub mod registry;
 pub mod sampler;
 pub mod tensors;
