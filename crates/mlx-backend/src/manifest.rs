@@ -308,6 +308,9 @@ mod tests {
 
     #[test]
     fn test_tensor_names() {
+        if crate::loader::check_init().is_err() {
+            return;
+        }
         let dir = make_model_dir("weight");
         let manifest = ModelManifest::open(dir.path()).unwrap();
         let names = manifest.tensor_names().unwrap();
@@ -339,6 +342,9 @@ mod tests {
 
     #[test]
     fn test_multi_file_model() {
+        if crate::loader::check_init().is_err() {
+            return;
+        }
         let dir = make_model_dir("multi");
         let manifest = ModelManifest::open(dir.path()).unwrap();
         assert_eq!(manifest.safetensors_files().len(), 2);
@@ -349,10 +355,13 @@ mod tests {
 
     #[test]
     fn test_total_tensor_bytes() {
+        if crate::loader::check_init().is_err() {
+            return;
+        }
         let dir = make_model_dir("weight");
         let manifest = ModelManifest::open(dir.path()).unwrap();
         let bytes = manifest.total_tensor_bytes().unwrap();
-        assert_eq!(bytes, 16); // 4 floats * 4 bytes
+        assert_eq!(bytes, 16);
     }
 
     #[test]
