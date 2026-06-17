@@ -144,25 +144,26 @@ impl ModelManifest {
         }
 
         // Remap quantized tensor names following Ollama's convention:
-        // "foo.weight" + "foo.weight.scales" -> "foo.weight" (packed) + "foo.weight_scale"
-        // "foo.weight.biases" when foo.weight.scales exists -> "foo.weight_qbias"
-        // Also handle singular ".scale"/".bias" variants
+        // "foo.weight" + "foo.scales" -> "foo.weight" (packed) + "foo_weight_scale"
+        // "foo.biases" when foo.scales exists -> "foo_weight_qbias"
+        // Only plural ".scales"/".biases" are quantization metadata.
+        // Singular ".scale"/".bias" are NOT quantization tensors.
         let keys: Vec<String> = all.keys().cloned().collect();
         let scale_bases: std::collections::HashSet<String> = keys.iter()
-            .filter(|k| k.ends_with(".scales") || k.ends_with(".scale"))
+            .filter(|k| k.ends_with(".scales"))
             .filter_map(|k| {
-                k.strip_suffix(".scales").or_else(|| k.strip_suffix(".scale")).map(|s| s.to_string())
+                k.strip_suffix(".scales").map(|s| s.to_string())
             })
             .collect();
 
         if !scale_bases.is_empty() {
             let mut renames: Vec<(String, String)> = Vec::new();
             for key in &keys {
-                if let Some(base) = key.strip_suffix(".scales").or_else(|| key.strip_suffix(".scale")) {
+                if let Some(base) = key.strip_suffix(".scales") {
                     if scale_bases.contains(base) {
                         renames.push((key.clone(), format!("{base}_scale")));
                     }
-                } else if let Some(base) = key.strip_suffix(".biases").or_else(|| key.strip_suffix(".bias")) {
+                } else if let Some(base) = key.strip_suffix(".biases") {
                     if scale_bases.contains(base) {
                         renames.push((key.clone(), format!("{base}_qbias")));
                     }

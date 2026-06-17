@@ -40,7 +40,11 @@ fn choose_next_token(logits: &Array, sampler: &Sampler) -> anyhow::Result<i32> {
         let idx = crate::ops::argmax_axis(logits, -1, false)?;
         Ok(idx.item_i32()?)
     } else {
-        let data = logits.data_f32()?;
+        // Convert to f32 before reading data — data_f32() reinterprets raw bytes,
+        // so f16/bf16 arrays must be cast first.
+        let logits_f32 = crate::ops::astype(logits, crate::ffi::MlxDtype::Float32)?;
+        crate::ops::eval(&[&logits_f32])?;
+        let data = logits_f32.data_f32()?;
         Ok(sampler.sample(data) as i32)
     }
 }
@@ -137,6 +141,7 @@ impl MlxBackend {
             "<turn|>",
             "<|end_of_turn|>",
             "<|end_of_text|>",
+            "<|eot_id|>",
             "</s>",
             "<|im_end|>",
         ];

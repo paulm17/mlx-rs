@@ -1,15 +1,15 @@
 use std::collections::HashMap;
 
 use crate::array::Array;
-use crate::llama::{Embedding, KvCache, LayerCache, Linear, Mlp, RmsNorm, resolve_weight_prefix};
+use crate::llama::{Embedding, KvCache, LayerCache, Linear, LinearLayer, Mlp, RmsNorm, resolve_weight_prefix};
 use crate::model::Model;
 use crate::ops;
 
 pub struct Qwen3Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: Box<dyn LinearLayer>,
+    k_proj: Box<dyn LinearLayer>,
+    v_proj: Box<dyn LinearLayer>,
+    o_proj: Box<dyn LinearLayer>,
     q_norm: RmsNorm,
     k_norm: RmsNorm,
 }
@@ -230,10 +230,10 @@ impl Qwen3Model {
                 .ok_or_else(|| anyhow::anyhow!("missing {lp}.self_attn.k_norm.weight"))?;
 
             let attention = Qwen3Attention {
-                q_proj: Linear::new(q_w.clone(), None),
-                k_proj: Linear::new(k_w.clone(), None),
-                v_proj: Linear::new(v_w.clone(), None),
-                o_proj: Linear::new(o_w.clone(), None),
+                q_proj: Box::new(Linear::new(q_w.clone(), None)),
+                k_proj: Box::new(Linear::new(k_w.clone(), None)),
+                v_proj: Box::new(Linear::new(v_w.clone(), None)),
+                o_proj: Box::new(Linear::new(o_w.clone(), None)),
                 q_norm: RmsNorm::new(q_norm_w.clone(), config.qk_norm_eps),
                 k_norm: RmsNorm::new(k_norm_w.clone(), config.qk_norm_eps),
             };
@@ -246,9 +246,9 @@ impl Qwen3Model {
                 .ok_or_else(|| anyhow::anyhow!("missing {lp}.mlp.down_proj.weight"))?;
 
             let mlp = Mlp::new(
-                Linear::new(gate_w.clone(), None),
-                Linear::new(up_w.clone(), None),
-                Linear::new(down_w.clone(), None),
+                Box::new(Linear::new(gate_w.clone(), None)),
+                Box::new(Linear::new(up_w.clone(), None)),
+                Box::new(Linear::new(down_w.clone(), None)),
             );
 
             let attn_norm_w = tensors.get(&format!("{lp}.input_layernorm.weight"))

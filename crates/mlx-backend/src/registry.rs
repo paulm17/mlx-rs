@@ -24,7 +24,7 @@ pub fn create_model(
     config: &serde_json::Value,
 ) -> anyhow::Result<Box<dyn Model>> {
     match architecture {
-        "LlamaForCausalLM" | "LlamaForSequenceClassification" => {
+        "LlamaForCausalLM" | "LlamaForSequenceClassification" | "Qwen2ForCausalLM" => {
             let cfg = LlamaConfig::from_json(config)?;
             let model = LlamaModel::load_from_tensors(tensors, cfg)?;
             Ok(Box::new(model))
@@ -60,6 +60,7 @@ pub fn supported_architectures() -> Vec<&'static str> {
     vec![
         "LlamaForCausalLM",
         "LlamaForSequenceClassification",
+        "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
         "Qwen3_5ForCausalLM",
         "Qwen3_5ForConditionalGeneration",

@@ -84,13 +84,17 @@ impl PrefixCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llama::KvCache;
+
+    fn make_test_caches(n: usize) -> Vec<LayerCache> {
+        (0..n).map(|_| LayerCache::Attention(KvCache::new())).collect()
+    }
 
     #[test]
     fn test_prefix_cache_basic() {
         let mut cache = PrefixCache::new(2, 10);
         let tokens = vec![1, 2, 3];
-        let kv_caches: Vec<KvCache> = (0..2).map(|_| KvCache::new()).collect();
-        cache.insert(&tokens, kv_caches);
+        cache.insert(&tokens, make_test_caches(2));
 
         let (matched, _) = cache.find(&[1, 2, 3, 4]);
         assert_eq!(matched, 3);
@@ -113,8 +117,7 @@ mod tests {
     #[test]
     fn test_prefix_cache_partial_match() {
         let mut cache = PrefixCache::new(2, 10);
-        let kv_caches: Vec<KvCache> = (0..2).map(|_| KvCache::new()).collect();
-        cache.insert(&[1, 2, 3], kv_caches);
+        cache.insert(&[1, 2, 3], make_test_caches(2));
 
         let (matched, _) = cache.find(&[1, 2, 9]);
         assert_eq!(matched, 2);
@@ -123,10 +126,8 @@ mod tests {
     #[test]
     fn test_prefix_cache_multiple_entries() {
         let mut cache = PrefixCache::new(2, 10);
-        let kv1: Vec<KvCache> = (0..2).map(|_| KvCache::new()).collect();
-        let kv2: Vec<KvCache> = (0..2).map(|_| KvCache::new()).collect();
-        cache.insert(&[1, 2, 3], kv1);
-        cache.insert(&[1, 2, 4], kv2);
+        cache.insert(&[1, 2, 3], make_test_caches(2));
+        cache.insert(&[1, 2, 4], make_test_caches(2));
 
         assert_eq!(cache.entry_count(), 2);
 
@@ -139,8 +140,7 @@ mod tests {
     #[test]
     fn test_prefix_cache_clear() {
         let mut cache = PrefixCache::new(2, 10);
-        let kv_caches: Vec<KvCache> = (0..2).map(|_| KvCache::new()).collect();
-        cache.insert(&[1, 2, 3], kv_caches);
+        cache.insert(&[1, 2, 3], make_test_caches(2));
         assert_eq!(cache.entry_count(), 1);
 
         cache.clear();

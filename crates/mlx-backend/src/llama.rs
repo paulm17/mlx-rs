@@ -159,6 +159,7 @@ pub struct QuantizedLinear {
     weight: Array,
     scales: Array,
     biases: Option<Array>,
+    attn_bias: Option<Array>,
     group_size: Option<i32>,
     bits: Option<i32>,
     mode: String,
@@ -173,13 +174,18 @@ impl QuantizedLinear {
         bits: Option<i32>,
         mode: String,
     ) -> Self {
-        Self { weight, scales, biases, group_size, bits, mode }
+        Self { weight, scales, biases, attn_bias: None, group_size, bits, mode }
+    }
+
+    pub fn with_attn_bias(mut self, bias: Array) -> Self {
+        self.attn_bias = Some(bias);
+        self
     }
 }
 
 impl LinearLayer for QuantizedLinear {
     fn forward(&self, x: &Array) -> anyhow::Result<Array> {
-        ops::quantized_matmul(
+        let out = ops::quantized_matmul(
             x,
             &self.weight,
             &self.scales,
@@ -188,7 +194,12 @@ impl LinearLayer for QuantizedLinear {
             self.group_size,
             self.bits,
             &self.mode,
-        )
+        )?;
+        if let Some(ref bias) = self.attn_bias {
+            ops::add(&out, bias)
+        } else {
+            Ok(out)
+        }
     }
 }
 
@@ -216,14 +227,12 @@ impl QuantizedEmbedding {
 
 impl EmbeddingLayer for QuantizedEmbedding {
     fn forward(&self, indices: &Array) -> anyhow::Result<Array> {
-        // Take rows by index from packed weight, scales, and biases
         let w = ops::take(&self.weight, indices, 0)?;
         let s = ops::take(&self.scales, indices, 0)?;
         let b = match &self.biases {
             Some(bias) => Some(ops::take(bias, indices, 0)?),
             None => None,
         };
-        // Dequantize the selected rows
         ops::dequantize(
             &w,
             &s,
@@ -241,14 +250,19 @@ impl EmbeddingLayer for QuantizedEmbedding {
 }
 
 pub struct Attention {
-    q_proj: Linear,
-    k_proj: Linear,
-    v_proj: Linear,
-    o_proj: Linear,
+    q_proj: Box<dyn LinearLayer>,
+    k_proj: Box<dyn LinearLayer>,
+    v_proj: Box<dyn LinearLayer>,
+    o_proj: Box<dyn LinearLayer>,
 }
 
 impl Attention {
-    pub fn new(q_proj: Linear, k_proj: Linear, v_proj: Linear, o_proj: Linear) -> Self {
+    pub fn new(
+        q_proj: Box<dyn LinearLayer>,
+        k_proj: Box<dyn LinearLayer>,
+        v_proj: Box<dyn LinearLayer>,
+        o_proj: Box<dyn LinearLayer>,
+    ) -> Self {
         Self { q_proj, k_proj, v_proj, o_proj }
     }
 
@@ -293,13 +307,17 @@ impl Attention {
 }
 
 pub struct Mlp {
-    gate_proj: Linear,
-    up_proj: Linear,
-    down_proj: Linear,
+    gate_proj: Box<dyn LinearLayer>,
+    up_proj: Box<dyn LinearLayer>,
+    down_proj: Box<dyn LinearLayer>,
 }
 
 impl Mlp {
-    pub fn new(gate_proj: Linear, up_proj: Linear, down_proj: Linear) -> Self {
+    pub fn new(
+        gate_proj: Box<dyn LinearLayer>,
+        up_proj: Box<dyn LinearLayer>,
+        down_proj: Box<dyn LinearLayer>,
+    ) -> Self {
         Self { gate_proj, up_proj, down_proj }
     }
 
@@ -448,10 +466,10 @@ impl LlamaConfig {
 }
 
 pub struct LlamaModel {
-    embed_tokens: Embedding,
+    embed_tokens: Box<dyn EmbeddingLayer>,
     layers: Vec<Layer>,
     norm: RmsNorm,
-    lm_head: Linear,
+    lm_head: Box<dyn LinearLayer>,
     config: LlamaConfig,
 }
 
@@ -469,7 +487,8 @@ impl Model for LlamaModel {
             }
         }
         let h = self.norm.forward(&h)?;
-        self.lm_head.forward(&h)
+        let logits = self.lm_head.forward(&h)?;
+        Ok(logits)
     }
 
     fn num_layers(&self) -> usize {
@@ -504,61 +523,54 @@ impl LlamaModel {
     ) -> anyhow::Result<Self> {
         let prefix = resolve_weight_prefix(&tensors);
 
-        let embed_w = tensors.get(&format!("{prefix}model.embed_tokens.weight"))
-            .ok_or_else(|| anyhow::anyhow!("missing {prefix}model.embed_tokens.weight"))?;
-        let embed_tokens = Embedding::new(embed_w.clone());
+        let embed_tokens = make_embedding(&tensors, &format!("{prefix}model.embed_tokens.weight"))?;
 
         let norm_w = tensors.get(&format!("{prefix}model.norm.weight"))
             .ok_or_else(|| anyhow::anyhow!("missing {prefix}model.norm.weight"))?;
         let norm = RmsNorm::new(norm_w.clone(), config.rms_norm_eps);
 
-        let lm_head = if config.tie_word_embeddings {
-            Linear::new(embed_w.clone(), None)
-        } else if let Some(w) = tensors.get(&format!("{prefix}lm_head.weight")) {
-            Linear::new(w.clone(), None)
-        } else if let Some(w) = tensors.get("lm_head.weight") {
-            Linear::new(w.clone(), None)
+        let lm_head: Box<dyn LinearLayer> = if config.tie_word_embeddings {
+            let base = format!("{prefix}model.embed_tokens.weight");
+            let base_trimmed = base.strip_suffix(".weight").unwrap_or(&base);
+            let scale_key = format!("{base_trimmed}_scale");
+            if let Some(scales) = tensors.get(&scale_key) {
+                let weight = tensors.get(&base)
+                    .ok_or_else(|| anyhow::anyhow!("missing {base}"))?;
+                let biases = tensors.get(&format!("{base_trimmed}_qbias")).cloned();
+                let w_cols = weight.dim(weight.ndim() - 1)? as i32;
+                let s_cols = scales.dim(scales.ndim() - 1)? as i32;
+                let (group_size, bits, mode) = infer_quant_params(w_cols, s_cols);
+                Box::new(QuantizedLinear::new(
+                    weight.clone(), scales.clone(), biases,
+                    Some(group_size), Some(bits), mode,
+                ))
+            } else {
+                let weight = tensors.get(&base)
+                    .ok_or_else(|| anyhow::anyhow!("missing {base}"))?;
+                Box::new(Linear::new(weight.clone(), None))
+            }
         } else {
-            Linear::new(embed_w.clone(), None)
+            make_linear(&tensors, &format!("{prefix}lm_head.weight"))
+                .or_else(|_| make_linear(&tensors, "lm_head.weight"))
+                .or_else(|_| make_linear(&tensors, &format!("{prefix}model.embed_tokens.weight")))?
         };
 
         let mut layers = Vec::with_capacity(config.num_hidden_layers as usize);
         for i in 0..config.num_hidden_layers as usize {
             let lp = format!("{prefix}model.layers.{i}");
 
-            let q_w = tensors.get(&format!("{lp}.self_attn.q_proj.weight"))
-                .ok_or_else(|| anyhow::anyhow!("missing {lp}.self_attn.q_proj.weight"))?;
-            let k_w = tensors.get(&format!("{lp}.self_attn.k_proj.weight"))
-                .ok_or_else(|| anyhow::anyhow!("missing {lp}.self_attn.k_proj.weight"))?;
-            let v_w = tensors.get(&format!("{lp}.self_attn.v_proj.weight"))
-                .ok_or_else(|| anyhow::anyhow!("missing {lp}.self_attn.v_proj.weight"))?;
-            let o_w = tensors.get(&format!("{lp}.self_attn.o_proj.weight"))
-                .ok_or_else(|| anyhow::anyhow!("missing {lp}.self_attn.o_proj.weight"))?;
+            let q_proj = make_linear_with_bias(&tensors, &format!("{lp}.self_attn.q_proj.weight"))?;
+            let k_proj = make_linear_with_bias(&tensors, &format!("{lp}.self_attn.k_proj.weight"))?;
+            let v_proj = make_linear_with_bias(&tensors, &format!("{lp}.self_attn.v_proj.weight"))?;
+            let o_proj = make_linear_with_bias(&tensors, &format!("{lp}.self_attn.o_proj.weight"))?;
 
-            let q_bias = tensors.get(&format!("{lp}.self_attn.q_proj.bias")).cloned();
-            let k_bias = tensors.get(&format!("{lp}.self_attn.k_proj.bias")).cloned();
-            let v_bias = tensors.get(&format!("{lp}.self_attn.v_proj.bias")).cloned();
-            let o_bias = tensors.get(&format!("{lp}.self_attn.o_proj.bias")).cloned();
+            let attention = Attention::new(q_proj, k_proj, v_proj, o_proj);
 
-            let attention = Attention::new(
-                Linear::new(q_w.clone(), q_bias),
-                Linear::new(k_w.clone(), k_bias),
-                Linear::new(v_w.clone(), v_bias),
-                Linear::new(o_w.clone(), o_bias),
-            );
+            let gate_proj = make_linear(&tensors, &format!("{lp}.mlp.gate_proj.weight"))?;
+            let up_proj = make_linear(&tensors, &format!("{lp}.mlp.up_proj.weight"))?;
+            let down_proj = make_linear(&tensors, &format!("{lp}.mlp.down_proj.weight"))?;
 
-            let gate_w = tensors.get(&format!("{lp}.mlp.gate_proj.weight"))
-                .ok_or_else(|| anyhow::anyhow!("missing {lp}.mlp.gate_proj.weight"))?;
-            let up_w = tensors.get(&format!("{lp}.mlp.up_proj.weight"))
-                .ok_or_else(|| anyhow::anyhow!("missing {lp}.mlp.up_proj.weight"))?;
-            let down_w = tensors.get(&format!("{lp}.mlp.down_proj.weight"))
-                .ok_or_else(|| anyhow::anyhow!("missing {lp}.mlp.down_proj.weight"))?;
-
-            let mlp = Mlp::new(
-                Linear::new(gate_w.clone(), None),
-                Linear::new(up_w.clone(), None),
-                Linear::new(down_w.clone(), None),
-            );
+            let mlp = Mlp::new(gate_proj, up_proj, down_proj);
 
             let attn_norm_w = tensors.get(&format!("{lp}.input_layernorm.weight"))
                 .ok_or_else(|| anyhow::anyhow!("missing {lp}.input_layernorm.weight"))?;
@@ -574,6 +586,102 @@ impl LlamaModel {
         }
 
         Ok(Self { embed_tokens, layers, norm, lm_head, config })
+    }
+}
+
+fn infer_quant_params(weight_cols: i32, scale_cols: i32) -> (i32, i32, String) {
+    if scale_cols == 0 {
+        return (64, 4, "affine".to_string());
+    }
+    let group_size_4 = weight_cols * 8 / scale_cols;
+    let group_size_8 = weight_cols * 4 / scale_cols;
+    if group_size_4 == 32 {
+        (32, 4, "mxfp4".to_string())
+    } else if group_size_4 == 64 {
+        (64, 4, "affine".to_string())
+    } else if group_size_8 == 64 {
+        (64, 8, "affine".to_string())
+    } else if group_size_8 == 32 {
+        (32, 8, "mxfp8".to_string())
+    } else {
+        (64, 4, "affine".to_string())
+    }
+}
+
+fn make_linear(
+    tensors: &std::collections::HashMap<String, Array>,
+    base_key: &str,
+) -> anyhow::Result<Box<dyn LinearLayer>> {
+    let base = base_key.strip_suffix(".weight").unwrap_or(base_key);
+    let scale_key = format!("{base}_scale");
+    if let Some(scales) = tensors.get(&scale_key) {
+        let weight = tensors.get(base_key)
+            .ok_or_else(|| anyhow::anyhow!("missing {base_key}"))?;
+        let biases = tensors.get(&format!("{base}_qbias")).cloned();
+        let w_cols = weight.dim(weight.ndim() - 1)? as i32;
+        let s_cols = scales.dim(scales.ndim() - 1)? as i32;
+        let (group_size, bits, mode) = infer_quant_params(w_cols, s_cols);
+        Ok(Box::new(QuantizedLinear::new(
+            weight.clone(), scales.clone(), biases,
+            Some(group_size), Some(bits), mode,
+        )))
+    } else {
+        let weight = tensors.get(base_key)
+            .ok_or_else(|| anyhow::anyhow!("missing {base_key}"))?;
+        Ok(Box::new(Linear::new(weight.clone(), None)))
+    }
+}
+
+fn make_linear_with_bias(
+    tensors: &std::collections::HashMap<String, Array>,
+    base_key: &str,
+) -> anyhow::Result<Box<dyn LinearLayer>> {
+    let base = base_key.strip_suffix(".weight").unwrap_or(base_key);
+    let scale_key = format!("{base}_scale");
+    let attn_bias = tensors.get(&format!("{base}.bias")).cloned();
+    if let Some(scales) = tensors.get(&scale_key) {
+        let weight = tensors.get(base_key)
+            .ok_or_else(|| anyhow::anyhow!("missing {base_key}"))?;
+        let biases = tensors.get(&format!("{base}_qbias")).cloned();
+        let w_cols = weight.dim(weight.ndim() - 1)? as i32;
+        let s_cols = scales.dim(scales.ndim() - 1)? as i32;
+        let (group_size, bits, mode) = infer_quant_params(w_cols, s_cols);
+        let ql = QuantizedLinear::new(
+            weight.clone(), scales.clone(), biases,
+            Some(group_size), Some(bits), mode,
+        );
+        Ok(Box::new(match attn_bias {
+            Some(b) => ql.with_attn_bias(b),
+            None => ql,
+        }))
+    } else {
+        let weight = tensors.get(base_key)
+            .ok_or_else(|| anyhow::anyhow!("missing {base_key}"))?;
+        Ok(Box::new(Linear::new(weight.clone(), attn_bias)))
+    }
+}
+
+fn make_embedding(
+    tensors: &std::collections::HashMap<String, Array>,
+    base_key: &str,
+) -> anyhow::Result<Box<dyn EmbeddingLayer>> {
+    let base = base_key.strip_suffix(".weight").unwrap_or(base_key);
+    let scale_key = format!("{base}_scale");
+    if let Some(scales) = tensors.get(&scale_key) {
+        let weight = tensors.get(base_key)
+            .ok_or_else(|| anyhow::anyhow!("missing {base_key}"))?;
+        let biases = tensors.get(&format!("{base}_qbias")).cloned();
+        let w_cols = weight.dim(weight.ndim() - 1)? as i32;
+        let s_cols = scales.dim(scales.ndim() - 1)? as i32;
+        let (group_size, bits, mode) = infer_quant_params(w_cols, s_cols);
+        Ok(Box::new(QuantizedEmbedding::new(
+            weight.clone(), scales.clone(), biases,
+            Some(group_size), Some(bits), mode,
+        )))
+    } else {
+        let weight = tensors.get(base_key)
+            .ok_or_else(|| anyhow::anyhow!("missing {base_key}"))?;
+        Ok(Box::new(Embedding::new(weight.clone())))
     }
 }
 
