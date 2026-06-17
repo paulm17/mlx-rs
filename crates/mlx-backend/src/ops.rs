@@ -467,16 +467,16 @@ pub fn argpartition(a: &Array, _kth: i32, _axis: i32) -> anyhow::Result<Array> {
 
 pub fn repeat_heads(x: &Array, repeat_factor: usize) -> anyhow::Result<Array> {
     // x: [B, T, Hk, D] -> [B, T, Hk*repeat, D]
+    // Interleaved: [h0,h0,h1,h1,...] to match model's out_proj weight ordering.
     let b = x.dim(0)?;
     let t = x.dim(1)?;
     let hk = x.dim(2)?;
     let d = x.dim(3)?;
-    let mut parts = Vec::with_capacity(repeat_factor);
-    for _ in 0..repeat_factor {
-        parts.push(x.clone());
-    }
-    let refs: Vec<&Array> = parts.iter().collect();
-    let out = concatenate(&refs, 2)?;
+    let indices: Vec<i32> = (0..hk as i32)
+        .flat_map(|h| std::iter::repeat(h).take(repeat_factor))
+        .collect();
+    let idx = Array::from_data_i32(&indices, &[hk * repeat_factor])?;
+    let out = take(x, &idx, 2)?;
     reshape(&out, &[b, t, hk * repeat_factor, d])
 }
 

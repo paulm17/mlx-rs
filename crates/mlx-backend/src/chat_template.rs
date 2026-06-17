@@ -8,6 +8,9 @@ const DEFAULT_LLAMA3_TEMPLATE: &str = "{% for message in messages %}\n<|start_he
 
 const GEMMA_TEMPLATE: &str = "{{ bos_token }}{% if messages[0]['role'] == 'system' %}{% set system_message = messages[0]['content'] %}{% set loop_messages = messages[1:] %}{% else %}{% set system_message = '' %}{% set loop_messages = messages %}{% endif %}{% for message in loop_messages %}{% if message['role'] == 'user' %}<start_of_turn>user\n{% if loop.index0 == 0 and system_message %}{{ system_message }}\n\n{% endif %}{{ message.content }}<end_of_turn>\n{% elif message['role'] == 'assistant' %}<start_of_turn>model\n{{ message.content }}<end_of_turn>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<start_of_turn>model\n{% endif %}";
 
+const QWEN_TEMPLATE: &str = "{% for message in messages %}\n<|im_start|>{{ message.role }}\n{{ message.content }}<|im_end|>\n{% endfor %}\n<|im_start|>assistant\n<think>\n\n</think>\n\n";
+
+
 #[derive(Debug, Clone, Deserialize)]
 struct TemplateEntry {
     name: String,
@@ -101,9 +104,18 @@ fn is_gemma_architecture(architecture: Option<&str>) -> bool {
     }
 }
 
+
+fn is_qwen_architecture(architecture: Option<&str>) -> bool {
+    match architecture {
+        Some(arch) => arch.starts_with("Qwen3") || arch.starts_with("Qwen3Next"),
+        None => false,
+    }
+}
 fn default_template_for_architecture(architecture: Option<&str>) -> &'static str {
     if is_gemma_architecture(architecture) {
         GEMMA_TEMPLATE
+    } else if is_qwen_architecture(architecture) {
+        QWEN_TEMPLATE
     } else {
         DEFAULT_LLAMA3_TEMPLATE
     }
@@ -112,6 +124,8 @@ fn default_template_for_architecture(architecture: Option<&str>) -> &'static str
 fn default_tokens_for_architecture(architecture: Option<&str>) -> (&'static str, &'static str) {
     if is_gemma_architecture(architecture) {
         ("<bos>", "<eos>")
+    } else if is_qwen_architecture(architecture) {
+        ("", "</think>")
     } else {
         ("<|begin_of_text|>", "<|end_of_text|>")
     }

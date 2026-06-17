@@ -285,22 +285,51 @@ impl Qwen3_5GatedDeltaNet {
         let conv_tail = cfg.linear_conv_kernel_dim as usize - 1;
         let v_per_k = nv / nk;
 
-        // Project to QKV and BA
-        let (q, k, v, z, beta, alpha) = if let (Some(qkv_proj), Some(z_proj), Some(b_proj), Some(a_proj)) =
+        // Project to QKV and BA, then conv1d, then split
+        let key_dim = nk * dk;
+        let value_dim = nv * dv;
+        let conv_dim = 2 * key_dim + value_dim;
+
+        // Get recurrent states
+        let (conv_state, delta_state) = rc.get_states(b, x.dtype()?)?;
+
+        #[allow(unused_assignments)]
+        let mut qkv_out: Option<(Array, Array, Array, Array)> = None;
+
+        let (z, beta, alpha) = if let (Some(qkv_proj), Some(z_proj), Some(b_proj), Some(a_proj)) =
             (&self.in_proj_qkv, &self.in_proj_z, &self.in_proj_b, &self.in_proj_a)
         {
+            // Split path: conv on raw flat qkv (interleaved layout), then split
             let qkv = qkv_proj.forward(x)?;
             let z = z_proj.forward(x)?;
             let z = ops::reshape(&z, &[b, l, nv, dv])?;
             let beta = b_proj.forward(x)?;
             let alpha = a_proj.forward(x)?;
-            let qkv = ops::reshape(&qkv, &[b, l, nk, 2 * dk + v_per_k * dv])?;
-            let q = ops::slice_last_dim(&qkv, 0, dk)?;
-            let k = ops::slice_last_dim(&qkv, dk, 2 * dk)?;
-            let v = ops::slice_last_dim(&qkv, 2 * dk, 2 * dk + v_per_k * dv)?;
-            let v = ops::reshape(&v, &[b, l, nv, dv])?;
-            (q, k, v, z, beta, alpha)
+
+            // Causal conv1d on raw qkv
+            let qkv = ops::reshape(&qkv, &[b, l, conv_dim])?;
+            let conv_in = ops::concatenate(&[conv_state, &qkv], 1)?;
+            let conv_out = depthwise_conv1d(&conv_in, &self.conv_weight, l as usize)?;
+            let conv_out = ops::silu(&conv_out)?;
+
+            // Update conv state (tail of conv_in)
+            let total_len = conv_in.dim(1)?;
+            let new_conv_state = ops::slice_axis1(&conv_in, total_len - conv_tail, total_len)?;
+
+            // Flat slicing after conv: [all_q, all_k, all_v]
+            let q_out = ops::slice_last_dim(&conv_out, 0, key_dim)?;
+            let k_out = ops::slice_last_dim(&conv_out, key_dim, 2 * key_dim)?;
+            let v_out = ops::slice_last_dim(&conv_out, 2 * key_dim, 2 * key_dim + value_dim)?;
+            let q_out = ops::reshape(&q_out, &[b, l, nk, dk])?;
+            let k_out = ops::reshape(&k_out, &[b, l, nk, dk])?;
+            let v_out = ops::reshape(&v_out, &[b, l, nv, dv])?;
+
+            // Store results in outer scope via closure workaround
+            // We'll use a flag to pass q/k/v out
+            qkv_out = Some((q_out, k_out, v_out, new_conv_state));
+            (z, beta, alpha)
         } else if let (Some(qkvz_proj), Some(ba_proj)) = (&self.in_proj_qkvz, &self.in_proj_ba) {
+            // Combined path: reshape+slice, reorder to [all_q, all_k, all_v], then conv
             let qkvz = qkvz_proj.forward(x)?;
             let ba = ba_proj.forward(x)?;
             let qkvz = ops::reshape(&qkvz, &[b, l, nk, 2 * dk + 2 * v_per_k * dv])?;
@@ -315,40 +344,38 @@ impl Qwen3_5GatedDeltaNet {
             let alpha = ops::slice_last_dim(&ba, v_per_k, 2 * v_per_k)?;
             let beta = ops::reshape(&beta, &[b, l, nv])?;
             let alpha = ops::reshape(&alpha, &[b, l, nv])?;
-            (q, k, v, z, beta, alpha)
+
+            // Concatenate QKV for conv: [all_q, all_k, all_v]
+            let q_flat = ops::reshape(&q, &[b, l, key_dim])?;
+            let k_flat = ops::reshape(&k, &[b, l, key_dim])?;
+            let v_flat = ops::reshape(&v, &[b, l, value_dim])?;
+            let qkv = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1)?;
+            let qkv = ops::reshape(&qkv, &[b, l, conv_dim])?;
+
+            // Causal conv1d
+            let conv_in = ops::concatenate(&[conv_state, &qkv], 1)?;
+            let conv_out = depthwise_conv1d(&conv_in, &self.conv_weight, l as usize)?;
+            let conv_out = ops::silu(&conv_out)?;
+
+            // Update conv state (tail of conv_in)
+            let total_len = conv_in.dim(1)?;
+            let new_conv_state = ops::slice_axis1(&conv_in, total_len - conv_tail, total_len)?;
+
+            // Flat slicing after conv
+            let q_out = ops::slice_last_dim(&conv_out, 0, key_dim)?;
+            let k_out = ops::slice_last_dim(&conv_out, key_dim, 2 * key_dim)?;
+            let v_out = ops::slice_last_dim(&conv_out, 2 * key_dim, 2 * key_dim + value_dim)?;
+            let q_out = ops::reshape(&q_out, &[b, l, nk, dk])?;
+            let k_out = ops::reshape(&k_out, &[b, l, nk, dk])?;
+            let v_out = ops::reshape(&v_out, &[b, l, nv, dv])?;
+
+            qkv_out = Some((q_out, k_out, v_out, new_conv_state));
+            (z, beta, alpha)
         } else {
             anyhow::bail!("GatedDeltaNet: missing projections");
         };
 
-        // Concatenate QKV for conv: [B, L, nk*dk*2 + nv*dv]
-        let key_dim = nk * dk;
-        let value_dim = nv * dv;
-        let conv_dim = 2 * key_dim + value_dim;
-        let q_flat = ops::reshape(&q, &[b, l, key_dim])?;
-        let k_flat = ops::reshape(&k, &[b, l, key_dim])?;
-        let v_flat = ops::reshape(&v, &[b, l, value_dim])?;
-        let qkv = ops::concatenate(&[&q_flat, &k_flat, &v_flat], -1)?;
-        let qkv = ops::reshape(&qkv, &[b, l, conv_dim])?;
-
-        // Get recurrent states
-        let (conv_state, delta_state) = rc.get_states(b, x.dtype()?)?;
-
-        // Causal conv1d: prepend state, convolve, extract tail
-        let conv_in = ops::concatenate(&[conv_state, &qkv], 1)?;
-        let conv_out = depthwise_conv1d(&conv_in, &self.conv_weight, l as usize)?;
-        let conv_out = ops::silu(&conv_out)?;
-
-        // Update conv state (tail of conv_in)
-        let total_len = conv_in.dim(1)?;
-        let new_conv_state = ops::slice_axis1(&conv_in, total_len - conv_tail, total_len)?;
-
-        // Split conv output into Q, K, V
-        let q_out = ops::slice_last_dim(&conv_out, 0, key_dim)?;
-        let k_out = ops::slice_last_dim(&conv_out, key_dim, 2 * key_dim)?;
-        let v_out = ops::slice_last_dim(&conv_out, 2 * key_dim, 2 * key_dim + value_dim)?;
-        let q_out = ops::reshape(&q_out, &[b, l, nk, dk])?;
-        let k_out = ops::reshape(&k_out, &[b, l, nk, dk])?;
-        let v_out = ops::reshape(&v_out, &[b, l, nv, dv])?;
+        let (q_out, k_out, v_out, new_conv_state) = qkv_out.take().unwrap();
 
         // RMSNorm + scale
         let inv_scale_k = 1.0 / (dk as f32).sqrt();
@@ -985,16 +1012,15 @@ fn gated_delta_scan(
 ) -> anyhow::Result<(Array, Array)> {
     let b = q.dim(0)?;
     let t = q.dim(1)?;
-    let hv = q.dim(2)?;
-    let dk = q.dim(3)?;
-    let dv = v.dim(3)?;
-
-    // Repeat heads if Hv != Hk
     let hk = k.dim(2)?;
-    let repeat_factor = hv / hk;
+    let hv = v.dim(2)?;
+    let _dk = q.dim(3)?;
+    let dv = v.dim(3)?;
+    let v_per_k = hv / hk;
 
-    let q = if repeat_factor > 1 { ops::repeat_heads(q, repeat_factor)? } else { q.clone() };
-    let k = if repeat_factor > 1 { ops::repeat_heads(k, repeat_factor)? } else { k.clone() };
+    // Expand q/k to hv heads for grouped-head attention
+    let q = if v_per_k > 1 { ops::repeat_heads(q, v_per_k)? } else { q.clone() };
+    let k = if v_per_k > 1 { ops::repeat_heads(k, v_per_k)? } else { k.clone() };
 
     let mut next_state = state.clone();
     let mut outs = Vec::with_capacity(t);
@@ -1016,7 +1042,7 @@ fn gated_delta_scan(
         next_state = ops::multiply(&next_state, &gt_2d)?;
 
         // kv_mem = sum(state * k, dim=-1)
-        let kt_3d = ops::reshape(&ops::expand_dims(&kt, 2)?, &[b, hv, dk, 1])?;
+        let kt_3d = ops::expand_dims(&kt, 2)?;
         let kv_mem = ops::sum_axis(&ops::multiply(&next_state, &kt_3d)?, 3, false)?;
 
         // delta = (v - kv_mem) * beta

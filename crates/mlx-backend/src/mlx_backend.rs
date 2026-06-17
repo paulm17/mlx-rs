@@ -126,12 +126,25 @@ impl MlxBackend {
         })
     }
 
-    /// Collect EOG token IDs from special token strings in the tokenizer vocab.
+    /// Collect EOG token IDs from special token strings in both the base vocab
+    /// and the added tokens vocabulary (which covers special tokens not in base vocab).
     fn eog_token_ids_from_tokenizer(tokenizer: &tokenizers::Tokenizer) -> std::collections::HashSet<i32> {
         let vocab = tokenizer.get_vocab(true);
+        let added_vocab = tokenizer.get_added_vocabulary().get_vocab();
         let mut ids = std::collections::HashSet::new();
-        for token in &["<eos>", "<turn|>", "<|end_of_turn|>", "<|end_of_text|>", "</s>"] {
+        let eog_strings = [
+            "<eos>",
+            "<turn|>",
+            "<|end_of_turn|>",
+            "<|end_of_text|>",
+            "</s>",
+            "<|im_end|>",
+        ];
+        for token in &eog_strings {
             if let Some(&id) = vocab.get(*token) {
+                ids.insert(id as i32);
+            }
+            if let Some(&id) = added_vocab.get(*token) {
                 ids.insert(id as i32);
             }
         }
