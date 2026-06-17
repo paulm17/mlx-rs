@@ -19,3 +19,15 @@ pub trait Model: Send {
 
     fn new_caches(&self) -> Vec<LayerCache>;
 }
+
+pub trait EncoderModel: Send {
+    fn encode(&self, input_ids: &Array) -> anyhow::Result<Array>;
+
+    fn encode_masked(
+        &self,
+        input_ids: &Array,
+        attention_mask: Option<&Array>,
+    ) -> anyhow::Result<Array>;
+
+    fn hidden_size(&self) -> i32;
+}

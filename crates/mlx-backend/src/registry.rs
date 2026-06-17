@@ -1,8 +1,9 @@
 use std::collections::HashMap;
 
 use crate::array::Array;
+use crate::bert::{BertConfig, BertModel};
 use crate::llama::{LlamaConfig, LlamaModel};
-use crate::model::Model;
+use crate::model::{EncoderModel, Model};
 use crate::qwen3::{Qwen3Config, Qwen3Model};
 use crate::qwen3_5::{Qwen3_5Config, Qwen3_5Model};
 use crate::gemma3::{Gemma3Config, Gemma3Model};
@@ -16,6 +17,10 @@ pub fn detect_architecture(config: &serde_json::Value) -> String {
         .and_then(|v| v.as_str())
         .unwrap_or("LlamaForCausalLM")
         .to_string()
+}
+
+pub fn is_encoder_architecture(architecture: &str) -> bool {
+    matches!(architecture, "BertModel" | "BertForMaskedLM" | "BertForSequenceClassification")
 }
 
 pub fn create_model(
@@ -52,7 +57,27 @@ pub fn create_model(
             let model = Gemma4Model::load_from_tensors(tensors, cfg)?;
             Ok(Box::new(model))
         }
+        "BertModel" | "BertForMaskedLM" | "BertForSequenceClassification" => {
+            let cfg = BertConfig::from_json(config)?;
+            let model = BertModel::load_from_tensors(tensors, cfg)?;
+            Ok(Box::new(model))
+        }
         _ => anyhow::bail!("unsupported architecture: {architecture}"),
+    }
+}
+
+pub fn create_encoder_model(
+    architecture: &str,
+    tensors: HashMap<String, Array>,
+    config: &serde_json::Value,
+) -> anyhow::Result<Box<dyn EncoderModel>> {
+    match architecture {
+        "BertModel" | "BertForMaskedLM" | "BertForSequenceClassification" => {
+            let cfg = BertConfig::from_json(config)?;
+            let model = BertModel::load_from_tensors(tensors, cfg)?;
+            Ok(Box::new(model))
+        }
+        _ => anyhow::bail!("architecture {architecture} is not an encoder model"),
     }
 }
 
@@ -74,6 +99,9 @@ pub fn supported_architectures() -> Vec<&'static str> {
         "Gemma3ForConditionalGeneration",
         "Gemma4ForCausalLM",
         "Gemma4ForConditionalGeneration",
+        "BertModel",
+        "BertForMaskedLM",
+        "BertForSequenceClassification",
     ]
 }
 

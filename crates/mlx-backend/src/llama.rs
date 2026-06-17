@@ -155,6 +155,37 @@ impl RmsNorm {
     }
 }
 
+pub struct LayerNorm {
+    weight: Array,
+    bias: Option<Array>,
+    eps: f32,
+}
+
+impl LayerNorm {
+    pub fn new(weight: Array, bias: Option<Array>, eps: f32) -> Self {
+        Self { weight, bias, eps }
+    }
+
+    pub fn forward(&self, x: &Array) -> anyhow::Result<Array> {
+        let ndim = x.ndim();
+        let last_dim = x.dim(ndim - 1)? as f32;
+        let mean = ops::sum_axis(x, ndim - 1, true)?;
+        let mean = ops::divide(&mean, &Array::from_f32(last_dim)?)?;
+        let diff = ops::subtract(x, &mean)?;
+        let var = ops::multiply(&diff, &diff)?;
+        let var = ops::sum_axis(&var, ndim - 1, true)?;
+        let var = ops::divide(&var, &Array::from_f32(last_dim)?)?;
+        let var_eps = ops::add(&var, &Array::from_f32(self.eps)?)?;
+        let std = ops::sqrt(&var_eps)?;
+        let normed = ops::divide(&diff, &std)?;
+        let scaled = ops::multiply(&normed, &self.weight)?;
+        match &self.bias {
+            Some(b) => ops::add(&scaled, b),
+            None => Ok(scaled),
+        }
+    }
+}
+
 pub struct QuantizedLinear {
     weight: Array,
     scales: Array,
@@ -589,7 +620,7 @@ impl LlamaModel {
     }
 }
 
-fn infer_quant_params(weight_cols: i32, scale_cols: i32) -> (i32, i32, String) {
+pub fn infer_quant_params(weight_cols: i32, scale_cols: i32) -> (i32, i32, String) {
     if scale_cols == 0 {
         return (64, 4, "affine".to_string());
     }
@@ -608,7 +639,7 @@ fn infer_quant_params(weight_cols: i32, scale_cols: i32) -> (i32, i32, String) {
     }
 }
 
-fn make_linear(
+pub fn make_linear(
     tensors: &std::collections::HashMap<String, Array>,
     base_key: &str,
 ) -> anyhow::Result<Box<dyn LinearLayer>> {
@@ -661,7 +692,7 @@ fn make_linear_with_bias(
     }
 }
 
-fn make_embedding(
+pub fn make_embedding(
     tensors: &std::collections::HashMap<String, Array>,
     base_key: &str,
 ) -> anyhow::Result<Box<dyn EmbeddingLayer>> {

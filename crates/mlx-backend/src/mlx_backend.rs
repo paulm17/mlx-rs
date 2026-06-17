@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use backend_trait::types::{
-    ChatMessage, EmbeddingOutput, GenerateOutput,
+    ChatMessage, EmbeddingData, EmbeddingOutput, EmbeddingUsage, GenerateOutput,
     GenerationMetrics, GenerationOptions, LoadedModelInfo, StopReason,
 };
 
@@ -12,7 +12,7 @@ use crate::cache::PrefixCache;
 use crate::chat_template::ChatTemplate;
 use crate::llama::LayerCache;
 use crate::manifest::ModelManifest;
-use crate::model::Model;
+use crate::model::{EncoderModel, Model};
 use crate::registry;
 use crate::sampler::Sampler;
 
@@ -21,6 +21,7 @@ const DEFAULT_PREFILL_CHUNK_SIZE: usize = 2048;
 
 pub struct MlxBackend {
     model: Box<dyn Model>,
+    encoder_model: Option<Box<dyn EncoderModel>>,
     tokenizer: tokenizers::Tokenizer,
     model_path: String,
     chat_template: ChatTemplate,
@@ -66,11 +67,22 @@ impl MlxBackend {
         let config = manifest.config().clone();
         let architecture = registry::detect_architecture(&config);
 
+        let is_encoder = registry::is_encoder_architecture(&architecture);
+
         let tensors = manifest.load_all_tensors()
             .context("failed to load tensors")?;
 
-        let model = registry::create_model(&architecture, tensors, &config)
-            .context("failed to construct model")?;
+        let (model, encoder_model) = if is_encoder {
+            let model = registry::create_model(&architecture, tensors.clone(), &config)
+                .context("failed to construct model")?;
+            let encoder = registry::create_encoder_model(&architecture, tensors, &config)
+                .context("failed to construct encoder model")?;
+            (model, Some(encoder))
+        } else {
+            let model = registry::create_model(&architecture, tensors, &config)
+                .context("failed to construct model")?;
+            (model, None)
+        };
 
         let tokenizer_path = dir.join("tokenizer.json");
         let tokenizer = if tokenizer_path.exists() {
@@ -117,6 +129,7 @@ impl MlxBackend {
 
         Ok(Self {
             model,
+            encoder_model,
             tokenizer,
             model_path: dir.display().to_string(),
             chat_template,
@@ -239,7 +252,7 @@ impl backend_trait::Backend for MlxBackend {
     }
 
     fn embeddings_enabled(&self) -> bool {
-        false
+        self.encoder_model.is_some()
     }
 
     fn supports_chat_template(&self) -> bool {
@@ -446,8 +459,63 @@ impl backend_trait::Backend for MlxBackend {
         })
     }
 
-    fn embed(&mut self, _text: &str) -> Result<EmbeddingOutput> {
-        anyhow::bail!("embeddings not yet supported for MLX backend")
+    fn embed(&mut self, text: &str) -> Result<EmbeddingOutput> {
+        let encoder = self.encoder_model.as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no encoder model loaded; embeddings not available"))?;
+
+        let encoding = self.tokenizer.encode(text, true)
+            .map_err(|e| anyhow::anyhow!("tokenization failed: {e}"))?;
+        let ids: Vec<i32> = encoding.get_ids().iter().map(|&x| x as i32).collect();
+        let token_count = ids.len();
+
+        let n = ids.len();
+        let input_ids = Array::from_data_i32(&ids, &[1, n])?;
+        let hidden_states = encoder.encode(&input_ids)?;
+        crate::ops::eval(&[&hidden_states])?;
+
+        let hidden_size = encoder.hidden_size() as usize;
+        let seq_len = ids.len();
+
+        let data_f32 = crate::ops::astype(&hidden_states, crate::ffi::MlxDtype::Float32)?;
+        crate::ops::eval(&[&data_f32])?;
+        let raw = data_f32.data_f32()?;
+
+        let mut pooled = vec![0.0f32; hidden_size];
+        for t in 0..seq_len {
+            for d in 0..hidden_size {
+                pooled[d] += raw[t * hidden_size + d];
+            }
+        }
+        let inv_len = 1.0 / seq_len as f32;
+        for v in &mut pooled {
+            *v *= inv_len;
+        }
+
+        let mut norm = 0.0f32;
+        for v in &pooled {
+            norm += v * v;
+        }
+        norm = norm.sqrt();
+        if norm > 0.0 {
+            for v in &mut pooled {
+                *v /= norm;
+            }
+        }
+
+        let _ = crate::memory::clear_cache();
+
+        Ok(EmbeddingOutput {
+            object: "list".to_string(),
+            data: vec![EmbeddingData {
+                object: "embedding".to_string(),
+                index: 0,
+                embedding: pooled,
+            }],
+            usage: EmbeddingUsage {
+                prompt_tokens: token_count,
+                total_tokens: token_count,
+            },
+        })
     }
 
     fn memory_info(&self) -> Option<String> {
