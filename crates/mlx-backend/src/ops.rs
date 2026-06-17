@@ -1,6 +1,42 @@
+use std::cell::Cell;
+
 use crate::array::Array;
-use crate::ffi::{MlxArray, MlxVectorArray};
+use crate::ffi::{MlxArray, MlxStream, MlxVectorArray};
 use crate::loader;
+
+thread_local! {
+    static STREAM_INIT: Cell<bool> = const { Cell::new(false) };
+    static DEFAULT_STREAM: Cell<MlxStream> = const { Cell::new(MlxStream { ctx: std::ptr::null_mut() }) };
+    static CPU_STREAM: Cell<MlxStream> = const { Cell::new(MlxStream { ctx: std::ptr::null_mut() }) };
+}
+
+pub fn init_streams() {
+    STREAM_INIT.with(|init| {
+        if init.get() {
+            return;
+        }
+        let syms = loader::symbols().expect("MLX not initialized");
+        let gpu_device = unsafe { (syms.mlx_device_new_type)(crate::ffi::MlxDeviceType::Gpu, 0) };
+        unsafe { (syms.mlx_set_default_device)(gpu_device); }
+        let gpu_stream = unsafe { (syms.mlx_default_gpu_stream_new)() };
+        DEFAULT_STREAM.set(gpu_stream);
+        let cpu_stream = unsafe { (syms.mlx_default_cpu_stream_new)() };
+        CPU_STREAM.set(cpu_stream);
+        unsafe { (syms.mlx_device_free)(gpu_device); }
+        init.set(true);
+    });
+}
+
+pub fn cpu_stream() -> anyhow::Result<MlxStream> {
+    init_streams();
+    let s = CPU_STREAM.with(|c| c.get());
+    Ok(s)
+}
+
+fn default_stream() -> MlxStream {
+    init_streams();
+    DEFAULT_STREAM.with(|s| s.get())
+}
 
 pub(crate) struct VectorArray {
     ctx: MlxVectorArray,
@@ -43,14 +79,10 @@ impl Drop for VectorArray {
     }
 }
 
-fn null_stream() -> *const crate::ffi::MlxStream {
-    std::ptr::null()
-}
-
 pub fn add(a: &Array, b: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_add)(&mut res, a.raw(), b.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_add)(&mut res, a.raw(), b.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_add returned error: {rc}"));
     }
@@ -60,7 +92,7 @@ pub fn add(a: &Array, b: &Array) -> anyhow::Result<Array> {
 pub fn multiply(a: &Array, b: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_multiply)(&mut res, a.raw(), b.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_multiply)(&mut res, a.raw(), b.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_multiply returned error: {rc}"));
     }
@@ -70,7 +102,7 @@ pub fn multiply(a: &Array, b: &Array) -> anyhow::Result<Array> {
 pub fn matmul(a: &Array, b: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_matmul)(&mut res, a.raw(), b.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_matmul)(&mut res, a.raw(), b.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_matmul returned error: {rc}"));
     }
@@ -87,7 +119,7 @@ pub fn reshape(a: &Array, shape: &[usize]) -> anyhow::Result<Array> {
             a.raw(),
             c_shape.as_ptr(),
             shape.len(),
-            null_stream(),
+            default_stream(),
         )
     };
     if rc != 0 {
@@ -106,7 +138,7 @@ pub fn transpose(a: &Array, axes: &[usize]) -> anyhow::Result<Array> {
             a.raw(),
             c_axes.as_ptr(),
             axes.len(),
-            null_stream(),
+            default_stream(),
         )
     };
     if rc != 0 {
@@ -118,7 +150,7 @@ pub fn transpose(a: &Array, axes: &[usize]) -> anyhow::Result<Array> {
 pub fn astype(a: &Array, dtype: crate::ffi::MlxDtype) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_astype)(&mut res, a.raw(), dtype as i32, null_stream()) };
+    let rc = unsafe { (syms.mlx_astype)(&mut res, a.raw(), dtype as i32, default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_astype returned error: {rc}"));
     }
@@ -133,7 +165,7 @@ pub fn concatenate(arrays: &[&Array], axis: i32) -> anyhow::Result<Array> {
     }
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
     let rc = unsafe {
-        (syms.mlx_concatenate_axis)(&mut res, vec.raw(), axis, null_stream())
+        (syms.mlx_concatenate_axis)(&mut res, vec.raw(), axis, default_stream())
     };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_concatenate_axis returned error: {rc}"));
@@ -151,7 +183,7 @@ pub fn zeros(shape: &[usize], dtype: crate::ffi::MlxDtype) -> anyhow::Result<Arr
             c_shape.as_ptr(),
             shape.len(),
             dtype as i32,
-            null_stream(),
+            default_stream(),
         )
     };
     if rc != 0 {
@@ -164,7 +196,7 @@ pub fn sum_axis(a: &Array, axis: usize, keepdims: bool) -> anyhow::Result<Array>
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
     let rc = unsafe {
-        (syms.mlx_sum_axis)(&mut res, a.raw(), axis as i32, keepdims, null_stream())
+        (syms.mlx_sum_axis)(&mut res, a.raw(), axis as i32, keepdims, default_stream())
     };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_sum_axis returned error: {rc}"));
@@ -173,6 +205,7 @@ pub fn sum_axis(a: &Array, axis: usize, keepdims: bool) -> anyhow::Result<Array>
 }
 
 pub fn eval(arrays: &[&Array]) -> anyhow::Result<()> {
+    init_streams();
     let syms = loader::symbols()?;
     let vec = VectorArray::new()?;
     for arr in arrays {
@@ -188,7 +221,7 @@ pub fn eval(arrays: &[&Array]) -> anyhow::Result<()> {
 pub fn take(a: &Array, indices: &Array, axis: i32) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_take_axis)(&mut res, a.raw(), indices.raw(), axis, null_stream()) };
+    let rc = unsafe { (syms.mlx_take_axis)(&mut res, a.raw(), indices.raw(), axis, default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_take_axis returned error: {rc}"));
     }
@@ -198,7 +231,7 @@ pub fn take(a: &Array, indices: &Array, axis: i32) -> anyhow::Result<Array> {
 pub fn expand_dims(a: &Array, axis: i32) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_expand_dims)(&mut res, a.raw(), axis, null_stream()) };
+    let rc = unsafe { (syms.mlx_expand_dims)(&mut res, a.raw(), axis, default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_expand_dims returned error: {rc}"));
     }
@@ -208,7 +241,7 @@ pub fn expand_dims(a: &Array, axis: i32) -> anyhow::Result<Array> {
 pub fn tri_matrix(n: i32, m: i32, k: i32, dtype: crate::ffi::MlxDtype) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_tri)(&mut res, n, m, k, dtype as i32, null_stream()) };
+    let rc = unsafe { (syms.mlx_tri)(&mut res, n, m, k, dtype as i32, default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_tri returned error: {rc}"));
     }
@@ -218,7 +251,7 @@ pub fn tri_matrix(n: i32, m: i32, k: i32, dtype: crate::ffi::MlxDtype) -> anyhow
 pub fn where_op(condition: &Array, x: &Array, y: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_where)(&mut res, condition.raw(), x.raw(), y.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_where)(&mut res, condition.raw(), x.raw(), y.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_where returned error: {rc}"));
     }
@@ -228,7 +261,7 @@ pub fn where_op(condition: &Array, x: &Array, y: &Array) -> anyhow::Result<Array
 pub fn divide(a: &Array, b: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_divide)(&mut res, a.raw(), b.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_divide)(&mut res, a.raw(), b.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_divide returned error: {rc}"));
     }
@@ -238,7 +271,7 @@ pub fn divide(a: &Array, b: &Array) -> anyhow::Result<Array> {
 pub fn negative(a: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_negative)(&mut res, a.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_negative)(&mut res, a.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_negative returned error: {rc}"));
     }
@@ -248,7 +281,7 @@ pub fn negative(a: &Array) -> anyhow::Result<Array> {
 pub fn softmax(a: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_softmax)(&mut res, a.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_softmax)(&mut res, a.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_softmax returned error: {rc}"));
     }
@@ -258,7 +291,7 @@ pub fn softmax(a: &Array) -> anyhow::Result<Array> {
 pub fn sigmoid(a: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_sigmoid)(&mut res, a.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_sigmoid)(&mut res, a.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_sigmoid returned error: {rc}"));
     }
@@ -268,7 +301,7 @@ pub fn sigmoid(a: &Array) -> anyhow::Result<Array> {
 pub fn sqrt(a: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_sqrt)(&mut res, a.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_sqrt)(&mut res, a.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_sqrt returned error: {rc}"));
     }
@@ -278,7 +311,7 @@ pub fn sqrt(a: &Array) -> anyhow::Result<Array> {
 pub fn tanh(a: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_tanh)(&mut res, a.raw(), null_stream()) };
+    let rc = unsafe { (syms.mlx_tanh)(&mut res, a.raw(), default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_tanh returned error: {rc}"));
     }
@@ -288,7 +321,7 @@ pub fn tanh(a: &Array) -> anyhow::Result<Array> {
 pub fn fast_rms_norm(x: &Array, weight: &Array, eps: f32) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_fast_rms_norm)(&mut res, x.raw(), weight.raw(), eps, null_stream()) };
+    let rc = unsafe { (syms.mlx_fast_rms_norm)(&mut res, x.raw(), weight.raw(), eps, default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_fast_rms_norm returned error: {rc}"));
     }
@@ -303,6 +336,20 @@ pub fn fast_rope(
     scale: f32,
     offset: i32,
 ) -> anyhow::Result<Array> {
+    fast_rope_with_freqs(x, dims, traditional, base, scale, offset, None)
+}
+
+pub fn fast_rope_with_freqs(
+    x: &Array,
+    dims: i32,
+    traditional: bool,
+    base: Option<f32>,
+    scale: f32,
+    offset: i32,
+    freqs: Option<&Array>,
+) -> anyhow::Result<Array> {
+    eprintln!("[rope] x.shape={:?} dims={} traditional={} base={:?} scale={} offset={} has_freqs={}",
+        x.shape(), dims, traditional, base, scale, offset, freqs.is_some());
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
     let optional_base = crate::ffi::MlxOptionalFloat {
@@ -310,6 +357,7 @@ pub fn fast_rope(
         has_value: base.is_some(),
     };
     let null_freqs = MlxArray { ctx: std::ptr::null_mut() };
+    let freqs_raw = freqs.map(|f| f.raw()).unwrap_or(null_freqs);
     let rc = unsafe {
         (syms.mlx_fast_rope)(
             &mut res,
@@ -319,12 +367,50 @@ pub fn fast_rope(
             optional_base,
             scale,
             offset,
-            null_freqs,
-            null_stream(),
+            freqs_raw,
+            default_stream(),
         )
     };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_fast_rope returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn fast_rope_dynamic(
+    x: &Array,
+    dims: i32,
+    traditional: bool,
+    base: Option<f32>,
+    scale: f32,
+    offset: &Array,
+    freqs: Option<&Array>,
+) -> anyhow::Result<Array> {
+    eprintln!("[rope_dynamic] x.shape={:?} dims={} traditional={} base={:?} scale={} offset.shape={:?} has_freqs={}",
+        x.shape(), dims, traditional, base, scale, offset.shape(), freqs.is_some());
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let optional_base = crate::ffi::MlxOptionalFloat {
+        value: base.unwrap_or(0.0),
+        has_value: base.is_some(),
+    };
+    let null_freqs = MlxArray { ctx: std::ptr::null_mut() };
+    let freqs_raw = freqs.map(|f| f.raw()).unwrap_or(null_freqs);
+    let rc = unsafe {
+        (syms.mlx_fast_rope_dynamic)(
+            &mut res,
+            x.raw(),
+            dims,
+            traditional,
+            optional_base,
+            scale,
+            offset.raw(),
+            freqs_raw,
+            default_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_fast_rope_dynamic returned error: {rc}"));
     }
     Ok(Array { ctx: res })
 }
@@ -353,11 +439,109 @@ pub fn fast_sdpa(
             c_mode.as_ptr(),
             mask_arr,
             null_sinks,
-            null_stream(),
+            default_stream(),
         )
     };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_fast_sdpa returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn dequantize(
+    w: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    group_size: Option<i32>,
+    bits: Option<i32>,
+    mode: &str,
+    global_scale: Option<&Array>,
+) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let null_bias = MlxArray { ctx: std::ptr::null_mut() };
+    let bias_raw = biases.map(|b| b.raw()).unwrap_or(null_bias);
+    let gs = crate::ffi::MlxOptionalInt {
+        value: group_size.unwrap_or(0),
+        has_value: group_size.is_some(),
+    };
+    let bits_opt = crate::ffi::MlxOptionalInt {
+        value: bits.unwrap_or(0),
+        has_value: bits.is_some(),
+    };
+    let c_mode = std::ffi::CString::new(mode).unwrap_or_else(|_| std::ffi::CString::new("affine").unwrap());
+    let null_gs = MlxArray { ctx: std::ptr::null_mut() };
+    let gs_raw = global_scale.map(|g| g.raw()).unwrap_or(null_gs);
+    let dtype_opt = crate::ffi::MlxOptionalDtype { value: 0, has_value: false };
+    let rc = unsafe {
+        (syms.mlx_dequantize)(
+            &mut res,
+            w.raw(),
+            scales.raw(),
+            bias_raw,
+            gs,
+            bits_opt,
+            c_mode.as_ptr(),
+            gs_raw,
+            dtype_opt,
+            default_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_dequantize returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn quantized_matmul(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    transpose: bool,
+    group_size: Option<i32>,
+    bits: Option<i32>,
+    mode: &str,
+) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let null_bias = MlxArray { ctx: std::ptr::null_mut() };
+    let bias_raw = biases.map(|b| b.raw()).unwrap_or(null_bias);
+    let gs = crate::ffi::MlxOptionalInt {
+        value: group_size.unwrap_or(0),
+        has_value: group_size.is_some(),
+    };
+    let bits_opt = crate::ffi::MlxOptionalInt {
+        value: bits.unwrap_or(0),
+        has_value: bits.is_some(),
+    };
+    let c_mode = std::ffi::CString::new(mode).unwrap_or_else(|_| std::ffi::CString::new("affine").unwrap());
+    let rc = unsafe {
+        (syms.mlx_quantized_matmul)(
+            &mut res,
+            x.raw(),
+            w.raw(),
+            scales.raw(),
+            bias_raw,
+            transpose,
+            gs,
+            bits_opt,
+            c_mode.as_ptr(),
+            default_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_quantized_matmul returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn argmax_op(a: &Array) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_argmax)(&mut res, a.raw(), false, default_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_argmax returned error: {rc}"));
     }
     Ok(Array { ctx: res })
 }
@@ -496,5 +680,119 @@ mod tests {
         let vb = b.item_f64().unwrap();
         assert!((va - 1.0).abs() < 1e-6);
         assert!((vb - 2.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_dequantize_affine_small() {
+        if !mlx_available() {
+            return;
+        }
+        use crate::ffi::MlxDtype;
+
+        // Create a small U32 packed weight: 4 rows, 2 U32 per row (16 4-bit values)
+        // Each U32 packs 8 4-bit values. For a 4x16 matrix:
+        //   group_size = 16*8/2 = 64? No. group_size for 4-bit: weight_cols * 8 / scale_cols
+        //   weight shape [4, 2] means 16 values per row (2 U32 * 8 4-bit vals each)
+        //   scale shape [4, 1] means 1 group per row -> group_size = 16
+        //   Actually group_size = weight_cols * pack_ratio / scale_cols
+        //   For 4-bit: pack_ratio = 8. So group_size = 2 * 8 / 1 = 16.
+        let w_data: Vec<u32> = vec![0x00000000, 0x11111111,  // row 0: all 0s, all 1s
+                                     0x22222222, 0x33333333,  // row 1: all 2s, all 3s
+                                     0x00000000, 0x00000000,  // row 2: all 0s
+                                     0xFFFFFFFF, 0xFFFFFFFF]; // row 3: all 15s (max 4-bit)
+        let w = Array::from_data_u32(&w_data, &[4, 2]).expect("create u32 weight");
+
+        // Scales: one scale per row, F32 format
+        let s_data: Vec<f32> = vec![1.0, 2.0, 0.5, 3.0];
+        let scales = Array::from_data_f32(&s_data, &[4, 1]).expect("create scales");
+
+        let t0 = std::time::Instant::now();
+        let out = dequantize(&w, &scales, None, Some(16), Some(4), "affine", None)
+            .expect("dequantize failed");
+        eprintln!("[test_dequantize] dequantize call in {:.3}s", t0.elapsed().as_secs_f64());
+
+        let t0 = std::time::Instant::now();
+        let data = out.data_f32().expect("data_f32 failed");
+        eprintln!("[test_dequantize] data_f32 in {:.3}s, len={}", t0.elapsed().as_secs_f64(), data.len());
+
+        // Should have 4 rows * 16 values = 64 floats
+        assert_eq!(data.len(), 64);
+        assert_eq!(out.shape(), vec![4, 16]);
+
+        // Row 0: scale=1.0, packed values are 0,0,0,0,0,0,0,0, 1,1,1,1,1,1,1,1
+        // Affine dequant: value = (packed_val - 0) * scale (for unsigned)
+        // Actually affine 4-bit dequant: w_deq = w * scales where w is the 4-bit value
+        // Row 0, col 0 should be 0 * 1.0 = 0.0
+        assert!((data[0] - 0.0).abs() < 1e-6, "row0 col0: {}", data[0]);
+        // Row 0, col 8 should be 1 * 1.0 = 1.0
+        assert!((data[8] - 1.0).abs() < 1e-6, "row0 col8: {}", data[8]);
+    }
+
+    #[test]
+    fn test_dequantize_affine_e2b_shapes() {
+        if !mlx_available() {
+            return;
+        }
+        // Simulate E2B model shapes: weight [2048, 192] U32, scales [2048, 24] BF16/F32
+        // group_size = 192 * 8 / 24 = 64, bits = 4
+        // Use a smaller version: weight [4, 24] U32, scales [4, 3] F32
+        // group_size = 24 * 8 / 3 = 64, bits = 4
+        let rows = 4usize;
+        let w_cols = 24usize; // 24 U32 = 192 4-bit values per row
+        let s_cols = 3usize;  // 3 scales per row = 3 groups of 64
+
+        let w_data: Vec<u32> = vec![0u32; rows * w_cols];
+        let w = Array::from_data_u32(&w_data, &[rows, w_cols]).expect("create u32 weight");
+
+        let s_data: Vec<f32> = vec![1.0; rows * s_cols];
+        let scales = Array::from_data_f32(&s_data, &[rows, s_cols]).expect("create scales");
+
+        eprintln!("[test_dequantize_e2b] dequantizing {}x{} weight with {}x{} scales...", rows, w_cols, rows, s_cols);
+        let t0 = std::time::Instant::now();
+        let out = dequantize(&w, &scales, None, Some(64), Some(4), "affine", None)
+            .expect("dequantize failed");
+        eprintln!("[test_dequantize_e2b] dequantize call in {:.3}s", t0.elapsed().as_secs_f64());
+
+        let t0 = std::time::Instant::now();
+        let data = out.data_f32().expect("data_f32 failed");
+        eprintln!("[test_dequantize_e2b] data_f32 in {:.3}s, len={}", t0.elapsed().as_secs_f64(), data.len());
+
+        assert_eq!(data.len(), rows * w_cols * 8); // 4 * 192 = 768
+        assert_eq!(out.shape(), vec![rows, w_cols * 8]); // [4, 192]
+    }
+
+    #[test]
+    fn test_quantized_matmul_affine() {
+        if !mlx_available() {
+            return;
+        }
+        // Test quantized_matmul: x @ w^T where w is packed U32
+        // x: [2, 4] F32, w: [3, 1] U32 (3 rows, 1 U32 = 8 4-bit values -> 8 cols)
+        // scales: [3, 1] F32, group_size=8, bits=4
+        // Result should be [2, 3]
+        let x_data: Vec<f32> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let x = Array::from_data_f32(&x_data, &[2, 4]).expect("create x");
+
+        // w: 3 output rows, 1 U32 each (packing 8 4-bit values)
+        let w_data: Vec<u32> = vec![0x00000000, 0x11111111, 0x22222222];
+        let w = Array::from_data_u32(&w_data, &[3, 1]).expect("create w");
+
+        // scales: one per output row
+        let s_data: Vec<f32> = vec![1.0, 1.0, 1.0];
+        let scales = Array::from_data_f32(&s_data, &[3, 1]).expect("create scales");
+
+        eprintln!("[test_qmm] calling quantized_matmul...");
+        let t0 = std::time::Instant::now();
+        let out = quantized_matmul(&x, &w, &scales, None, true, Some(8), Some(4), "affine")
+            .expect("quantized_matmul failed");
+        eprintln!("[test_qmm] quantized_matmul call in {:.3}s", t0.elapsed().as_secs_f64());
+
+        let t0 = std::time::Instant::now();
+        let data = out.data_f32().expect("data_f32 failed");
+        eprintln!("[test_qmm] data_f32 in {:.3}s, shape={:?}, len={}", t0.elapsed().as_secs_f64(), out.shape(), data.len());
+
+        // Result should be [2, 3]
+        assert_eq!(out.shape(), vec![2, 3]);
+        assert_eq!(data.len(), 6);
     }
 }

@@ -16,4 +16,8 @@ pub trait Model: Send {
     fn hidden_size(&self) -> i32;
 
     fn vocab_size(&self) -> i32;
+
+    /// Create a fresh KV cache for each layer. Models with sliding-window
+    /// attention should return rotating caches for the appropriate layers.
+    fn new_caches(&self) -> Vec<KvCache>;
 }

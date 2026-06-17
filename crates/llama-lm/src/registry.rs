@@ -6,7 +6,7 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::config::LlamaCppConfig;
 use crate::llamacpp::LlamaCppBackend;
-use crate::loader::resolve_model_path;
+use crate::loader::{resolve_model_path, resolve_hf_safetensors_dir, looks_like_hf_repo_id, looks_like_hf_gguf_ref};
 use crate::subprocess::RunnerSubprocess;
 use crate::types::LoadedModelInfo;
 
@@ -52,9 +52,19 @@ pub fn detect_format(path: &str) -> Result<ModelFormat> {
             })
             .is_some();
 
-        if has_safetensors {
+        if has_safetensors || raw.join("config.json").is_file() {
             return Ok(ModelFormat::Safetensors);
         }
+    }
+
+    if looks_like_hf_repo_id(path) {
+        // For HF repo IDs, detect format without downloading.
+        // GGUF references (owner/repo/file.gguf) are handled by resolve_model_path.
+        // Everything else (owner/repo or owner/repo/subdir) is considered safetensors.
+        if looks_like_hf_gguf_ref(path) {
+            return Ok(ModelFormat::Gguf);
+        }
+        return Ok(ModelFormat::Safetensors);
     }
 
     let resolved: PathBuf = resolve_model_path(path)?;
@@ -79,16 +89,20 @@ pub fn create_backend(path: &str, config: LlamaCppConfig) -> Result<Box<dyn Back
             Ok(Box::new(backend))
         }
         ModelFormat::Safetensors => {
+            let resolved = if PathBuf::from(path).is_dir() {
+                PathBuf::from(path)
+            } else {
+                resolve_hf_safetensors_dir(path)?
+            };
+
             let reg = safetensors_registry().lock().unwrap();
             if let Some(factory) = reg.first() {
-                let raw = PathBuf::from(path);
-                return factory(&raw);
+                return factory(&resolved);
             }
 
-            let raw = PathBuf::from(path);
-            let subprocess = RunnerSubprocess::spawn(&raw)?;
+            let subprocess = RunnerSubprocess::spawn(&resolved)?;
             let model_info = LoadedModelInfo {
-                model_path: raw.display().to_string(),
+                model_path: resolved.display().to_string(),
                 context_length: None,
                 embedding_dimension: None,
                 vocab_size: None,

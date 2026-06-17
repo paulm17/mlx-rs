@@ -5,6 +5,7 @@ use crate::llama::{LlamaConfig, LlamaModel};
 use crate::model::Model;
 use crate::qwen3::{Qwen3Config, Qwen3Model};
 use crate::gemma3::{Gemma3Config, Gemma3Model};
+use crate::gemma4::{Gemma4Config, Gemma4Model};
 
 pub fn detect_architecture(config: &serde_json::Value) -> String {
     config
@@ -37,6 +38,11 @@ pub fn create_model(
             let model = Gemma3Model::load_from_tensors(tensors, cfg)?;
             Ok(Box::new(model))
         }
+        "Gemma4ForCausalLM" | "Gemma4ForConditionalGeneration" => {
+            let cfg = Gemma4Config::from_json(config)?;
+            let model = Gemma4Model::load_from_tensors(tensors, cfg)?;
+            Ok(Box::new(model))
+        }
         _ => anyhow::bail!("unsupported architecture: {architecture}"),
     }
 }
@@ -48,6 +54,8 @@ pub fn supported_architectures() -> Vec<&'static str> {
         "Qwen3ForCausalLM",
         "Gemma3ForCausalLM",
         "Gemma3ForConditionalGeneration",
+        "Gemma4ForCausalLM",
+        "Gemma4ForConditionalGeneration",
     ]
 }
 

@@ -2,6 +2,15 @@ use crate::array::Array;
 use crate::model::Model;
 use crate::ops;
 
+pub trait LinearLayer: Send {
+    fn forward(&self, x: &Array) -> anyhow::Result<Array>;
+}
+
+pub trait EmbeddingLayer: Send {
+    fn forward(&self, indices: &Array) -> anyhow::Result<Array>;
+    fn weight(&self) -> &Array;
+}
+
 pub struct Linear {
     weight: Array,
     bias: Option<Array>,
@@ -13,6 +22,12 @@ impl Linear {
     }
 
     pub fn forward(&self, x: &Array) -> anyhow::Result<Array> {
+        <Self as LinearLayer>::forward(self, x)
+    }
+}
+
+impl LinearLayer for Linear {
+    fn forward(&self, x: &Array) -> anyhow::Result<Array> {
         let w_t = ops::transpose(&self.weight, &[1, 0])?;
         let out = ops::matmul(x, &w_t)?;
         match &self.bias {
@@ -32,10 +47,20 @@ impl Embedding {
     }
 
     pub fn forward(&self, indices: &Array) -> anyhow::Result<Array> {
-        ops::take(&self.weight, indices, 0)
+        <Self as EmbeddingLayer>::forward(self, indices)
     }
 
     pub fn weight(&self) -> &Array {
+        &self.weight
+    }
+}
+
+impl EmbeddingLayer for Embedding {
+    fn forward(&self, indices: &Array) -> anyhow::Result<Array> {
+        ops::take(&self.weight, indices, 0)
+    }
+
+    fn weight(&self) -> &Array {
         &self.weight
     }
 }
@@ -55,6 +80,91 @@ impl RmsNorm {
     }
 }
 
+pub struct QuantizedLinear {
+    weight: Array,
+    scales: Array,
+    biases: Option<Array>,
+    group_size: Option<i32>,
+    bits: Option<i32>,
+    mode: String,
+}
+
+impl QuantizedLinear {
+    pub fn new(
+        weight: Array,
+        scales: Array,
+        biases: Option<Array>,
+        group_size: Option<i32>,
+        bits: Option<i32>,
+        mode: String,
+    ) -> Self {
+        Self { weight, scales, biases, group_size, bits, mode }
+    }
+}
+
+impl LinearLayer for QuantizedLinear {
+    fn forward(&self, x: &Array) -> anyhow::Result<Array> {
+        ops::quantized_matmul(
+            x,
+            &self.weight,
+            &self.scales,
+            self.biases.as_ref(),
+            true, // transpose=true because weight is [out, in] packed
+            self.group_size,
+            self.bits,
+            &self.mode,
+        )
+    }
+}
+
+pub struct QuantizedEmbedding {
+    weight: Array,
+    scales: Array,
+    biases: Option<Array>,
+    group_size: Option<i32>,
+    bits: Option<i32>,
+    mode: String,
+}
+
+impl QuantizedEmbedding {
+    pub fn new(
+        weight: Array,
+        scales: Array,
+        biases: Option<Array>,
+        group_size: Option<i32>,
+        bits: Option<i32>,
+        mode: String,
+    ) -> Self {
+        Self { weight, scales, biases, group_size, bits, mode }
+    }
+}
+
+impl EmbeddingLayer for QuantizedEmbedding {
+    fn forward(&self, indices: &Array) -> anyhow::Result<Array> {
+        // Take rows by index from packed weight, scales, and biases
+        let w = ops::take(&self.weight, indices, 0)?;
+        let s = ops::take(&self.scales, indices, 0)?;
+        let b = match &self.biases {
+            Some(bias) => Some(ops::take(bias, indices, 0)?),
+            None => None,
+        };
+        // Dequantize the selected rows
+        ops::dequantize(
+            &w,
+            &s,
+            b.as_ref(),
+            self.group_size,
+            self.bits,
+            &self.mode,
+            None,
+        )
+    }
+
+    fn weight(&self) -> &Array {
+        &self.weight
+    }
+}
+
 pub struct Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -71,7 +181,7 @@ impl Attention {
         &self,
         x: &Array,
         kv: &mut KvCache,
-        _positions: &Array,
+        positions: &Array,
         cfg: &LlamaConfig,
     ) -> anyhow::Result<Array> {
         let b = x.dim(0)?;
@@ -92,13 +202,14 @@ impl Attention {
 
         let head_dim = cfg.head_dim as i32;
         let rope_theta = Some(cfg.rope_theta);
-        let q = ops::fast_rope(&q, head_dim, false, rope_theta, 1.0, 0)?;
-        let k = ops::fast_rope(&k, head_dim, false, rope_theta, 1.0, 0)?;
+        let q = ops::fast_rope_dynamic(&q, head_dim, false, rope_theta, 1.0, positions, None)?;
+        let k = ops::fast_rope_dynamic(&k, head_dim, false, rope_theta, 1.0, positions, None)?;
 
         let (k, v) = kv.update(&k, &v)?;
 
         let scale = cfg.scale();
-        let out = ops::fast_sdpa(&q, &k, &v, scale, "causal", None)?;
+        let sdpa_mode = if l > 1 { "causal" } else { "" };
+        let out = ops::fast_sdpa(&q, &k, &v, scale, sdpa_mode, None)?;
 
         let out = ops::transpose(&out, &[0, 2, 1, 3])?;
         let out = ops::reshape(&out, &[b, l, (cfg.num_attention_heads * cfg.head_dim) as usize])?;
@@ -152,34 +263,61 @@ impl Layer {
 
 #[derive(Clone)]
 pub struct KvCache {
-    k_cache: Option<Array>,
-    v_cache: Option<Array>,
+    pub(crate) k_cache: Option<Array>,
+    pub(crate) v_cache: Option<Array>,
+    pub donor: Option<(Array, Array, f32)>,
+    /// Maximum sequence length for sliding-window layers. When the cache grows
+    /// beyond this, oldest tokens are dropped from the sequence dimension.
+    pub max_len: Option<usize>,
 }
 
 impl KvCache {
     pub fn new() -> Self {
-        Self { k_cache: None, v_cache: None }
+        Self { k_cache: None, v_cache: None, donor: None, max_len: None }
+    }
+
+    pub fn new_rotating(max_len: usize) -> Self {
+        Self { k_cache: None, v_cache: None, donor: None, max_len: Some(max_len) }
     }
 
     pub fn update(&mut self, k: &Array, v: &Array) -> anyhow::Result<(Array, Array)> {
-        match (&self.k_cache, &self.v_cache) {
+        let offset_before = self.len();
+        let (mut new_k, mut new_v) = match (&self.k_cache, &self.v_cache) {
             (Some(ck), Some(cv)) => {
-                let new_k = ops::concatenate(&[ck, k], 2)?;
-                let new_v = ops::concatenate(&[cv, v], 2)?;
-                self.k_cache = Some(new_k.clone());
-                self.v_cache = Some(new_v.clone());
-                Ok((new_k, new_v))
+                (ops::concatenate(&[ck, k], 2)?, ops::concatenate(&[cv, v], 2)?)
             }
-            _ => {
-                self.k_cache = Some(k.clone());
-                self.v_cache = Some(v.clone());
-                Ok((k.clone(), v.clone()))
+            _ => (k.clone(), v.clone()),
+        };
+
+        // Sliding-window eviction: keep only the most recent max_len positions.
+        if let Some(max_len) = self.max_len {
+            let seq_len = new_k.dim(2)?;
+            if seq_len > max_len {
+                let start = seq_len - max_len;
+                let indices: Vec<i32> = (start..seq_len).map(|i| i as i32).collect();
+                let idx = Array::from_data_i32(&indices, &[max_len])?;
+                new_k = ops::take(&new_k, &idx, 2)?;
+                new_v = ops::take(&new_v, &idx, 2)?;
             }
         }
+
+        self.k_cache = Some(new_k.clone());
+        self.v_cache = Some(new_v.clone());
+        eprintln!("[MLX_KVCACHE] Update k_dims={:?} v_dims={:?} offset_before={} offset_after={} max_len={:?}",
+            k.shape(), v.shape(), offset_before, self.len(), self.max_len);
+        Ok((new_k, new_v))
     }
 
     pub fn len(&self) -> usize {
         self.k_cache.as_ref().map(|k| k.dim(2).unwrap_or(0)).unwrap_or(0)
+    }
+
+    /// Collect the current K and V arrays for explicit evaluation.
+    pub fn arrays(&self) -> Vec<&Array> {
+        let mut out = Vec::with_capacity(2);
+        if let Some(k) = &self.k_cache { out.push(k); }
+        if let Some(v) = &self.v_cache { out.push(v); }
+        out
     }
 }
 
@@ -273,6 +411,10 @@ impl Model for LlamaModel {
 
     fn vocab_size(&self) -> i32 {
         self.config.vocab_size
+    }
+
+    fn new_caches(&self) -> Vec<KvCache> {
+        (0..self.layers.len()).map(|_| KvCache::new()).collect()
     }
 }
 
@@ -371,16 +513,12 @@ pub fn resolve_weight_prefix(tensors: &std::collections::HashMap<String, Array>)
 }
 
 pub fn argmax(logits: &Array) -> anyhow::Result<i32> {
-    let shape = logits.shape();
-    let ndim = shape.len();
-    let vocab_size = shape[ndim - 1];
-    let data = logits.data_f32()?;
-    let offset = data.len() - vocab_size;
+    let logits_data = logits.data_f32()?;
+    let mut best_idx: i32 = 0;
     let mut best_val = f32::NEG_INFINITY;
-    let mut best_idx = 0i32;
-    for i in 0..vocab_size {
-        if data[offset + i] > best_val {
-            best_val = data[offset + i];
+    for (i, &v) in logits_data.iter().enumerate() {
+        if v > best_val {
+            best_val = v;
             best_idx = i as i32;
         }
     }

@@ -3,6 +3,8 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
+use hf_hub::api::sync::ApiBuilder;
+
 /// Resolve a model input path to a single GGUF file.
 ///
 /// Accepted inputs:
@@ -43,6 +45,10 @@ pub fn resolve_model_path(input: &str) -> Result<PathBuf> {
 struct HfGgufReference {
     repo_id: String,
     filename: String,
+}
+
+pub(crate) fn looks_like_hf_gguf_ref(input: &str) -> bool {
+    parse_hf_gguf_reference(input).is_some()
 }
 
 fn parse_hf_gguf_reference(input: &str) -> Option<HfGgufReference> {
@@ -200,6 +206,123 @@ fn url_component_encode(component: &str) -> String {
         }
     }
     encoded
+}
+
+pub(crate) fn looks_like_hf_repo_id(model: &str) -> bool {
+    !model.is_empty()
+        && !model.starts_with('.')
+        && !model.starts_with('~')
+        && !Path::new(model).is_absolute()
+        && model.matches('/').count() == 1
+}
+
+pub fn resolve_hf_safetensors_dir(model: &str) -> Result<PathBuf> {
+    if let Some(dir) = cached_hf_safetensors_dir(model) {
+        return Ok(dir);
+    }
+    download_hf_safetensors_repo(model)
+}
+
+fn cached_hf_safetensors_dir(model: &str) -> Option<PathBuf> {
+    if let Some(snapshot_dir) = hf_hub::Cache::from_env()
+        .model(model.to_string())
+        .get("config.json")
+        .and_then(|path| path.parent().map(Path::to_path_buf))
+    {
+        if snapshot_dir.join("config.json").is_file() {
+            return Some(snapshot_dir);
+        }
+    }
+
+    let cache_root = hf_hub::Cache::from_env().path().clone();
+    let repo_dir = cache_root.join(format!("models--{}", model.replace('/', "--")));
+    let snapshots_dir = repo_dir.join("snapshots");
+    if !snapshots_dir.is_dir() {
+        return None;
+    }
+    let mut snapshots: Vec<PathBuf> = std::fs::read_dir(&snapshots_dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("config.json").is_file())
+        .collect();
+    snapshots.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    snapshots.pop()
+}
+
+fn download_hf_safetensors_repo(model: &str) -> Result<PathBuf> {
+    let token = std::env::var("HF_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty());
+
+    eprintln!("Resolving safetensors model from Hugging Face repo {model} ...");
+
+    let hf_status = Command::new("hf")
+        .arg("download")
+        .arg(model)
+        .status();
+
+    if let Ok(status) = hf_status {
+        if status.success() {
+            let cache_dir = hf_hub::Cache::from_env().path().clone();
+            let repo_dir = cache_dir.join(format!("models--{}", model.replace('/', "--")));
+            let snapshots_dir = repo_dir.join("snapshots");
+            if snapshots_dir.is_dir() {
+                return find_latest_snapshot(&snapshots_dir, model);
+            }
+        }
+    }
+
+    let api = ApiBuilder::from_env()
+        .with_token(token)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to initialize Hugging Face client: {e}"))?;
+    let repo = api.model(model.to_string());
+    let info = repo
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to query Hugging Face repo {model}: {e}"))?;
+
+    for sibling in &info.siblings {
+        let filename = sibling.rfilename.as_str();
+        if filename.ends_with('/') || filename == ".gitattributes" {
+            continue;
+        }
+        repo.download(filename).map_err(|e| {
+            anyhow::anyhow!("failed to download {filename} from Hugging Face repo {model}: {e}")
+        })?;
+    }
+
+    let snapshot_dir = repo
+        .get("config.json")
+        .map_err(|e| anyhow::anyhow!("failed to locate config.json for {model}: {e}"))?
+        .parent()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow::anyhow!("invalid cached snapshot layout for {model}"))?;
+
+    eprintln!("Resolved Hugging Face repo {model} to {snapshot_dir:?}");
+    Ok(snapshot_dir)
+}
+
+fn find_latest_snapshot(snapshots_dir: &Path, model: &str) -> Result<PathBuf> {
+    let mut snapshots: Vec<PathBuf> = std::fs::read_dir(snapshots_dir)
+        .with_context(|| format!("failed to read snapshots dir: {}", snapshots_dir.display()))?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| p.is_dir() && p.join("config.json").is_file())
+        .collect();
+    snapshots.sort_by_key(|p| {
+        std::fs::metadata(p)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH)
+    });
+    snapshots
+        .pop()
+        .ok_or_else(|| anyhow::anyhow!("no snapshot with config.json found for {}", model))
 }
 
 fn resolve_from_dir(dir: &Path) -> Result<PathBuf> {

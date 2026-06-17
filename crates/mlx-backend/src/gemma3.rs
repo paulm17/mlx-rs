@@ -29,7 +29,7 @@ impl Gemma3Attention {
         &self,
         x: &Array,
         kv: &mut KvCache,
-        _positions: &Array,
+        positions: &Array,
         cfg: &Gemma3Config,
         head_dim: i32,
         rope_theta: f32,
@@ -53,13 +53,14 @@ impl Gemma3Attention {
         let q = self.q_norm.forward(&q)?;
         let k = self.k_norm.forward(&k)?;
 
-        let q = ops::fast_rope(&q, head_dim, false, Some(rope_theta), 1.0, 0)?;
-        let k = ops::fast_rope(&k, head_dim, false, Some(rope_theta), 1.0, 0)?;
+        let q = ops::fast_rope_dynamic(&q, head_dim, false, Some(rope_theta), 1.0, positions, None)?;
+        let k = ops::fast_rope_dynamic(&k, head_dim, false, Some(rope_theta), 1.0, positions, None)?;
 
         let (k, v) = kv.update(&k, &v)?;
 
         let scale = 1.0 / (head_dim as f32).sqrt();
-        let out = ops::fast_sdpa(&q, &k, &v, scale, "causal", None)?;
+        let sdpa_mode = if l > 1 { "causal" } else { "" };
+        let out = ops::fast_sdpa(&q, &k, &v, scale, sdpa_mode, None)?;
 
         let out = ops::transpose(&out, &[0, 2, 1, 3])?;
         let out = ops::reshape(&out, &[b, l, (cfg.num_attention_heads * head_dim) as usize])?;
@@ -216,6 +217,10 @@ impl Model for Gemma3Model {
 
     fn vocab_size(&self) -> i32 {
         self.config.vocab_size
+    }
+
+    fn new_caches(&self) -> Vec<KvCache> {
+        (0..self.layers.len()).map(|_| KvCache::new()).collect()
     }
 }
 

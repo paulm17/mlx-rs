@@ -91,6 +91,23 @@ impl Array {
         Ok(Self { ctx })
     }
 
+    pub fn from_data_u32(data: &[u32], shape: &[usize]) -> anyhow::Result<Self> {
+        let syms = loader::symbols()?;
+        let c_shape: Vec<i32> = shape.iter().map(|&s| s as i32).collect();
+        let ctx = unsafe {
+            (syms.mlx_array_new_data)(
+                data.as_ptr() as *const std::ffi::c_void,
+                c_shape.as_ptr(),
+                shape.len() as i32,
+                MlxDtype::Uint32 as i32,
+            )
+        };
+        if ctx.ctx.is_null() {
+            return Err(anyhow::anyhow!("mlx_array_new_data returned null"));
+        }
+        Ok(Self { ctx })
+    }
+
     pub fn from_data(data: &[u8], shape: &[usize], dtype: MlxDtype) -> anyhow::Result<Self> {
         let syms = loader::symbols()?;
         let c_shape: Vec<i32> = shape.iter().map(|&s| s as i32).collect();

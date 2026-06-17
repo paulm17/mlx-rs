@@ -1,6 +1,10 @@
 use anyhow::Result;
 use clap::Parser;
 
+// Ensure mlx-backend is linked and its ctor registers the safetensors factory
+#[allow(unused_imports)]
+use mlx_backend;
+
 /// Local chat server powered by llama.cpp and GGUF models.
 #[derive(Parser, Debug)]
 #[command(name = "llama-server", about = "Start local llama.cpp/GGUF chat server")]

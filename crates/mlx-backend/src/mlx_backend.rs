@@ -24,10 +24,20 @@ pub struct MlxBackend {
     max_position_embeddings: i32,
     hidden_size: i32,
     vocab_size: i32,
+    eog_token_ids: std::collections::HashSet<i32>,
 }
 
 impl MlxBackend {
     pub fn load(dir: &Path) -> Result<Self> {
+        // Check MLX availability before loading files
+        crate::loader::check_init()
+            .context("MLX-C runtime (libmlxc.dylib) not found; safetensors models require \
+                      the MLX-C runtime. Set LLAMA_RS_BUILD_MLX=1 to auto-build it, \
+                      or set MLX_RS_MLX_LIBRARY to the directory containing libmlxc.dylib")?;
+
+        // Initialize GPU/CPU streams for the current thread (required for eval())
+        crate::ops::init_streams();
+
         let manifest = ModelManifest::open(dir)
             .with_context(|| format!("failed to open model at {}", dir.display()))?;
 
@@ -51,6 +61,29 @@ impl MlxBackend {
         let chat_template = ChatTemplate::load(dir)
             .unwrap_or_else(|_| ChatTemplate::default_llama3());
 
+        let mut eog_token_ids = Self::eog_token_ids_from_tokenizer(&tokenizer);
+        if let Ok(config_str) = std::fs::read_to_string(dir.join("tokenizer_config.json")) {
+            if let Ok(config_json) = serde_json::from_str::<serde_json::Value>(&config_str) {
+                if let Some(eos_ids) = config_json.get("eos_token_id") {
+                    match eos_ids {
+                        serde_json::Value::Number(n) => {
+                            if let Some(id) = n.as_i64() {
+                                eog_token_ids.insert(id as i32);
+                            }
+                        }
+                        serde_json::Value::Array(arr) => {
+                            for v in arr {
+                                if let Some(id) = v.as_i64() {
+                                    eog_token_ids.insert(id as i32);
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
         let num_layers = model.num_layers();
         let max_position_embeddings = model.max_position_embeddings();
         let hidden_size = model.hidden_size();
@@ -66,18 +99,56 @@ impl MlxBackend {
             max_position_embeddings,
             hidden_size,
             vocab_size,
+            eog_token_ids,
         })
+    }
+
+    /// Collect EOG token IDs from special token strings in the tokenizer vocab.
+    fn eog_token_ids_from_tokenizer(tokenizer: &tokenizers::Tokenizer) -> std::collections::HashSet<i32> {
+        let vocab = tokenizer.get_vocab(true);
+        let mut ids = std::collections::HashSet::new();
+        for token in &["<eos>", "<turn|>", "<|end_of_turn|>", "<|end_of_text|>", "</s>"] {
+            if let Some(&id) = vocab.get(*token) {
+                ids.insert(id as i32);
+            }
+        }
+        ids
     }
 }
 
-fn make_positions(start: usize, length: usize) -> Result<Array> {
-    let data: Vec<i32> = (start..start + length).map(|x| x as i32).collect();
-    Array::from_data_i32(&data, &[length])
+fn make_positions(start: usize, _length: usize) -> Result<Array> {
+    Array::from_data_i32(&[start as i32], &[1])
 }
 
 fn make_input_ids(tokens: &[i32]) -> Result<Array> {
     let n = tokens.len();
     Array::from_data_i32(tokens, &[1, n])
+}
+
+const PREFILL_CHUNK_SIZE: usize = 2048;
+
+/// Run prefill in fixed-size chunks, evaluating logits (and therefore the KV
+/// cache graph) after each chunk so the GPU stream encoder stays valid.
+fn prefill_chunked(
+    model: &dyn Model,
+    tokens: &[i32],
+    start_pos: usize,
+    caches: &mut [KvCache],
+) -> anyhow::Result<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let mut pos = start_pos;
+    for chunk in tokens.chunks(PREFILL_CHUNK_SIZE) {
+        let input_ids = make_input_ids(chunk)?;
+        let positions = make_positions(pos, chunk.len())?;
+        eprintln!("[MLX_PREFILL] n={} position={} input_dims={:?}", chunk.len(), pos, input_ids.shape());
+        let logits = model.forward(&input_ids, caches, &positions)?;
+        crate::ops::eval(&[&logits])?;
+        pos += chunk.len();
+        let _ = crate::memory::clear_cache();
+    }
+    Ok(())
 }
 
 impl backend_trait::Backend for MlxBackend {
@@ -117,12 +188,14 @@ impl backend_trait::Backend for MlxBackend {
     }
 
     fn is_eog(&self, token_id: i32) -> bool {
-        token_id == self.token_eos()
+        self.eog_token_ids.contains(&token_id)
     }
 
     fn token_eos(&self) -> i32 {
         let vocab = self.tokenizer.get_vocab(true);
-        vocab.get("<|end_of_text|>")
+        // Gemma models use <eos>; many models use <|end_of_text|> or </s>.
+        vocab.get("<eos>")
+            .or_else(|| vocab.get("<|end_of_text|>"))
             .or_else(|| vocab.get("</s>"))
             .map(|&id| id as i32)
             .unwrap_or(2)
@@ -150,31 +223,29 @@ impl backend_trait::Backend for MlxBackend {
         let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
             cached.clone()
         } else {
-            (0..self.model.num_layers()).map(|_| KvCache::new()).collect()
+            self.model.new_caches()
         };
 
         let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
         let mut all_tokens = tokens.clone();
 
-        if !prefill_tokens.is_empty() {
-            let input_ids = make_input_ids(prefill_tokens)?;
-            let positions = make_positions(prefix_len, prefill_tokens.len())?;
-            self.model.forward(&input_ids, &mut caches, &positions)?;
-        }
+        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches)?;
 
-        let eos_token = self.token_eos();
         let mut generated = 0;
         let mut text = String::new();
 
-        for _ in 0..max_tokens {
+        for _step in 0..max_tokens {
             let last_token = *all_tokens.last().unwrap();
             let input_ids = make_input_ids(&[last_token])?;
-            let positions = make_positions(all_tokens.len() - 1, 1)?;
+            let pos = all_tokens.len() - 1;
+            let positions = make_positions(pos, 1)?;
+            eprintln!("[MLX_DECODE] step position={} token={}", pos, last_token);
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
+            crate::ops::eval(&[&logits])?;
             let next_token = argmax(&logits)?;
 
-            if next_token == eos_token {
+            if self.is_eog(next_token) {
                 break;
             }
 
@@ -220,19 +291,14 @@ impl backend_trait::Backend for MlxBackend {
         let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
             cached.clone()
         } else {
-            (0..self.model.num_layers()).map(|_| KvCache::new()).collect()
+            self.model.new_caches()
         };
 
         let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
         let mut all_tokens = tokens.clone();
 
-        if !prefill_tokens.is_empty() {
-            let input_ids = make_input_ids(prefill_tokens)?;
-            let positions = make_positions(prefix_len, prefill_tokens.len())?;
-            self.model.forward(&input_ids, &mut caches, &positions)?;
-        }
+        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches)?;
 
-        let eos_token = self.token_eos();
         let mut generated = 0;
 
         for _ in 0..max_tokens {
@@ -241,9 +307,10 @@ impl backend_trait::Backend for MlxBackend {
             let positions = make_positions(all_tokens.len() - 1, 1)?;
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
+            crate::ops::eval(&[&logits])?;
             let next_token = argmax(&logits)?;
 
-            if next_token == eos_token {
+            if self.is_eog(next_token) {
                 break;
             }
 
@@ -287,19 +354,14 @@ impl backend_trait::Backend for MlxBackend {
         let mut caches: Vec<KvCache> = if let Some(cached) = cached_caches {
             cached.clone()
         } else {
-            (0..self.model.num_layers()).map(|_| KvCache::new()).collect()
+            self.model.new_caches()
         };
 
         let prefill_tokens = if prefix_len > 0 { &tokens[prefix_len..] } else { &tokens };
         let mut all_tokens = tokens.clone();
 
-        if !prefill_tokens.is_empty() {
-            let input_ids = make_input_ids(prefill_tokens)?;
-            let positions = make_positions(prefix_len, prefill_tokens.len())?;
-            self.model.forward(&input_ids, &mut caches, &positions)?;
-        }
+        prefill_chunked(self.model.as_ref(), prefill_tokens, prefix_len, &mut caches)?;
 
-        let eos_token = self.token_eos();
         let mut generated = 0;
         let mut text = String::new();
 
@@ -309,9 +371,10 @@ impl backend_trait::Backend for MlxBackend {
             let positions = make_positions(all_tokens.len() - 1, 1)?;
 
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
+            crate::ops::eval(&[&logits])?;
             let next_token = argmax(&logits)?;
 
-            if next_token == eos_token {
+            if self.is_eog(next_token) {
                 break;
             }
 

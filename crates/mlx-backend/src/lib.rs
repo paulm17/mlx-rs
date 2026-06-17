@@ -3,6 +3,7 @@ pub mod cache;
 pub mod chat_template;
 pub mod ffi;
 pub mod gemma3;
+pub mod gemma4;
 pub mod llama;
 pub mod loader;
 pub mod manifest;

@@ -145,40 +145,47 @@ pub type MlxEvalFn = unsafe extern "C" fn(MlxVectorArray) -> c_int;
 // Array string
 pub type MlxArrayToStringFn = unsafe extern "C" fn(*mut MlxString, MlxArray) -> c_int;
 
-// Stream
+// Stream & Device
 pub type MlxStreamNewFn = unsafe extern "C" fn() -> MlxStream;
+pub type MlxStreamNewDeviceFn = unsafe extern "C" fn(MlxDevice) -> MlxStream;
 pub type MlxStreamFreeFn = unsafe extern "C" fn(MlxStream) -> c_int;
+pub type MlxSetDefaultStreamFn = unsafe extern "C" fn(MlxStream) -> c_int;
+pub type MlxDefaultGpuStreamNewFn = unsafe extern "C" fn() -> MlxStream;
+pub type MlxDefaultCpuStreamNewFn = unsafe extern "C" fn() -> MlxStream;
+pub type MlxDeviceNewTypeFn = unsafe extern "C" fn(MlxDeviceType, c_int) -> MlxDevice;
+pub type MlxSetDefaultDeviceFn = unsafe extern "C" fn(MlxDevice) -> c_int;
+pub type MlxGetDefaultStreamFn = unsafe extern "C" fn(*mut MlxStream, MlxDevice) -> c_int;
 
 // Vector array
 pub type MlxVectorArrayNewFn = unsafe extern "C" fn() -> MlxVectorArray;
 pub type MlxVectorArrayFreeFn = unsafe extern "C" fn(MlxVectorArray) -> c_int;
 pub type MlxVectorArrayAppendValueFn = unsafe extern "C" fn(MlxVectorArray, MlxArray) -> c_int;
 
-// Ops (stream param is nullable for default stream)
+// Ops (stream param passed by value matching mlx_stream C struct)
 pub type MlxBinaryOpFn =
-    unsafe extern "C" fn(*mut MlxArray, MlxArray, MlxArray, *const MlxStream) -> c_int;
+    unsafe extern "C" fn(*mut MlxArray, MlxArray, MlxArray, MlxStream) -> c_int;
 pub type MlxReshapeFn = unsafe extern "C" fn(
     *mut MlxArray,
     MlxArray,
     *const c_int,
     usize,
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 pub type MlxTransposeAxesFn = unsafe extern "C" fn(
     *mut MlxArray,
     MlxArray,
     *const c_int,
     usize,
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 pub type MlxAsTypeFn =
-    unsafe extern "C" fn(*mut MlxArray, MlxArray, c_int, *const MlxStream) -> c_int;
+    unsafe extern "C" fn(*mut MlxArray, MlxArray, c_int, MlxStream) -> c_int;
 pub type MlxConcatenateAxisFn =
-    unsafe extern "C" fn(*mut MlxArray, MlxVectorArray, c_int, *const MlxStream) -> c_int;
+    unsafe extern "C" fn(*mut MlxArray, MlxVectorArray, c_int, MlxStream) -> c_int;
 pub type MlxZerosFn =
-    unsafe extern "C" fn(*mut MlxArray, *const c_int, usize, c_int, *const MlxStream) -> c_int;
+    unsafe extern "C" fn(*mut MlxArray, *const c_int, usize, c_int, MlxStream) -> c_int;
 pub type MlxSumAxisFn =
-    unsafe extern "C" fn(*mut MlxArray, MlxArray, c_int, bool, *const MlxStream) -> c_int;
+    unsafe extern "C" fn(*mut MlxArray, MlxArray, c_int, bool, MlxStream) -> c_int;
 pub type MlxGatherMmFn = unsafe extern "C" fn(
     *mut MlxArray,
     MlxArray,
@@ -186,7 +193,7 @@ pub type MlxGatherMmFn = unsafe extern "C" fn(
     MlxArray,
     MlxArray,
     bool,
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 
 // Fast ops (from mlx/c/fast.h)
@@ -195,13 +202,27 @@ pub type MlxFastRmsNormFn = unsafe extern "C" fn(
     MlxArray,
     MlxArray, // weight (nullable)
     f32,      // eps
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub struct MlxOptionalFloat {
     pub value: f32,
+    pub has_value: bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MlxOptionalInt {
+    pub value: c_int,
+    pub has_value: bool,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MlxOptionalDtype {
+    pub value: c_int,
     pub has_value: bool,
 }
 
@@ -214,7 +235,7 @@ pub type MlxFastRopeFn = unsafe extern "C" fn(
     f32,               // scale
     c_int,             // offset
     MlxArray,          // freqs (nullable)
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 
 pub type MlxFastSdpaFn = unsafe extern "C" fn(
@@ -226,7 +247,7 @@ pub type MlxFastSdpaFn = unsafe extern "C" fn(
     *const std::ffi::c_char, // mask_mode
     MlxArray,          // mask (nullable)
     MlxArray,          // sinks (nullable)
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 
 // Additional ops
@@ -235,14 +256,14 @@ pub type MlxTakeAxisFn = unsafe extern "C" fn(
     MlxArray,
     MlxArray,
     c_int, // axis
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 
 pub type MlxExpandDimsFn = unsafe extern "C" fn(
     *mut MlxArray,
     MlxArray,
     c_int, // axis
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 
 pub type MlxTriFn = unsafe extern "C" fn(
@@ -251,7 +272,7 @@ pub type MlxTriFn = unsafe extern "C" fn(
     c_int, // m
     c_int, // k
     c_int, // dtype
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 
 pub type MlxWhereFn = unsafe extern "C" fn(
@@ -259,10 +280,124 @@ pub type MlxWhereFn = unsafe extern "C" fn(
     MlxArray, // condition
     MlxArray, // x
     MlxArray, // y
-    *const MlxStream,
+    MlxStream,
 ) -> c_int;
 
-pub type MlxUnaryOpFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, *const MlxStream) -> c_int;
+pub type MlxUnaryOpFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, MlxStream) -> c_int;
+
+// Argmax (no-axis variant: reduces entire array to scalar index)
+pub type MlxArgmaxFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,
+    bool,              // keepdims
+    MlxStream,
+) -> c_int;
+
+// Quantization ops
+pub type MlxDequantizeFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,           // w
+    MlxArray,           // scales
+    MlxArray,           // biases (nullable)
+    MlxOptionalInt,     // group_size
+    MlxOptionalInt,     // bits
+    *const std::ffi::c_char, // mode
+    MlxArray,           // global_scale (nullable)
+    MlxOptionalDtype,   // dtype
+    MlxStream,
+) -> c_int;
+
+pub type MlxQuantizedMatmulFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,           // x
+    MlxArray,           // w
+    MlxArray,           // scales
+    MlxArray,           // biases (nullable)
+    bool,               // transpose
+    MlxOptionalInt,     // group_size
+    MlxOptionalInt,     // bits
+    *const std::ffi::c_char, // mode
+    MlxStream,
+) -> c_int;
+
+pub type MlxGatherQmmFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,           // x
+    MlxArray,           // w
+    MlxArray,           // scales
+    MlxArray,           // biases (nullable)
+    MlxArray,           // lhs_indices (nullable)
+    MlxArray,           // rhs_indices (nullable)
+    bool,               // transpose
+    MlxOptionalInt,     // group_size
+    MlxOptionalInt,     // bits
+    *const std::ffi::c_char, // mode
+    bool,               // sorted_indices
+    MlxStream,
+) -> c_int;
+
+// Map types (for mlx_load_safetensors)
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MlxMapStringToArray {
+    pub ctx: *mut std::ffi::c_void,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MlxMapStringToArrayIterator {
+    pub ctx: *mut std::ffi::c_void,
+    pub map_ctx: *mut std::ffi::c_void,
+}
+
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub struct MlxMapStringToString {
+    pub ctx: *mut std::ffi::c_void,
+}
+
+// Map function types
+pub type MlxMapStringToArrayNewFn = unsafe extern "C" fn() -> MlxMapStringToArray;
+pub type MlxMapStringToArrayFreeFn = unsafe extern "C" fn(MlxMapStringToArray) -> c_int;
+pub type MlxMapStringToArrayGetFn =
+    unsafe extern "C" fn(*mut MlxArray, MlxMapStringToArray, *const std::ffi::c_char) -> c_int;
+pub type MlxMapStringToArrayIteratorNewFn =
+    unsafe extern "C" fn(MlxMapStringToArray) -> MlxMapStringToArrayIterator;
+pub type MlxMapStringToArrayIteratorFreeFn =
+    unsafe extern "C" fn(MlxMapStringToArrayIterator) -> c_int;
+pub type MlxMapStringToArrayIteratorNextFn = unsafe extern "C" fn(
+    *mut *const std::ffi::c_char,
+    *mut MlxArray,
+    MlxMapStringToArrayIterator,
+) -> c_int;
+pub type MlxMapStringToStringNewFn = unsafe extern "C" fn() -> MlxMapStringToString;
+pub type MlxMapStringToStringFreeFn = unsafe extern "C" fn(MlxMapStringToString) -> c_int;
+pub type MlxMapStringToStringGetFn = unsafe extern "C" fn(
+    *mut *const std::ffi::c_char,
+    MlxMapStringToString,
+    *const std::ffi::c_char,
+) -> c_int;
+
+// IO (safetensors)
+pub type MlxLoadSafetensorsFn = unsafe extern "C" fn(
+    *mut MlxMapStringToArray,
+    *mut MlxMapStringToString,
+    *const std::ffi::c_char,
+    MlxStream,
+) -> c_int;
+
+// Fast rope dynamic (offset is array, not scalar)
+pub type MlxFastRopeDynamicFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,
+    c_int,             // dims
+    bool,              // traditional
+    MlxOptionalFloat,  // base
+    f32,               // scale
+    MlxArray,          // offset (array)
+    MlxArray,          // freqs (nullable)
+    MlxStream,
+) -> c_int;
 
 // Memory
 pub type MlxGetActiveMemoryFn = unsafe extern "C" fn(*mut usize) -> c_int;
@@ -304,7 +439,14 @@ pub struct MlxSymbols {
     pub mlx_eval: MlxEvalFn,
     // Stream
     pub mlx_stream_new: MlxStreamNewFn,
+    pub mlx_stream_new_device: MlxStreamNewDeviceFn,
     pub mlx_stream_free: MlxStreamFreeFn,
+    pub mlx_set_default_stream: MlxSetDefaultStreamFn,
+    pub mlx_default_gpu_stream_new: MlxDefaultGpuStreamNewFn,
+    pub mlx_default_cpu_stream_new: MlxDefaultCpuStreamNewFn,
+    pub mlx_device_new_type: MlxDeviceNewTypeFn,
+    pub mlx_set_default_device: MlxSetDefaultDeviceFn,
+    pub mlx_get_default_stream: MlxGetDefaultStreamFn,
     // Vector array
     pub mlx_vector_array_new: MlxVectorArrayNewFn,
     pub mlx_vector_array_free: MlxVectorArrayFreeFn,
@@ -335,6 +477,26 @@ pub struct MlxSymbols {
     pub mlx_sigmoid: MlxUnaryOpFn,
     pub mlx_sqrt: MlxUnaryOpFn,
     pub mlx_tanh: MlxUnaryOpFn,
+    // Argmax
+    pub mlx_argmax: MlxArgmaxFn,
+    // Quantization ops
+    pub mlx_dequantize: MlxDequantizeFn,
+    pub mlx_quantized_matmul: MlxQuantizedMatmulFn,
+    pub mlx_gather_qmm: MlxGatherQmmFn,
+    // Map types (for safetensors loading)
+    pub mlx_map_string_to_array_new: MlxMapStringToArrayNewFn,
+    pub mlx_map_string_to_array_free: MlxMapStringToArrayFreeFn,
+    pub mlx_map_string_to_array_get: MlxMapStringToArrayGetFn,
+    pub mlx_map_string_to_array_iterator_new: MlxMapStringToArrayIteratorNewFn,
+    pub mlx_map_string_to_array_iterator_free: MlxMapStringToArrayIteratorFreeFn,
+    pub mlx_map_string_to_array_iterator_next: MlxMapStringToArrayIteratorNextFn,
+    pub mlx_map_string_to_string_new: MlxMapStringToStringNewFn,
+    pub mlx_map_string_to_string_free: MlxMapStringToStringFreeFn,
+    pub mlx_map_string_to_string_get: MlxMapStringToStringGetFn,
+    // IO
+    pub mlx_load_safetensors: MlxLoadSafetensorsFn,
+    // Fast rope dynamic
+    pub mlx_fast_rope_dynamic: MlxFastRopeDynamicFn,
     // Memory
     pub mlx_get_active_memory: MlxGetActiveMemoryFn,
     pub mlx_get_cache_memory: MlxGetCacheMemoryFn,
@@ -386,7 +548,14 @@ impl MlxSymbols {
                 mlx_array_tostring: load_sym!(lib, b"mlx_array_tostring\0", MlxArrayToStringFn),
                 mlx_eval: load_sym!(lib, b"mlx_eval\0", MlxEvalFn),
                 mlx_stream_new: load_sym!(lib, b"mlx_stream_new\0", MlxStreamNewFn),
+                mlx_stream_new_device: load_sym!(lib, b"mlx_stream_new_device\0", MlxStreamNewDeviceFn),
                 mlx_stream_free: load_sym!(lib, b"mlx_stream_free\0", MlxStreamFreeFn),
+                mlx_set_default_stream: load_sym!(lib, b"mlx_set_default_stream\0", MlxSetDefaultStreamFn),
+                mlx_default_gpu_stream_new: load_sym!(lib, b"mlx_default_gpu_stream_new\0", MlxDefaultGpuStreamNewFn),
+                mlx_default_cpu_stream_new: load_sym!(lib, b"mlx_default_cpu_stream_new\0", MlxDefaultCpuStreamNewFn),
+                mlx_device_new_type: load_sym!(lib, b"mlx_device_new_type\0", MlxDeviceNewTypeFn),
+                mlx_set_default_device: load_sym!(lib, b"mlx_set_default_device\0", MlxSetDefaultDeviceFn),
+                mlx_get_default_stream: load_sym!(lib, b"mlx_get_default_stream\0", MlxGetDefaultStreamFn),
                 mlx_vector_array_new: load_sym!(lib, b"mlx_vector_array_new\0", MlxVectorArrayNewFn),
                 mlx_vector_array_free: load_sym!(lib, b"mlx_vector_array_free\0", MlxVectorArrayFreeFn),
                 mlx_vector_array_append_value: load_sym!(lib, b"mlx_vector_array_append_value\0", MlxVectorArrayAppendValueFn),
@@ -415,6 +584,26 @@ impl MlxSymbols {
                 mlx_sigmoid: load_sym!(lib, b"mlx_sigmoid\0", MlxUnaryOpFn),
                 mlx_sqrt: load_sym!(lib, b"mlx_sqrt\0", MlxUnaryOpFn),
                 mlx_tanh: load_sym!(lib, b"mlx_tanh\0", MlxUnaryOpFn),
+                // Quantization ops
+                mlx_argmax: load_sym!(lib, b"mlx_argmax\0", MlxArgmaxFn),
+                mlx_dequantize: load_sym!(lib, b"mlx_dequantize\0", MlxDequantizeFn),
+                mlx_quantized_matmul: load_sym!(lib, b"mlx_quantized_matmul\0", MlxQuantizedMatmulFn),
+                mlx_gather_qmm: load_sym!(lib, b"mlx_gather_qmm\0", MlxGatherQmmFn),
+                // Map types
+                mlx_map_string_to_array_new: load_sym!(lib, b"mlx_map_string_to_array_new\0", MlxMapStringToArrayNewFn),
+                mlx_map_string_to_array_free: load_sym!(lib, b"mlx_map_string_to_array_free\0", MlxMapStringToArrayFreeFn),
+                mlx_map_string_to_array_get: load_sym!(lib, b"mlx_map_string_to_array_get\0", MlxMapStringToArrayGetFn),
+                mlx_map_string_to_array_iterator_new: load_sym!(lib, b"mlx_map_string_to_array_iterator_new\0", MlxMapStringToArrayIteratorNewFn),
+                mlx_map_string_to_array_iterator_free: load_sym!(lib, b"mlx_map_string_to_array_iterator_free\0", MlxMapStringToArrayIteratorFreeFn),
+                mlx_map_string_to_array_iterator_next: load_sym!(lib, b"mlx_map_string_to_array_iterator_next\0", MlxMapStringToArrayIteratorNextFn),
+                mlx_map_string_to_string_new: load_sym!(lib, b"mlx_map_string_to_string_new\0", MlxMapStringToStringNewFn),
+                mlx_map_string_to_string_free: load_sym!(lib, b"mlx_map_string_to_string_free\0", MlxMapStringToStringFreeFn),
+                mlx_map_string_to_string_get: load_sym!(lib, b"mlx_map_string_to_string_get\0", MlxMapStringToStringGetFn),
+                // IO
+                mlx_load_safetensors: load_sym!(lib, b"mlx_load_safetensors\0", MlxLoadSafetensorsFn),
+                // Fast rope dynamic
+                mlx_fast_rope_dynamic: load_sym!(lib, b"mlx_fast_rope_dynamic\0", MlxFastRopeDynamicFn),
+                // Memory
                 mlx_get_active_memory: load_sym!(lib, b"mlx_get_active_memory\0", MlxGetActiveMemoryFn),
                 mlx_get_cache_memory: load_sym!(lib, b"mlx_get_cache_memory\0", MlxGetCacheMemoryFn),
                 mlx_get_peak_memory: load_sym!(lib, b"mlx_get_peak_memory\0", MlxGetPeakMemoryFn),

@@ -4,7 +4,11 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 use llama_lm::config::LlamaCppConfig;
-use llama_lm::{resolve_model_path, ChatMessage, GenerationOptions, GenerationPipeline};
+use llama_lm::{ChatMessage, GenerationOptions, GenerationPipeline};
+
+// Ensure mlx-backend is linked and its ctor registers the safetensors factory
+#[allow(unused_imports)]
+use mlx_backend;
 
 #[derive(Parser, Debug)]
 #[command(name = "generate", about = "Generate text with GGUF models via llama.cpp")]
@@ -40,7 +44,7 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let model_path = resolve_model_path(&args.model)?;
+    let model_path = &args.model;
 
     let llamacpp_config = if args.config.exists() {
         let toml_content = std::fs::read_to_string(&args.config)?;
@@ -53,10 +57,9 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut pipeline = GenerationPipeline::new(
-        model_path.to_str().unwrap(),
-        llamacpp_config,
-    )?;
+    eprintln!("Loading model...");
+    let mut pipeline = GenerationPipeline::new(model_path, llamacpp_config)?;
+    eprintln!("Model loaded.");
 
     let prompt = if args.chat {
         let messages = vec![
