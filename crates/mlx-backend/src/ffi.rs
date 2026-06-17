@@ -138,9 +138,12 @@ pub type MlxArrayItemInt64Fn = unsafe extern "C" fn(*mut i64, MlxArray) -> c_int
 pub type MlxArrayDataFloat32Fn = unsafe extern "C" fn(MlxArray) -> *const f32;
 pub type MlxArrayDataInt32Fn = unsafe extern "C" fn(MlxArray) -> *const i32;
 
+pub type MlxArrayItemInt32Fn = unsafe extern "C" fn(*mut i32, MlxArray) -> c_int;
+
 // Array eval
 pub type MlxArrayEvalFn = unsafe extern "C" fn(MlxArray) -> c_int;
 pub type MlxEvalFn = unsafe extern "C" fn(MlxVectorArray) -> c_int;
+pub type MlxAsyncEvalFn = unsafe extern "C" fn(MlxVectorArray) -> c_int;
 
 // Array string
 pub type MlxArrayToStringFn = unsafe extern "C" fn(*mut MlxString, MlxArray) -> c_int;
@@ -293,6 +296,25 @@ pub type MlxArgmaxFn = unsafe extern "C" fn(
     MlxStream,
 ) -> c_int;
 
+// Argmax with axis
+pub type MlxArgmaxAxisFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    MlxArray,
+    c_int,             // axis
+    bool,              // keepdims
+    MlxStream,
+) -> c_int;
+
+// Arange
+pub type MlxArangeFn = unsafe extern "C" fn(
+    *mut MlxArray,
+    f64,               // start
+    f64,               // stop
+    f64,               // step
+    c_int,             // dtype
+    MlxStream,
+) -> c_int;
+
 // Quantization ops
 pub type MlxDequantizeFn = unsafe extern "C" fn(
     *mut MlxArray,
@@ -430,6 +452,7 @@ pub struct MlxSymbols {
     pub mlx_array_dim: MlxArrayDimFn,
     pub mlx_array_dtype: MlxArrayDtypeFn,
     pub mlx_array_item_float64: MlxArrayItemFloat64Fn,
+    pub mlx_array_item_int32: MlxArrayItemInt32Fn,
     pub mlx_array_item_int64: MlxArrayItemInt64Fn,
     pub mlx_array_data_float32: MlxArrayDataFloat32Fn,
     pub mlx_array_data_int32: MlxArrayDataInt32Fn,
@@ -437,6 +460,7 @@ pub struct MlxSymbols {
     pub mlx_array_tostring: MlxArrayToStringFn,
     // Eval
     pub mlx_eval: MlxEvalFn,
+    pub mlx_async_eval: MlxAsyncEvalFn,
     // Stream
     pub mlx_stream_new: MlxStreamNewFn,
     pub mlx_stream_new_device: MlxStreamNewDeviceFn,
@@ -479,6 +503,9 @@ pub struct MlxSymbols {
     pub mlx_tanh: MlxUnaryOpFn,
     // Argmax
     pub mlx_argmax: MlxArgmaxFn,
+    pub mlx_argmax_axis: MlxArgmaxAxisFn,
+    // Arange
+    pub mlx_arange: MlxArangeFn,
     // Quantization ops
     pub mlx_dequantize: MlxDequantizeFn,
     pub mlx_quantized_matmul: MlxQuantizedMatmulFn,
@@ -541,12 +568,14 @@ impl MlxSymbols {
                 mlx_array_dim: load_sym!(lib, b"mlx_array_dim\0", MlxArrayDimFn),
                 mlx_array_dtype: load_sym!(lib, b"mlx_array_dtype\0", MlxArrayDtypeFn),
                 mlx_array_item_float64: load_sym!(lib, b"mlx_array_item_float64\0", MlxArrayItemFloat64Fn),
+                mlx_array_item_int32: load_sym!(lib, b"mlx_array_item_int32\0", MlxArrayItemInt32Fn),
                 mlx_array_item_int64: load_sym!(lib, b"mlx_array_item_int64\0", MlxArrayItemInt64Fn),
                 mlx_array_data_float32: load_sym!(lib, b"mlx_array_data_float32\0", MlxArrayDataFloat32Fn),
                 mlx_array_data_int32: load_sym!(lib, b"mlx_array_data_int32\0", MlxArrayDataInt32Fn),
                 mlx_array_eval: load_sym!(lib, b"mlx_array_eval\0", MlxArrayEvalFn),
                 mlx_array_tostring: load_sym!(lib, b"mlx_array_tostring\0", MlxArrayToStringFn),
                 mlx_eval: load_sym!(lib, b"mlx_eval\0", MlxEvalFn),
+                mlx_async_eval: load_sym!(lib, b"mlx_async_eval\0", MlxAsyncEvalFn),
                 mlx_stream_new: load_sym!(lib, b"mlx_stream_new\0", MlxStreamNewFn),
                 mlx_stream_new_device: load_sym!(lib, b"mlx_stream_new_device\0", MlxStreamNewDeviceFn),
                 mlx_stream_free: load_sym!(lib, b"mlx_stream_free\0", MlxStreamFreeFn),
@@ -586,6 +615,9 @@ impl MlxSymbols {
                 mlx_tanh: load_sym!(lib, b"mlx_tanh\0", MlxUnaryOpFn),
                 // Quantization ops
                 mlx_argmax: load_sym!(lib, b"mlx_argmax\0", MlxArgmaxFn),
+                mlx_argmax_axis: load_sym!(lib, b"mlx_argmax_axis\0", MlxArgmaxAxisFn),
+                // Arange
+                mlx_arange: load_sym!(lib, b"mlx_arange\0", MlxArangeFn),
                 mlx_dequantize: load_sym!(lib, b"mlx_dequantize\0", MlxDequantizeFn),
                 mlx_quantized_matmul: load_sym!(lib, b"mlx_quantized_matmul\0", MlxQuantizedMatmulFn),
                 mlx_gather_qmm: load_sym!(lib, b"mlx_gather_qmm\0", MlxGatherQmmFn),

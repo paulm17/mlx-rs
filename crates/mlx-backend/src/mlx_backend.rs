@@ -30,9 +30,13 @@ pub struct MlxBackend {
 
 fn choose_next_token(logits: &Array, sampler: &Sampler) -> anyhow::Result<i32> {
     crate::ops::eval(&[logits])?;
-    let data = logits.data_f32()?;
-    let idx = sampler.sample(data);
-    Ok(idx as i32)
+    if sampler.temperature <= 0.0 {
+        let idx = crate::ops::argmax_axis(logits, -1, false)?;
+        Ok(idx.item_i32()?)
+    } else {
+        let data = logits.data_f32()?;
+        Ok(sampler.sample(data) as i32)
+    }
 }
 
 impl MlxBackend {
@@ -150,7 +154,6 @@ fn prefill_chunked(
     for chunk in tokens.chunks(PREFILL_CHUNK_SIZE) {
         let input_ids = make_input_ids(chunk)?;
         let positions = make_positions(pos, chunk.len())?;
-        eprintln!("[MLX_PREFILL] n={} position={} input_dims={:?}", chunk.len(), pos, input_ids.shape());
         let logits = model.forward(&input_ids, caches, &positions)?;
         crate::ops::eval(&[&logits])?;
         pos += chunk.len();
@@ -249,8 +252,6 @@ impl backend_trait::Backend for MlxBackend {
             let input_ids = make_input_ids(&[last_token])?;
             let pos = all_tokens.len() - 1;
             let positions = make_positions(pos, 1)?;
-            eprintln!("[MLX_DECODE] step position={} token={}", pos, last_token);
-
             let logits = self.model.forward(&input_ids, &mut caches, &positions)?;
             let next_token = choose_next_token(&logits, &sampler)?;
 

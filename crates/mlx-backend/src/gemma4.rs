@@ -340,9 +340,6 @@ impl Gemma4Attention {
         let l = x.dim(1)?;
         let hd = self.head_dim as usize;
 
-        eprintln!("[MLX_ATTN] x_dims={:?} B={} L={} is_sliding={} headDim={} scale={} ropeDims={} ropeBase={:?} positions_dims={:?} has_donor={}",
-            x.shape(), b, l, self.is_sliding, self.head_dim, self.scale, self.rope_dims, self.rope_theta, positions.shape(), kv.donor.is_some());
-
         // Q projection and norm
         let q = self.q_proj.forward(x)?;
         let q = ops::reshape(&q, &[b, l, self.n_heads as usize, hd])?;
@@ -406,10 +403,7 @@ impl Gemma4Attention {
         // Scaled dot-product attention
         // Ollama: causal mask for prefill (L>1), no mask for decode (L=1)
         let sdpa_mode = if l > 1 { "causal" } else { "" };
-        eprintln!("[MLX_SDPA] q_dims={:?} k_dims={:?} v_dims={:?} scale={} mode=\"{}\" is_sliding={}",
-            q.shape(), ks.shape(), vs.shape(), self.scale, sdpa_mode, self.is_sliding);
         let out = ops::fast_sdpa(&q, &ks, &vs, self.scale, sdpa_mode, None)?;
-        eprintln!("[MLX_SDPA] out_dims={:?}", out.shape());
         let out = ops::transpose(&out, &[0, 2, 1, 3])?;
         let out = ops::reshape(&out, &[b, l, self.n_heads as usize * hd])?;
         self.o_proj.forward(&out)
@@ -567,11 +561,9 @@ impl Model for Gemma4Model {
     ) -> anyhow::Result<Array> {
         let b = input_ids.dim(0)?;
         let l = input_ids.dim(1)?;
-        eprintln!("[MLX_FWD] B={} L={} positions_dims={:?} input_dims={:?}", b, l, positions.shape(), input_ids.shape());
 
         let mut h = self.embed_tokens.forward(input_ids)?;
         h = ops::multiply(&h, &Array::from_f32(self.config.embed_scale)?)?;
-        eprintln!("[MLX_FWD] after_embed h_dims={:?}", h.shape());
 
         // Precompute PLE inputs if configured
         let ple_tensor: Option<Array> = if let Some(ple) = &self.ple {
@@ -605,10 +597,7 @@ impl Model for Gemma4Model {
             });
 
             h = self.layers[i].forward(&h, &mut caches[i], positions, ple_input.as_ref())?;
-            let is_sliding = is_layer_sliding(i as i32, self.config.sliding_window_pattern, &self.config.layer_types);
-            let has_donor = caches[i].donor.is_some();
-            eprintln!("[MLX_LAYER] layer_{} done h_dims={:?} is_sliding={} has_cache={} has_donor={}",
-                i, h.shape(), is_sliding, caches[i].k_cache.is_some(), has_donor);
+            let _is_sliding = is_layer_sliding(i as i32, self.config.sliding_window_pattern, &self.config.layer_types);
 
             // If this is a donor layer, store its KV for donees
             if self

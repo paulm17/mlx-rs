@@ -281,7 +281,7 @@ impl KvCache {
     }
 
     pub fn update(&mut self, k: &Array, v: &Array) -> anyhow::Result<(Array, Array)> {
-        let offset_before = self.len();
+        let _offset_before = self.len();
         let (mut new_k, mut new_v) = match (&self.k_cache, &self.v_cache) {
             (Some(ck), Some(cv)) => {
                 (ops::concatenate(&[ck, k], 2)?, ops::concatenate(&[cv, v], 2)?)
@@ -303,8 +303,6 @@ impl KvCache {
 
         self.k_cache = Some(new_k.clone());
         self.v_cache = Some(new_v.clone());
-        eprintln!("[MLX_KVCACHE] Update k_dims={:?} v_dims={:?} offset_before={} offset_after={} max_len={:?}",
-            k.shape(), v.shape(), offset_before, self.len(), self.max_len);
         Ok((new_k, new_v))
     }
 
@@ -513,16 +511,8 @@ pub fn resolve_weight_prefix(tensors: &std::collections::HashMap<String, Array>)
 }
 
 pub fn argmax(logits: &Array) -> anyhow::Result<i32> {
-    let logits_data = logits.data_f32()?;
-    let mut best_idx: i32 = 0;
-    let mut best_val = f32::NEG_INFINITY;
-    for (i, &v) in logits_data.iter().enumerate() {
-        if v > best_val {
-            best_val = v;
-            best_idx = i as i32;
-        }
-    }
-    Ok(best_idx)
+    let idx = crate::ops::argmax_axis(logits, -1, false)?;
+    Ok(idx.item_i32()?)
 }
 
 #[cfg(test)]

@@ -218,6 +218,20 @@ pub fn eval(arrays: &[&Array]) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub fn async_eval(arrays: &[&Array]) -> anyhow::Result<()> {
+    init_streams();
+    let syms = loader::symbols()?;
+    let vec = VectorArray::new()?;
+    for arr in arrays {
+        vec.push(arr)?;
+    }
+    let rc = unsafe { (syms.mlx_async_eval)(vec.raw()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_async_eval returned error: {rc}"));
+    }
+    Ok(())
+}
+
 pub fn take(a: &Array, indices: &Array, axis: i32) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
@@ -348,8 +362,6 @@ pub fn fast_rope_with_freqs(
     offset: i32,
     freqs: Option<&Array>,
 ) -> anyhow::Result<Array> {
-    eprintln!("[rope] x.shape={:?} dims={} traditional={} base={:?} scale={} offset={} has_freqs={}",
-        x.shape(), dims, traditional, base, scale, offset, freqs.is_some());
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
     let optional_base = crate::ffi::MlxOptionalFloat {
@@ -386,8 +398,6 @@ pub fn fast_rope_dynamic(
     offset: &Array,
     freqs: Option<&Array>,
 ) -> anyhow::Result<Array> {
-    eprintln!("[rope_dynamic] x.shape={:?} dims={} traditional={} base={:?} scale={} offset.shape={:?} has_freqs={}",
-        x.shape(), dims, traditional, base, scale, offset.shape(), freqs.is_some());
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
     let optional_base = crate::ffi::MlxOptionalFloat {
@@ -542,6 +552,26 @@ pub fn argmax_op(a: &Array) -> anyhow::Result<Array> {
     let rc = unsafe { (syms.mlx_argmax)(&mut res, a.raw(), false, default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_argmax returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn argmax_axis(a: &Array, axis: i32, keepdims: bool) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_argmax_axis)(&mut res, a.raw(), axis, keepdims, default_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_argmax_axis returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn arange(start: f64, stop: f64, step: f64, dtype: crate::ffi::MlxDtype) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_arange)(&mut res, start, stop, step, dtype as i32, default_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_arange returned error: {rc}"));
     }
     Ok(Array { ctx: res })
 }

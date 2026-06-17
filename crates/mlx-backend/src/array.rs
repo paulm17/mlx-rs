@@ -187,6 +187,16 @@ impl Array {
         Ok(val)
     }
 
+    pub fn item_i32(&self) -> anyhow::Result<i32> {
+        let syms = loader::symbols()?;
+        let mut val: i32 = 0;
+        let rc = unsafe { (syms.mlx_array_item_int32)(&mut val, self.ctx) };
+        if rc != 0 {
+            return Err(anyhow::anyhow!("mlx_array_item_int32 returned error: {rc}"));
+        }
+        Ok(val)
+    }
+
     pub fn data_f32(&self) -> anyhow::Result<&[f32]> {
         let syms = loader::symbols()?;
         let ptr = unsafe { (syms.mlx_array_data_float32)(self.ctx) };
