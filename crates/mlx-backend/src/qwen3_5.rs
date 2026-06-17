@@ -459,7 +459,7 @@ impl Qwen3_5SparseMoe {
 
         // Gate logits and top-k selection
         let gate_logits = self.gate.forward(x)?;
-        let probs = ops::softmax_axis(&gate_logits, -1)?;
+        let probs = ops::softmax_axis(&gate_logits, -1, true)?;
         let neg_probs = ops::negative(&probs)?;
         let indices = ops::argpartition(&neg_probs, top_k as i32 - 1, -1)?;
         let indices = ops::slice_last_dim(&indices, 0, top_k)?;

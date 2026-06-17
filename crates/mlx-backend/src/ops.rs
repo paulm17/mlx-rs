@@ -35,7 +35,12 @@ pub fn cpu_stream() -> anyhow::Result<MlxStream> {
 
 fn default_stream() -> MlxStream {
     init_streams();
-    DEFAULT_STREAM.with(|s| s.get())
+    let syms = loader::symbols().unwrap();
+    let mut stream = MlxStream { ctx: std::ptr::null_mut() };
+    let dev = unsafe { (syms.mlx_device_new_type)(crate::ffi::MlxDeviceType::Gpu, 0) };
+    unsafe { (syms.mlx_get_default_stream)(&mut stream, dev) };
+    unsafe { (syms.mlx_device_free)(dev) };
+    stream
 }
 
 pub(crate) struct VectorArray {
@@ -295,7 +300,7 @@ pub fn negative(a: &Array) -> anyhow::Result<Array> {
 pub fn softmax(a: &Array) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_softmax)(&mut res, a.raw(), default_stream()) };
+    let rc = unsafe { (syms.mlx_softmax)(&mut res, a.raw(), false, default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_softmax returned error: {rc}"));
     }
@@ -352,10 +357,10 @@ pub fn log(a: &Array) -> anyhow::Result<Array> {
     Ok(Array { ctx: res })
 }
 
-pub fn softmax_axis(a: &Array, axis: i32) -> anyhow::Result<Array> {
+pub fn softmax_axis(a: &Array, axis: i32, precise: bool) -> anyhow::Result<Array> {
     let syms = loader::symbols()?;
     let mut res = MlxArray { ctx: std::ptr::null_mut() };
-    let rc = unsafe { (syms.mlx_softmax_axis)(&mut res, a.raw(), axis, default_stream()) };
+    let rc = unsafe { (syms.mlx_softmax_axis)(&mut res, a.raw(), axis, precise, default_stream()) };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_softmax_axis returned error: {rc}"));
     }
@@ -453,16 +458,31 @@ pub fn slice_start_stop(a: &Array, starts: &[i32], ends: &[i32]) -> anyhow::Resu
 }
 
 pub fn take_along_axis(a: &Array, indices: &Array, axis: i32) -> anyhow::Result<Array> {
-    // Use take with reshaping for gather-along-axis behavior
-    take(a, indices, axis)
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe {
+        (syms.mlx_take_along_axis)(
+            &mut res,
+            a.raw(),
+            indices.raw(),
+            axis,
+            default_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_take_along_axis returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
 }
 
-pub fn argpartition(a: &Array, _kth: i32, _axis: i32) -> anyhow::Result<Array> {
-    let shape = a.shape();
-    let last_dim = *shape.last().unwrap_or(&1);
-    let indices: Vec<i32> = (0..last_dim as i32).collect();
-    let idx = Array::from_data_i32(&indices, &[last_dim])?;
-    Ok(idx)
+pub fn argpartition(a: &Array, kth: i32, axis: i32) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let rc = unsafe { (syms.mlx_argpartition_axis)(&mut res, a.raw(), kth, axis, default_stream()) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_argpartition_axis returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
 }
 
 pub fn repeat_heads(x: &Array, repeat_factor: usize) -> anyhow::Result<Array> {
@@ -714,6 +734,57 @@ pub fn quantized_matmul(
     };
     if rc != 0 {
         return Err(anyhow::anyhow!("mlx_quantized_matmul returned error: {rc}"));
+    }
+    Ok(Array { ctx: res })
+}
+
+pub fn gather_qmm(
+    x: &Array,
+    w: &Array,
+    scales: &Array,
+    biases: Option<&Array>,
+    lhs_indices: Option<&Array>,
+    rhs_indices: Option<&Array>,
+    transpose: bool,
+    group_size: Option<i32>,
+    bits: Option<i32>,
+    mode: &str,
+    sorted_indices: bool,
+) -> anyhow::Result<Array> {
+    let syms = loader::symbols()?;
+    let mut res = MlxArray { ctx: std::ptr::null_mut() };
+    let null_arr = MlxArray { ctx: std::ptr::null_mut() };
+    let bias_raw = biases.map(|b| b.raw()).unwrap_or(null_arr);
+    let lhs_raw = lhs_indices.map(|i| i.raw()).unwrap_or(null_arr);
+    let rhs_raw = rhs_indices.map(|i| i.raw()).unwrap_or(null_arr);
+    let gs = crate::ffi::MlxOptionalInt {
+        value: group_size.unwrap_or(0),
+        has_value: group_size.is_some(),
+    };
+    let bits_opt = crate::ffi::MlxOptionalInt {
+        value: bits.unwrap_or(0),
+        has_value: bits.is_some(),
+    };
+    let c_mode = std::ffi::CString::new(mode).unwrap_or_else(|_| std::ffi::CString::new("affine").unwrap());
+    let rc = unsafe {
+        (syms.mlx_gather_qmm)(
+            &mut res,
+            x.raw(),
+            w.raw(),
+            scales.raw(),
+            bias_raw,
+            lhs_raw,
+            rhs_raw,
+            transpose,
+            gs,
+            bits_opt,
+            c_mode.as_ptr(),
+            sorted_indices,
+            default_stream(),
+        )
+    };
+    if rc != 0 {
+        return Err(anyhow::anyhow!("mlx_gather_qmm returned error: {rc}"));
     }
     Ok(Array { ctx: res })
 }

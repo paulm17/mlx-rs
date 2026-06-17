@@ -5,6 +5,7 @@ use crate::ops;
 pub trait LinearLayer: Send {
     fn forward(&self, x: &Array) -> anyhow::Result<Array>;
     fn as_dense_weight(&self) -> Option<&Array> { None }
+    fn as_any(&self) -> &dyn std::any::Any;
 }
 
 pub trait EmbeddingLayer: Send {
@@ -110,6 +111,10 @@ impl LinearLayer for Linear {
     fn as_dense_weight(&self) -> Option<&Array> {
         Some(&self.weight)
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 pub struct Embedding {
@@ -186,6 +191,8 @@ impl LayerNorm {
     }
 }
 
+use std::sync::OnceLock;
+
 pub struct QuantizedLinear {
     weight: Array,
     scales: Array,
@@ -194,6 +201,7 @@ pub struct QuantizedLinear {
     group_size: Option<i32>,
     bits: Option<i32>,
     mode: String,
+    dense_weight: OnceLock<Option<Array>>,
 }
 
 impl QuantizedLinear {
@@ -205,12 +213,36 @@ impl QuantizedLinear {
         bits: Option<i32>,
         mode: String,
     ) -> Self {
-        Self { weight, scales, biases, attn_bias: None, group_size, bits, mode }
+        Self { weight, scales, biases, attn_bias: None, group_size, bits, mode, dense_weight: OnceLock::new() }
     }
 
     pub fn with_attn_bias(mut self, bias: Array) -> Self {
         self.attn_bias = Some(bias);
         self
+    }
+
+    pub fn weight(&self) -> &Array {
+        &self.weight
+    }
+
+    pub fn scales(&self) -> &Array {
+        &self.scales
+    }
+
+    pub fn biases(&self) -> Option<&Array> {
+        self.biases.as_ref()
+    }
+
+    pub fn group_size(&self) -> Option<i32> {
+        self.group_size
+    }
+
+    pub fn bits(&self) -> Option<i32> {
+        self.bits
+    }
+
+    pub fn mode(&self) -> &str {
+        &self.mode
     }
 }
 
@@ -231,6 +263,20 @@ impl LinearLayer for QuantizedLinear {
         } else {
             Ok(out)
         }
+    }
+
+    fn as_dense_weight(&self) -> Option<&Array> {
+        self.dense_weight.get_or_init(|| {
+            let dense = ops::dequantize(
+                &self.weight, &self.scales, self.biases.as_ref(),
+                self.group_size, self.bits, &self.mode, None,
+            ).ok()?;
+            ops::transpose(&dense, &[1, 0]).ok()
+        }).as_ref()
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 

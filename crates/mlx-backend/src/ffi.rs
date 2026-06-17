@@ -287,7 +287,9 @@ pub type MlxWhereFn = unsafe extern "C" fn(
 ) -> c_int;
 
 pub type MlxUnaryOpFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, MlxStream) -> c_int;
-pub type MlxSoftmaxAxisFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, c_int, MlxStream) -> c_int;
+pub type MlxArgpartitionAxisFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, c_int, c_int, MlxStream) -> c_int;
+pub type MlxSoftmaxFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, bool, MlxStream) -> c_int;
+pub type MlxSoftmaxAxisFn = unsafe extern "C" fn(*mut MlxArray, MlxArray, c_int, bool, MlxStream) -> c_int;
 
 // Argmax (no-axis variant: reduces entire array to scalar index)
 pub type MlxArgmaxFn = unsafe extern "C" fn(
@@ -493,12 +495,14 @@ pub struct MlxSymbols {
     pub mlx_fast_sdpa: MlxFastSdpaFn,
     // Additional ops
     pub mlx_take_axis: MlxTakeAxisFn,
+    pub mlx_take_along_axis: MlxTakeAxisFn,
+    pub mlx_argpartition_axis: MlxArgpartitionAxisFn,
     pub mlx_expand_dims: MlxExpandDimsFn,
     pub mlx_tri: MlxTriFn,
     pub mlx_where: MlxWhereFn,
     pub mlx_divide: MlxBinaryOpFn,
     pub mlx_negative: MlxUnaryOpFn,
-    pub mlx_softmax: MlxUnaryOpFn,
+    pub mlx_softmax: MlxSoftmaxFn,
     pub mlx_sigmoid: MlxUnaryOpFn,
     pub mlx_sqrt: MlxUnaryOpFn,
     pub mlx_tanh: MlxUnaryOpFn,
@@ -608,12 +612,14 @@ impl MlxSymbols {
                 mlx_fast_sdpa: load_sym!(lib, b"mlx_fast_scaled_dot_product_attention\0", MlxFastSdpaFn),
                 // Additional ops
                 mlx_take_axis: load_sym!(lib, b"mlx_take_axis\0", MlxTakeAxisFn),
+                mlx_take_along_axis: load_sym!(lib, b"mlx_take_along_axis\0", MlxTakeAxisFn),
+                mlx_argpartition_axis: load_sym!(lib, b"mlx_argpartition_axis\0", MlxArgpartitionAxisFn),
                 mlx_expand_dims: load_sym!(lib, b"mlx_expand_dims\0", MlxExpandDimsFn),
                 mlx_tri: load_sym!(lib, b"mlx_tri\0", MlxTriFn),
                 mlx_where: load_sym!(lib, b"mlx_where\0", MlxWhereFn),
                 mlx_divide: load_sym!(lib, b"mlx_divide\0", MlxBinaryOpFn),
                 mlx_negative: load_sym!(lib, b"mlx_negative\0", MlxUnaryOpFn),
-                mlx_softmax: load_sym!(lib, b"mlx_softmax\0", MlxUnaryOpFn),
+                mlx_softmax: load_sym!(lib, b"mlx_softmax\0", MlxSoftmaxFn),
                 mlx_sigmoid: load_sym!(lib, b"mlx_sigmoid\0", MlxUnaryOpFn),
                 mlx_sqrt: load_sym!(lib, b"mlx_sqrt\0", MlxUnaryOpFn),
                 mlx_tanh: load_sym!(lib, b"mlx_tanh\0", MlxUnaryOpFn),

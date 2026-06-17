@@ -107,7 +107,7 @@ fn is_gemma_architecture(architecture: Option<&str>) -> bool {
 
 fn is_qwen_architecture(architecture: Option<&str>) -> bool {
     match architecture {
-        Some(arch) => arch.starts_with("Qwen3") || arch.starts_with("Qwen3Next"),
+        Some(arch) => arch.starts_with("Qwen"),
         None => false,
     }
 }

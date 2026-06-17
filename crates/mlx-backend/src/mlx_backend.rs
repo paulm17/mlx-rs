@@ -264,6 +264,7 @@ impl backend_trait::Backend for MlxBackend {
     }
 
     fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput> {
+        crate::ops::init_streams();
         let tokens = self.tokenize(prompt, true)?;
         let prompt_len = tokens.len();
         let max_tokens = options.max_tokens.unwrap_or(512);
@@ -331,6 +332,7 @@ impl backend_trait::Backend for MlxBackend {
         options: &GenerationOptions,
         mut on_token: Box<dyn FnMut(&str) -> bool + Send>,
     ) -> Result<GenerationMetrics> {
+        crate::ops::init_streams();
         let tokens = self.tokenize(prompt, true)?;
         let prompt_len = tokens.len();
         let max_tokens = options.max_tokens.unwrap_or(512);
@@ -395,6 +397,7 @@ impl backend_trait::Backend for MlxBackend {
         options: &GenerationOptions,
         mut on_token: Box<dyn FnMut(&str) -> bool + Send>,
     ) -> Result<GenerateOutput> {
+        crate::ops::init_streams();
         let tokens = self.tokenize(prompt, true)?;
         let prompt_len = tokens.len();
         let max_tokens = options.max_tokens.unwrap_or(512);

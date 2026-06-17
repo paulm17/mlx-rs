@@ -6,6 +6,7 @@ use crate::llama::{LlamaConfig, LlamaModel};
 use crate::model::{EncoderModel, Model};
 use crate::qwen3::{Qwen3Config, Qwen3Model};
 use crate::qwen3_5::{Qwen3_5Config, Qwen3_5Model};
+use crate::qwen_moe::{QwenMoeConfig, QwenMoeModel};
 use crate::gemma3::{Gemma3Config, Gemma3Model};
 use crate::gemma4::{Gemma4Config, Gemma4Model};
 
@@ -37,6 +38,11 @@ pub fn create_model(
         "Qwen3ForCausalLM" => {
             let cfg = Qwen3Config::from_json(config)?;
             let model = Qwen3Model::load_from_tensors(tensors, cfg)?;
+            Ok(Box::new(model))
+        }
+        "Qwen2MoeForCausalLM" | "Qwen1.5MoeForCausalLM" => {
+            let cfg = QwenMoeConfig::from_json(config)?;
+            let model = QwenMoeModel::load_from_tensors(tensors, cfg)?;
             Ok(Box::new(model))
         }
         "Qwen3_5ForCausalLM" | "Qwen3_5ForConditionalGeneration"
@@ -87,6 +93,8 @@ pub fn supported_architectures() -> Vec<&'static str> {
         "LlamaForSequenceClassification",
         "Qwen2ForCausalLM",
         "Qwen3ForCausalLM",
+        "Qwen2MoeForCausalLM",
+        "Qwen1.5MoeForCausalLM",
         "Qwen3_5ForCausalLM",
         "Qwen3_5ForConditionalGeneration",
         "Qwen3NextForCausalLM",
