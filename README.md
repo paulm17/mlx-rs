@@ -142,6 +142,10 @@ Options:
   --stream                 Stream tokens as they arrive
 ```
 
+## Compatibility
+
+See [docs/compatibility.md](docs/compatibility.md) for the full backend support matrix and known limitations.
+
 ## Non-Goals (Phase 1)
 
 - Safetensors or MLX model support
