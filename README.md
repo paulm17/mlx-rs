@@ -40,7 +40,7 @@ cargo run --release --bin generate -- \
 cargo run --release --bin llama-server -- --model "$MODEL"
 ```
 
-Model inputs may point directly to a `.gguf` file, a directory containing one `.gguf`, a complete split-GGUF shard set, or a Hugging Face file reference in `owner/repo/file.gguf` form.
+Model inputs may point directly to a `.gguf` file, a directory containing one `.gguf`, a complete split-GGUF shard set, a Hugging Face file reference in `owner/repo/file.gguf` form, or a Hugging Face GGUF repo ID like `owner/repo-GGUF`. Repo IDs resolve to the default `Q4_K_M` GGUF file.
 
 Hugging Face references are downloaded automatically when missing locally. Downloads are cached under `$LLAMA_RS_MODEL_CACHE`, then `$HF_HOME/llama-rs/models`, then `~/.cache/llama-rs/models`. The downloader uses `huggingface-cli`, `hf`, or `curl`; set `HF_TOKEN` for gated or private models.
 

@@ -3,7 +3,9 @@ use std::process::Command;
 
 use anyhow::{bail, Context, Result};
 
-use hf_hub::api::sync::ApiBuilder;
+use hf_hub::api::sync::{ApiBuilder, ApiRepo};
+
+const DEFAULT_GGUF_QUANT: &str = "Q4_K_M";
 
 /// Resolve a model input path to a single GGUF file.
 ///
@@ -12,6 +14,7 @@ use hf_hub::api::sync::ApiBuilder;
 /// - A directory containing exactly one `.gguf` file
 /// - A directory containing split GGUF shards (e.g., `model-00001-of-00003.gguf`)
 /// - A Hugging Face reference like `owner/repo/model.gguf`
+/// - A Hugging Face GGUF repo ID like `owner/repo-GGUF`, resolved to `*Q4_K_M*.gguf`
 ///
 /// Rejected inputs:
 /// - Missing paths
@@ -23,6 +26,9 @@ pub fn resolve_model_path(input: &str) -> Result<PathBuf> {
     if !path.exists() {
         if let Some(reference) = parse_hf_gguf_reference(input) {
             return resolve_hf_gguf_reference(&reference);
+        }
+        if let Some(repo_id) = parse_hf_gguf_repo_id(input) {
+            return resolve_hf_gguf_repo_id(&repo_id);
         }
         bail!("Model path does not exist: {}", input);
     }
@@ -48,7 +54,7 @@ struct HfGgufReference {
 }
 
 pub(crate) fn looks_like_hf_gguf_ref(input: &str) -> bool {
-    parse_hf_gguf_reference(input).is_some()
+    parse_hf_gguf_reference(input).is_some() || parse_hf_gguf_repo_id(input).is_some()
 }
 
 fn parse_hf_gguf_reference(input: &str) -> Option<HfGgufReference> {
@@ -76,6 +82,27 @@ fn parse_hf_gguf_reference(input: &str) -> Option<HfGgufReference> {
     })
 }
 
+fn parse_hf_gguf_repo_id(input: &str) -> Option<String> {
+    if input.starts_with('/')
+        || input.starts_with("./")
+        || input.starts_with("../")
+        || input.contains("://")
+    {
+        return None;
+    }
+
+    let parts = input.split('/').collect::<Vec<_>>();
+    if parts.len() != 2 || parts.iter().any(|part| part.is_empty()) {
+        return None;
+    }
+
+    if parts[1].ends_with("-GGUF") {
+        Some(input.to_string())
+    } else {
+        None
+    }
+}
+
 fn resolve_hf_gguf_reference(reference: &HfGgufReference) -> Result<PathBuf> {
     let path = hf_cache_path(reference)?;
     if path.exists() {
@@ -97,6 +124,99 @@ fn resolve_hf_gguf_reference(reference: &HfGgufReference) -> Result<PathBuf> {
             path.display()
         )
     }
+}
+
+fn resolve_hf_gguf_repo_id(repo_id: &str) -> Result<PathBuf> {
+    if let Some(path) = cached_default_hf_gguf(repo_id)? {
+        return Ok(path);
+    }
+
+    let filename = resolve_default_hf_gguf_filename(repo_id)?;
+    resolve_hf_gguf_reference(&HfGgufReference {
+        repo_id: repo_id.to_string(),
+        filename,
+    })
+}
+
+fn cached_default_hf_gguf(repo_id: &str) -> Result<Option<PathBuf>> {
+    let repo_dir = hf_cache_root()?.join(repo_id.replace('/', "--"));
+    if !repo_dir.is_dir() {
+        return Ok(None);
+    }
+
+    let mut matches = find_gguf_files(&repo_dir)?
+        .into_iter()
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.contains(DEFAULT_GGUF_QUANT))
+                .unwrap_or(false)
+        })
+        .collect::<Vec<_>>();
+    matches.sort();
+
+    Ok(matches.into_iter().next())
+}
+
+fn find_gguf_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("Failed to read directory: {}", dir.display()))?
+    {
+        let path = entry?.path();
+        if path.is_dir() {
+            files.extend(find_gguf_files(&path)?);
+        } else if path.extension().and_then(|e| e.to_str()) == Some("gguf") {
+            files.push(path);
+        }
+    }
+    Ok(files)
+}
+
+fn resolve_default_hf_gguf_filename(repo_id: &str) -> Result<String> {
+    let token = std::env::var("HF_TOKEN")
+        .ok()
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty());
+
+    let api = ApiBuilder::from_env()
+        .with_token(token)
+        .build()
+        .map_err(|e| anyhow::anyhow!("failed to initialize Hugging Face client: {e}"))?;
+    let repo = api.model(repo_id.to_string());
+
+    match default_hf_gguf_filename_from_repo(&repo) {
+        Ok(filename) => Ok(filename),
+        Err(repo_error) => infer_default_hf_gguf_filename(repo_id).ok_or(repo_error),
+    }
+}
+
+fn default_hf_gguf_filename_from_repo(repo: &ApiRepo) -> Result<String> {
+    let info = repo
+        .info()
+        .map_err(|e| anyhow::anyhow!("failed to query Hugging Face repo: {e}"))?;
+
+    select_default_hf_gguf_filename(info.siblings.iter().map(|s| s.rfilename.as_str())).ok_or_else(
+        || anyhow::anyhow!("no *{DEFAULT_GGUF_QUANT}*.gguf file found in Hugging Face repo"),
+    )
+}
+
+fn select_default_hf_gguf_filename<'a>(
+    filenames: impl IntoIterator<Item = &'a str>,
+) -> Option<String> {
+    let mut matches = filenames
+        .into_iter()
+        .filter(|filename| filename.ends_with(".gguf") && filename.contains(DEFAULT_GGUF_QUANT))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    matches.sort();
+    matches.into_iter().next()
+}
+
+fn infer_default_hf_gguf_filename(repo_id: &str) -> Option<String> {
+    let repo_name = repo_id.rsplit('/').next()?;
+    let model_name = repo_name.strip_suffix("-GGUF").unwrap_or(repo_name);
+    Some(format!("{model_name}-{DEFAULT_GGUF_QUANT}.gguf"))
 }
 
 fn hf_cache_root() -> Result<PathBuf> {
@@ -262,10 +382,7 @@ fn download_hf_safetensors_repo(model: &str) -> Result<PathBuf> {
 
     eprintln!("Resolving safetensors model from Hugging Face repo {model} ...");
 
-    let hf_status = Command::new("hf")
-        .arg("download")
-        .arg(model)
-        .status();
+    let hf_status = Command::new("hf").arg("download").arg(model).status();
 
     if let Ok(status) = hf_status {
         if status.success() {
@@ -497,6 +614,42 @@ mod tests {
         assert!(parse_hf_gguf_reference("https://huggingface.co/owner/repo/model.gguf").is_none());
         assert!(parse_hf_gguf_reference("owner/repo/model.bin").is_none());
         assert!(parse_hf_gguf_reference("owner/repo").is_none());
+    }
+
+    #[test]
+    fn test_parse_hf_gguf_repo_id() {
+        assert_eq!(
+            parse_hf_gguf_repo_id("unsloth/gemma-4-E4B-it-GGUF"),
+            Some("unsloth/gemma-4-E4B-it-GGUF".to_string())
+        );
+        assert!(parse_hf_gguf_repo_id("unsloth/gemma-4-E4B-it").is_none());
+        assert!(parse_hf_gguf_repo_id("owner/repo/model.gguf").is_none());
+        assert!(parse_hf_gguf_repo_id("./owner/repo-GGUF").is_none());
+    }
+
+    #[test]
+    fn test_looks_like_hf_gguf_ref_accepts_repo_id() {
+        assert!(looks_like_hf_gguf_ref("unsloth/gemma-4-E4B-it-GGUF"));
+    }
+
+    #[test]
+    fn test_select_default_hf_gguf_filename_prefers_q4_k_m() {
+        let filename = select_default_hf_gguf_filename([
+            "model-Q8_0.gguf",
+            "nested/model-Q4_K_M.gguf",
+            "model-Q4_0.gguf",
+        ])
+        .unwrap();
+
+        assert_eq!(filename, "nested/model-Q4_K_M.gguf");
+    }
+
+    #[test]
+    fn test_infer_default_hf_gguf_filename() {
+        assert_eq!(
+            infer_default_hf_gguf_filename("unsloth/gemma-4-E4B-it-GGUF"),
+            Some("gemma-4-E4B-it-Q4_K_M.gguf".to_string())
+        );
     }
 
     #[test]

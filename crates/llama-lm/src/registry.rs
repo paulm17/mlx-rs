@@ -6,7 +6,9 @@ use anyhow::Result;
 use crate::backend::Backend;
 use crate::config::{LlamaCppConfig, MlxConfig};
 use crate::llamacpp::LlamaCppBackend;
-use crate::loader::{resolve_model_path, resolve_hf_safetensors_dir, looks_like_hf_repo_id, looks_like_hf_gguf_ref};
+use crate::loader::{
+    looks_like_hf_gguf_ref, looks_like_hf_repo_id, resolve_hf_safetensors_dir, resolve_model_path,
+};
 use crate::subprocess::RunnerSubprocess;
 use crate::types::LoadedModelInfo;
 
@@ -15,7 +17,8 @@ pub enum ModelFormat {
     Safetensors,
 }
 
-type SafetensorsFactory = Box<dyn Fn(&std::path::Path, &MlxConfig) -> Result<Box<dyn Backend>> + Send + Sync>;
+type SafetensorsFactory =
+    Box<dyn Fn(&std::path::Path, &MlxConfig) -> Result<Box<dyn Backend>> + Send + Sync>;
 
 fn safetensors_registry() -> &'static Mutex<Vec<SafetensorsFactory>> {
     static REGISTRY: OnceLock<Mutex<Vec<SafetensorsFactory>>> = OnceLock::new();
@@ -73,17 +76,18 @@ pub fn detect_format(path: &str) -> Result<ModelFormat> {
         return Ok(ModelFormat::Gguf);
     }
 
-    anyhow::bail!(
-        "Unable to detect model format for: {}",
-        path
-    )
+    anyhow::bail!("Unable to detect model format for: {}", path)
 }
 
 pub fn create_backend(path: &str, config: LlamaCppConfig) -> Result<Box<dyn Backend>> {
     create_backend_with_mlx(path, config, MlxConfig::default())
 }
 
-pub fn create_backend_with_mlx(path: &str, llamacpp_config: LlamaCppConfig, mlx_config: MlxConfig) -> Result<Box<dyn Backend>> {
+pub fn create_backend_with_mlx(
+    path: &str,
+    llamacpp_config: LlamaCppConfig,
+    mlx_config: MlxConfig,
+) -> Result<Box<dyn Backend>> {
     let format = detect_format(path)?;
 
     match format {
@@ -138,6 +142,12 @@ mod tests {
         fs::write(dir.path().join("config.json"), b"{}").unwrap();
         let result = detect_format(dir.path().to_str().unwrap()).unwrap();
         assert!(matches!(result, ModelFormat::Safetensors));
+    }
+
+    #[test]
+    fn test_detect_format_hf_gguf_repo_id() {
+        let result = detect_format("unsloth/gemma-4-E4B-it-GGUF").unwrap();
+        assert!(matches!(result, ModelFormat::Gguf));
     }
 
     #[test]
