@@ -305,6 +305,12 @@ impl Runtime {
         let n_prompt = prompt_tokens.len();
         let max_tokens = options.max_tokens.unwrap_or(512);
 
+        if n_prompt == 0 {
+            anyhow::bail!("prompt tokenized to zero tokens");
+        }
+
+        self.context.clear_kv_cache();
+
         // Prefill: process all prompt tokens
         let mut batch = LlamaBatch::new(n_prompt, 1);
         for (i, &token_id) in prompt_tokens.iter().enumerate() {
