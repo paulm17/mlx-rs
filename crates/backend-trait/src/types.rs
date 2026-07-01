@@ -30,6 +30,29 @@ impl ChatMessage {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ChatTemplateOptions {
+    pub enable_thinking: bool,
+}
+
+impl Default for ChatTemplateOptions {
+    fn default() -> Self {
+        Self {
+            enable_thinking: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppliedChatTemplate {
+    pub prompt: String,
+    pub additional_stops: Vec<String>,
+    pub parser: Option<String>,
+    pub generation_prompt: String,
+    pub chat_format: i32,
+    pub parse_tool_calls: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GenerationOptions {
     pub max_tokens: Option<usize>,
     pub temperature: f32,

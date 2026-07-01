@@ -4,8 +4,8 @@ use crate::backend::Backend;
 use crate::config::LlamaCppConfig;
 use crate::runtime::Runtime;
 use crate::types::{
-    ChatMessage, EmbeddingData, EmbeddingOutput, EmbeddingUsage, GenerateOutput,
-    GenerationMetrics, GenerationOptions, LoadedModelInfo,
+    AppliedChatTemplate, ChatMessage, ChatTemplateOptions, EmbeddingData, EmbeddingOutput,
+    EmbeddingUsage, GenerateOutput, GenerationMetrics, GenerationOptions, LoadedModelInfo,
 };
 
 pub struct LlamaCppBackend {
@@ -62,6 +62,24 @@ impl Backend for LlamaCppBackend {
 
     fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
         self.runtime.apply_chat_template(messages)
+    }
+
+    fn apply_chat_template_with_options(
+        &self,
+        messages: &[ChatMessage],
+        options: &ChatTemplateOptions,
+    ) -> Result<AppliedChatTemplate> {
+        self.runtime
+            .apply_chat_template_with_options(messages, options)
+    }
+
+    fn parse_chat_response(
+        &self,
+        template: &AppliedChatTemplate,
+        text: &str,
+        is_partial: bool,
+    ) -> Result<String> {
+        self.runtime.parse_chat_response(template, text, is_partial)
     }
 
     fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput> {
@@ -215,10 +233,14 @@ mod tests {
             std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let chunks_clone = chunks.clone();
         let metrics = backend
-            .generate_stream("Hello", &options, Box::new(move |piece| {
-                chunks_clone.lock().unwrap().push(piece.to_string());
-                true
-            }))
+            .generate_stream(
+                "Hello",
+                &options,
+                Box::new(move |piece| {
+                    chunks_clone.lock().unwrap().push(piece.to_string());
+                    true
+                }),
+            )
             .unwrap();
         assert!(metrics.prompt_tokens > 0);
     }

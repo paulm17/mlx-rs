@@ -26,7 +26,7 @@ MODEL=unsloth/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf
 # Build
 cargo build --release
 
-# Generate text
+# Generate text. Instruction/chat model names use the model chat template automatically.
 cargo run --release --bin generate -- --model "$MODEL" --prompt "Hello!"
 
 # Chat mode with streaming
@@ -137,7 +137,10 @@ Options:
   --max-tokens <N>         Max tokens to generate
   --temperature <FLOAT>    Sampling temperature [default: 0.6]
   --top-p <FLOAT>          Top-p sampling [default: 0.9]
-  --chat                   Use chat template mode
+  --top-k <N>              Top-k sampling [default: 64]
+  --chat                   Force chat template mode
+  --raw                    Force raw completion mode
+  --think                  Enable model thinking when the chat template supports it
   --system-prompt <TEXT>   System prompt for chat mode
   --stream                 Stream tokens as they arrive
 ```

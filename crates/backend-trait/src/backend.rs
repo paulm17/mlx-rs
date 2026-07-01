@@ -1,8 +1,8 @@
 use anyhow::Result;
 
 use crate::types::{
-    ChatMessage, EmbeddingOutput, GenerateOutput, GenerationMetrics, GenerationOptions,
-    LoadedModelInfo,
+    AppliedChatTemplate, ChatMessage, ChatTemplateOptions, EmbeddingOutput, GenerateOutput,
+    GenerationMetrics, GenerationOptions, LoadedModelInfo,
 };
 
 pub trait Backend: Send {
@@ -25,6 +25,30 @@ pub trait Backend: Send {
     }
 
     fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String>;
+
+    fn apply_chat_template_with_options(
+        &self,
+        messages: &[ChatMessage],
+        _options: &ChatTemplateOptions,
+    ) -> Result<AppliedChatTemplate> {
+        Ok(AppliedChatTemplate {
+            prompt: self.apply_chat_template(messages)?,
+            additional_stops: Vec::new(),
+            parser: None,
+            generation_prompt: String::new(),
+            chat_format: 0,
+            parse_tool_calls: false,
+        })
+    }
+
+    fn parse_chat_response(
+        &self,
+        _template: &AppliedChatTemplate,
+        text: &str,
+        _is_partial: bool,
+    ) -> Result<String> {
+        Ok(text.to_string())
+    }
 
     fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> Result<GenerateOutput>;
 

@@ -10,13 +10,15 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
+use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_sys_2::llama_flash_attn_type;
 
 use crate::config::LlamaCppConfig;
 use crate::sampler::Sampler;
 use crate::types::{
-    GenerateOutput, GenerationMetrics, GenerationOptions, LoadedModelInfo, StopReason,
+    AppliedChatTemplate, ChatTemplateOptions, GenerateOutput, GenerationMetrics, GenerationOptions,
+    LoadedModelInfo, StopReason,
 };
 
 fn ensure_backend() -> &'static LlamaBackend {
@@ -246,16 +248,104 @@ impl Runtime {
             if let Ok(result) = result {
                 return Ok(result);
             }
-            Some(
-                tmpl.to_str()
-                    .map(|s| s.to_string())
-                    .unwrap_or_default(),
-            )
+            Some(tmpl.to_str().map(|s| s.to_string()).unwrap_or_default())
         } else {
             None
         };
 
         Ok(render_fallback_chat_template(tmpl.as_deref(), messages))
+    }
+
+    pub fn apply_chat_template_with_options(
+        &self,
+        messages: &[crate::types::ChatMessage],
+        options: &ChatTemplateOptions,
+    ) -> Result<AppliedChatTemplate> {
+        let Some(template) = self.model.chat_template(None).ok() else {
+            return Ok(AppliedChatTemplate {
+                prompt: render_fallback_chat_template(None, messages),
+                additional_stops: Vec::new(),
+                parser: None,
+                generation_prompt: String::new(),
+                chat_format: 0,
+                parse_tool_calls: false,
+            });
+        };
+
+        let messages_json = serde_json::to_string(messages)?;
+        let params = OpenAIChatTemplateParams {
+            messages_json: &messages_json,
+            tools_json: None,
+            tool_choice: None,
+            json_schema: None,
+            grammar: None,
+            reasoning_format: None,
+            chat_template_kwargs: None,
+            add_generation_prompt: true,
+            use_jinja: true,
+            parallel_tool_calls: false,
+            enable_thinking: options.enable_thinking,
+            add_bos: true,
+            add_eos: false,
+            parse_tool_calls: false,
+        };
+
+        match self.model.apply_chat_template_oaicompat(&template, &params) {
+            Ok(result) => Ok(AppliedChatTemplate {
+                prompt: result.prompt,
+                additional_stops: result.additional_stops,
+                parser: result.parser,
+                generation_prompt: result.generation_prompt,
+                chat_format: result.chat_format,
+                parse_tool_calls: result.parse_tool_calls,
+            }),
+            Err(_) => Ok(AppliedChatTemplate {
+                prompt: self.apply_chat_template(messages)?,
+                additional_stops: Vec::new(),
+                parser: None,
+                generation_prompt: String::new(),
+                chat_format: 0,
+                parse_tool_calls: false,
+            }),
+        }
+    }
+
+    pub fn parse_chat_response(
+        &self,
+        template: &AppliedChatTemplate,
+        text: &str,
+        is_partial: bool,
+    ) -> Result<String> {
+        if let Some(parsed) = parse_gemma_channel_response(text) {
+            return Ok(parsed);
+        }
+
+        if template.chat_format == 0
+            && template.parser.is_none()
+            && template.generation_prompt.is_empty()
+        {
+            return Ok(text.to_string());
+        }
+
+        let parser_template = llama_cpp_2::model::ChatTemplateResult {
+            prompt: template.prompt.clone(),
+            grammar: None,
+            grammar_lazy: false,
+            grammar_triggers: Vec::new(),
+            preserved_tokens: Vec::new(),
+            additional_stops: template.additional_stops.clone(),
+            chat_format: template.chat_format,
+            parser: template.parser.clone(),
+            generation_prompt: template.generation_prompt.clone(),
+            parse_tool_calls: template.parse_tool_calls,
+        };
+
+        let parsed = parser_template
+            .parse_response_oaicompat(text, is_partial)
+            .map_err(|e| anyhow::anyhow!("Failed to parse chat response: {}", e))?;
+        extract_chat_content(&parsed)
+            .or_else(|| parse_gemma_channel_response(text))
+            .map_or_else(|| Ok(text.to_string()), Ok)
     }
 
     pub fn generate(
@@ -441,8 +531,13 @@ impl Runtime {
     }
 }
 
-fn render_fallback_chat_template(tmpl: Option<&str>, messages: &[crate::types::ChatMessage]) -> String {
-    let is_gemma_family = tmpl.map_or(false, |t| t.contains("<|turn|>") || t.contains("<start_of_turn>"));
+fn render_fallback_chat_template(
+    tmpl: Option<&str>,
+    messages: &[crate::types::ChatMessage],
+) -> String {
+    let is_gemma_family = tmpl.map_or(false, |t| {
+        t.contains("<|turn|>") || t.contains("<start_of_turn>")
+    });
 
     if is_gemma_family {
         render_gemma_chat_template(messages)
@@ -536,6 +631,47 @@ fn render_llama_chat_template(messages: &[crate::types::ChatMessage]) -> String 
     }
 }
 
+fn extract_chat_content(parsed_json: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(parsed_json).ok()?;
+    let content = value.get("content")?;
+
+    if let Some(text) = content.as_str() {
+        return Some(text.to_string());
+    }
+
+    content.as_array().map(|parts| {
+        parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(|text| text.as_str())
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("")
+    })
+}
+
+fn parse_gemma_channel_response(text: &str) -> Option<String> {
+    const FINAL_OPEN: &str = "<|channel>final\n";
+    const CLOSE: &str = "<channel|>";
+
+    let text = text.trim_start_matches(['\u{feff}', '\u{0}', ' ', '\n', '\r', '\t']);
+
+    if let Some(rest) = text.strip_prefix("<|channel>thought") {
+        let rest = rest.trim_start_matches(['\n', '\r']);
+        let (_, after_thought) = rest.split_once(CLOSE)?;
+        return Some(after_thought.trim_start_matches(['\n', '\r']).to_string());
+    }
+
+    if let Some(rest) = text.strip_prefix(FINAL_OPEN) {
+        let (final_text, _) = rest.split_once(CLOSE).unwrap_or((rest, ""));
+        return Some(final_text.to_string());
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,10 +699,13 @@ mod tests {
 
     #[test]
     fn test_fallback_chat_template_system_user() {
-        let prompt = render_fallback_chat_template(None, &[
-            ChatMessage::system("You are helpful."),
-            ChatMessage::user("Hello"),
-        ]);
+        let prompt = render_fallback_chat_template(
+            None,
+            &[
+                ChatMessage::system("You are helpful."),
+                ChatMessage::user("Hello"),
+            ],
+        );
         assert!(prompt.contains("[INST]"));
         assert!(prompt.contains("<<SYS>>\nYou are helpful.\n<</SYS>>"));
         assert!(prompt.ends_with("Hello [/INST]"));
@@ -574,11 +713,14 @@ mod tests {
 
     #[test]
     fn test_fallback_chat_template_assistant_history() {
-        let prompt = render_fallback_chat_template(None, &[
-            ChatMessage::user("Hello"),
-            ChatMessage::assistant("Hi there."),
-            ChatMessage::user("How are you?"),
-        ]);
+        let prompt = render_fallback_chat_template(
+            None,
+            &[
+                ChatMessage::user("Hello"),
+                ChatMessage::assistant("Hi there."),
+                ChatMessage::user("How are you?"),
+            ],
+        );
         assert_eq!(
             prompt,
             "[INST] Hello [/INST] Hi there. [INST] How are you? [/INST]"
@@ -587,13 +729,16 @@ mod tests {
 
     #[test]
     fn test_fallback_chat_template_ignores_unsupported_tool_role() {
-        let prompt = render_fallback_chat_template(None, &[
-            ChatMessage::user("Hello"),
-            ChatMessage {
-                role: "tool".to_string(),
-                content: "ignored".to_string(),
-            },
-        ]);
+        let prompt = render_fallback_chat_template(
+            None,
+            &[
+                ChatMessage::user("Hello"),
+                ChatMessage {
+                    role: "tool".to_string(),
+                    content: "ignored".to_string(),
+                },
+            ],
+        );
         assert_eq!(prompt, "[INST] Hello [/INST]");
     }
 
@@ -605,6 +750,45 @@ mod tests {
         );
         assert!(prompt.contains("<|turn>user\n"));
         assert!(prompt.contains("<|turn>model\n"));
+    }
+
+    #[test]
+    fn test_extract_chat_content_string() {
+        let parsed = r#"{"role":"assistant","content":"Hello there"}"#;
+        assert_eq!(extract_chat_content(parsed).as_deref(), Some("Hello there"));
+    }
+
+    #[test]
+    fn test_extract_chat_content_parts() {
+        let parsed = r#"{"role":"assistant","content":[{"type":"text","text":"Hello"},{"type":"text","text":" there"}]}"#;
+        assert_eq!(extract_chat_content(parsed).as_deref(), Some("Hello there"));
+    }
+
+    #[test]
+    fn test_parse_gemma_empty_thought_channel() {
+        let text = "<|channel>thought\n<channel|>Hello! How can I help you today?";
+        assert_eq!(
+            parse_gemma_channel_response(text).as_deref(),
+            Some("Hello! How can I help you today?")
+        );
+    }
+
+    #[test]
+    fn test_parse_gemma_empty_thought_channel_crlf() {
+        let text = "<|channel>thought\r\n<channel|>Hello! How can I help you today?";
+        assert_eq!(
+            parse_gemma_channel_response(text).as_deref(),
+            Some("Hello! How can I help you today?")
+        );
+    }
+
+    #[test]
+    fn test_parse_gemma_final_channel() {
+        let text = "<|channel>final\nHello!<channel|>";
+        assert_eq!(
+            parse_gemma_channel_response(text).as_deref(),
+            Some("Hello!")
+        );
     }
 
     #[test]

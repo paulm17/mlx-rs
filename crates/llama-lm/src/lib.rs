@@ -12,14 +12,18 @@ pub mod types;
 
 pub use backend::Backend;
 pub use llamacpp::LlamaCppBackend;
-pub use loader::{resolve_model_path, resolve_hf_safetensors_dir};
-pub use registry::{create_backend, create_backend_with_mlx, detect_format, register_safetensors_backend, ModelFormat};
+pub use loader::{resolve_hf_safetensors_dir, resolve_model_path};
+pub use registry::{
+    create_backend, create_backend_with_mlx, detect_format, register_safetensors_backend,
+    ModelFormat,
+};
 pub use runner::{CompletionOptions, CompletionRequest, CompletionResponse, RunnerClient};
 pub use sampler::Sampler;
 pub use server::{run_server, run_server_from_toml_path, ServerConfig};
 pub use types::{
-    ChatMessage, EmbeddingData, EmbeddingOutput, EmbeddingUsage, GenerateOutput,
-    GenerationMetrics, GenerationOptions, LoadedModelInfo, StopReason,
+    AppliedChatTemplate, ChatMessage, ChatTemplateOptions, EmbeddingData, EmbeddingOutput,
+    EmbeddingUsage, GenerateOutput, GenerationMetrics, GenerationOptions, LoadedModelInfo,
+    StopReason,
 };
 
 pub use config::{LlamaCppConfig, MlxConfig};
@@ -34,7 +38,11 @@ impl GenerationPipeline {
         Ok(Self { backend })
     }
 
-    pub fn generate(&mut self, prompt: &str, options: &GenerationOptions) -> anyhow::Result<GenerateOutput> {
+    pub fn generate(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+    ) -> anyhow::Result<GenerateOutput> {
         self.backend.generate(prompt, options)
     }
 
@@ -47,11 +55,30 @@ impl GenerationPipeline {
     where
         F: FnMut(&str) -> bool + Send + 'static,
     {
-        self.backend.generate_stream(prompt, options, Box::new(on_token))
+        self.backend
+            .generate_stream(prompt, options, Box::new(on_token))
     }
 
     pub fn apply_chat_template(&self, messages: &[ChatMessage]) -> anyhow::Result<String> {
         self.backend.apply_chat_template(messages)
+    }
+
+    pub fn apply_chat_template_with_options(
+        &self,
+        messages: &[ChatMessage],
+        options: &ChatTemplateOptions,
+    ) -> anyhow::Result<AppliedChatTemplate> {
+        self.backend
+            .apply_chat_template_with_options(messages, options)
+    }
+
+    pub fn parse_chat_response(
+        &self,
+        template: &AppliedChatTemplate,
+        text: &str,
+        is_partial: bool,
+    ) -> anyhow::Result<String> {
+        self.backend.parse_chat_response(template, text, is_partial)
     }
 
     pub fn backend(&self) -> &dyn Backend {
