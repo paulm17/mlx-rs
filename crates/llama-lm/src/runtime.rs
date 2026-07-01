@@ -12,6 +12,7 @@ use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
 use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::token::LlamaToken;
+use llama_cpp_2::TokenToStringError;
 use llama_cpp_sys_2::llama_flash_attn_type;
 
 use crate::config::LlamaCppConfig;
@@ -185,10 +186,38 @@ impl Runtime {
         token_id: i32,
         decoder: &mut encoding_rs::Decoder,
     ) -> Result<String> {
-        let token = llama_cpp_2::token::LlamaToken(token_id);
+        let token = LlamaToken(token_id);
         self.model
             .token_to_piece(token, decoder, false, None)
             .map_err(|e| anyhow::anyhow!("Detokenization failed for token {}: {}", token_id, e))
+    }
+
+    fn detokenize_generated_piece_with_decoder(
+        &self,
+        token_id: i32,
+        decoder: &mut encoding_rs::Decoder,
+    ) -> Result<Option<String>> {
+        let token = LlamaToken(token_id);
+        match self.model.token_to_piece(token, decoder, false, None) {
+            Ok(piece) => Ok(Some(piece)),
+            Err(TokenToStringError::UnknownTokenType) => {
+                match self.model.token_to_piece(token, decoder, true, None) {
+                    Ok(piece) if piece.is_empty() => Ok(None),
+                    Ok(piece) => Ok(Some(piece)),
+                    Err(TokenToStringError::UnknownTokenType) => Ok(None),
+                    Err(e) => Err(anyhow::anyhow!(
+                        "Detokenization failed for token {}: {}",
+                        token_id,
+                        e
+                    )),
+                }
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Detokenization failed for token {}: {}",
+                token_id,
+                e
+            )),
+        }
     }
 
     pub fn is_eog(&self, token_id: i32) -> bool {
@@ -441,7 +470,15 @@ impl Runtime {
             });
         }
 
-        let piece = self.detokenize_piece_with_decoder(current_token.0, &mut token_decoder)?;
+        let Some(piece) =
+            self.detokenize_generated_piece_with_decoder(current_token.0, &mut token_decoder)?
+        else {
+            return Ok(GenerateOutput {
+                text: output_text,
+                stop_reason: StopReason::Eos,
+                metrics: self.generation_metrics(start, ttft, n_prompt, generated_tokens),
+            });
+        };
         if !on_token(&piece) {
             return Ok(GenerateOutput {
                 text: output_text,
@@ -479,7 +516,12 @@ impl Runtime {
                 break;
             }
 
-            let piece = self.detokenize_piece_with_decoder(next_token.0, &mut token_decoder)?;
+            let Some(piece) =
+                self.detokenize_generated_piece_with_decoder(next_token.0, &mut token_decoder)?
+            else {
+                stop_reason = StopReason::Eos;
+                break;
+            };
             if !on_token(&piece) {
                 stop_reason = StopReason::Cancelled;
                 break;
