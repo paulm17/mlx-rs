@@ -26,6 +26,157 @@ fn ensure_backend() -> &'static LlamaBackend {
     BACKEND.get_or_init(|| LlamaBackend::init().expect("Failed to initialize llama.cpp backend"))
 }
 
+#[repr(C)]
+struct CompatTemplateResult {
+    prompt: *mut std::ffi::c_char,
+    generation_prompt: *mut std::ffi::c_char,
+    parser: *mut std::ffi::c_char,
+    chat_format: i32,
+    additional_stops: *mut *mut std::ffi::c_char,
+    additional_stops_count: usize,
+    parse_tool_calls: bool,
+}
+
+#[repr(C)]
+struct CompatParseState {
+    _private: [u8; 0],
+}
+
+unsafe extern "C" {
+    fn mlx_rs_apply_chat_template_oaicompat(
+        model: *const llama_cpp_sys_2::llama_model,
+        chat_template: *const std::ffi::c_char,
+        messages_json: *const std::ffi::c_char,
+        tools_json: *const std::ffi::c_char,
+        tool_choice: *const std::ffi::c_char,
+        reasoning: *const std::ffi::c_char,
+        chat_template_kwargs: *const std::ffi::c_char,
+        add_generation_prompt: bool,
+        parallel_tool_calls: bool,
+        enable_thinking: bool,
+        add_bos: bool,
+        add_eos: bool,
+        parse_tool_calls: bool,
+        result: *mut CompatTemplateResult,
+    ) -> i32;
+
+    fn mlx_rs_free_chat_template_result(result: *mut CompatTemplateResult);
+
+    fn mlx_rs_parse_chat_response(
+        text: *const std::ffi::c_char,
+        is_partial: bool,
+        chat_format: i32,
+        parse_tool_calls: bool,
+        generation_prompt: *const std::ffi::c_char,
+        parser_serialized: *const std::ffi::c_char,
+        reasoning: *const std::ffi::c_char,
+        output: *mut *mut std::ffi::c_char,
+    ) -> i32;
+
+    fn mlx_rs_init_chat_parse_state(
+        chat_format: i32,
+        parse_tool_calls: bool,
+        generation_prompt: *const std::ffi::c_char,
+        parser_serialized: *const std::ffi::c_char,
+        reasoning: *const std::ffi::c_char,
+        output: *mut *mut CompatParseState,
+    ) -> i32;
+
+    fn mlx_rs_update_chat_parse_state(
+        state: *mut CompatParseState,
+        text_added: *const std::ffi::c_char,
+        is_partial: bool,
+        outputs: *mut *mut *mut std::ffi::c_char,
+        output_count: *mut usize,
+    ) -> i32;
+
+    fn mlx_rs_free_chat_parse_outputs(outputs: *mut *mut std::ffi::c_char, count: usize);
+    fn mlx_rs_free_chat_parse_state(state: *mut CompatParseState);
+}
+
+fn optional_cstring(value: Option<&str>) -> Result<Option<std::ffi::CString>> {
+    value
+        .map(std::ffi::CString::new)
+        .transpose()
+        .map_err(|e| anyhow::anyhow!("invalid NUL byte in chat template option: {e}"))
+}
+
+fn model_ptr(model: &LlamaModel) -> *const llama_cpp_sys_2::llama_model {
+    // LlamaModel is repr(transparent) over NonNull<llama_model>; the public crate
+    // intentionally keeps that field private, so this is the narrow FFI bridge.
+    unsafe {
+        let field = model as *const LlamaModel
+            as *const std::ptr::NonNull<llama_cpp_sys_2::llama_model>;
+        (*field).as_ptr()
+    }
+}
+
+struct CompatStreamParser {
+    state: *mut CompatParseState,
+}
+
+impl CompatStreamParser {
+    fn new(template: &AppliedChatTemplate) -> Result<Self> {
+        let generation = std::ffi::CString::new(template.generation_prompt.as_str())?;
+        let parser = optional_cstring(template.parser.as_deref())?;
+        let reasoning = std::ffi::CString::new("deepseek")?;
+        let mut state = std::ptr::null_mut();
+        let status = unsafe {
+            mlx_rs_init_chat_parse_state(
+                template.chat_format,
+                template.parse_tool_calls,
+                generation.as_ptr(),
+                parser.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                reasoning.as_ptr(),
+                &mut state,
+            )
+        };
+        if status != 0 || state.is_null() {
+            return Err(anyhow::anyhow!(
+                "llama.cpp streaming parser initialization failed with status {status}"
+            ));
+        }
+        Ok(Self { state })
+    }
+
+    fn update(&mut self, piece: &str, is_partial: bool) -> Result<Vec<String>> {
+        let piece = std::ffi::CString::new(piece)?;
+        let mut outputs = std::ptr::null_mut();
+        let mut count = 0;
+        let status = unsafe {
+            mlx_rs_update_chat_parse_state(
+                self.state,
+                piece.as_ptr(),
+                is_partial,
+                &mut outputs,
+                &mut count,
+            )
+        };
+        if status != 0 {
+            return Err(anyhow::anyhow!(
+                "llama.cpp streaming parser failed with status {status}"
+            ));
+        }
+        let result = if count == 0 {
+            Vec::new()
+        } else {
+            let values = unsafe { std::slice::from_raw_parts(outputs, count) };
+            values
+                .iter()
+                .map(|value| unsafe { std::ffi::CStr::from_ptr(*value) }.to_str().map(str::to_string))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        unsafe { mlx_rs_free_chat_parse_outputs(outputs, count) };
+        Ok(result)
+    }
+}
+
+impl Drop for CompatStreamParser {
+    fn drop(&mut self) {
+        unsafe { mlx_rs_free_chat_parse_state(self.state) };
+    }
+}
+
 pub struct Runtime {
     context: LlamaContext<'static>,
     model: Box<LlamaModel>,
@@ -63,9 +214,11 @@ impl Runtime {
         let embeddings_enabled = config.embedding.unwrap_or(false);
         let mut ctx_params = LlamaContextParams::default().with_embeddings(embeddings_enabled);
 
-        if let Some(n_ctx) = config.n_ctx {
-            ctx_params = ctx_params.with_n_ctx(NonZeroU32::new(n_ctx));
-        }
+        // OhMyPi's default built-in tools and coding prompt are already about
+        // 18k tokens. Keep an explicit config value authoritative, but make
+        // the no-config path large enough for a normal tool-enabled session.
+        let n_ctx = config.n_ctx.unwrap_or(32768);
+        ctx_params = ctx_params.with_n_ctx(NonZeroU32::new(n_ctx));
         if let Some(n_batch) = config.n_batch {
             ctx_params = ctx_params.with_n_batch(n_batch);
         }
@@ -287,29 +440,141 @@ impl Runtime {
     pub fn apply_chat_template_with_options(
         &self,
         messages: &[crate::types::ChatMessage],
-        _options: &ChatTemplateOptions,
+        options: &ChatTemplateOptions,
     ) -> Result<AppliedChatTemplate> {
-        Ok(AppliedChatTemplate {
-            prompt: self.apply_chat_template(messages)?,
-            additional_stops: Vec::new(),
-            parser: None,
-            generation_prompt: String::new(),
+        let template = self.model.chat_template(None).ok();
+        let Some(template) = template else {
+            return Ok(AppliedChatTemplate {
+                prompt: render_fallback_chat_template(None, messages),
+                additional_stops: Vec::new(),
+                parser: None,
+                generation_prompt: String::new(),
+                chat_format: 0,
+                parse_tool_calls: false,
+            });
+        };
+
+        let template_text = template.to_str()?;
+        let messages_json = serde_json::to_string(messages)?;
+        let template_c = std::ffi::CString::new(template_text)?;
+        let messages_c = std::ffi::CString::new(messages_json)?;
+        let tools_c = optional_cstring(options.tools_json.as_deref())?;
+        let choice_c = optional_cstring(options.tool_choice.as_deref())?;
+        let reasoning_c = optional_cstring(options.reasoning_format.as_deref())?;
+        let kwargs_c = optional_cstring(options.chat_template_kwargs.as_deref())?;
+        let mut result = CompatTemplateResult {
+            prompt: std::ptr::null_mut(),
+            generation_prompt: std::ptr::null_mut(),
+            parser: std::ptr::null_mut(),
             chat_format: 0,
+            additional_stops: std::ptr::null_mut(),
+            additional_stops_count: 0,
             parse_tool_calls: false,
-        })
+        };
+        let status = unsafe {
+            mlx_rs_apply_chat_template_oaicompat(
+                model_ptr(&self.model),
+                template_c.as_ptr(),
+                messages_c.as_ptr(),
+                tools_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                choice_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                reasoning_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                kwargs_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                true,
+                options.parallel_tool_calls,
+                options.enable_thinking,
+                true,
+                false,
+                options.parse_tool_calls,
+                &mut result,
+            )
+        };
+        if status != 0 {
+            unsafe { mlx_rs_free_chat_template_result(&mut result) };
+            return Err(anyhow::anyhow!(
+                "llama.cpp OpenAI chat template failed with status {status}"
+            ));
+        }
+
+        let prompt = unsafe { std::ffi::CStr::from_ptr(result.prompt) }
+            .to_str()?
+            .to_string();
+        let generation_prompt = unsafe { std::ffi::CStr::from_ptr(result.generation_prompt) }
+            .to_str()?
+            .to_string();
+        let parser = if result.parser.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { std::ffi::CStr::from_ptr(result.parser) }
+                    .to_str()?
+                    .to_string(),
+            )
+        };
+        let additional_stops = if result.additional_stops_count == 0 {
+            Vec::new()
+        } else {
+            let stops = unsafe {
+                std::slice::from_raw_parts(result.additional_stops, result.additional_stops_count)
+            };
+            stops
+                .iter()
+                .map(|stop| unsafe { std::ffi::CStr::from_ptr(*stop) }.to_str().map(str::to_string))
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        let applied = AppliedChatTemplate {
+            prompt,
+            additional_stops,
+            parser,
+            generation_prompt,
+            chat_format: result.chat_format,
+            parse_tool_calls: result.parse_tool_calls,
+        };
+        unsafe { mlx_rs_free_chat_template_result(&mut result) };
+
+        Ok(applied)
     }
 
     pub fn parse_chat_response(
         &self,
         template: &AppliedChatTemplate,
         text: &str,
-        _is_partial: bool,
+        is_partial: bool,
     ) -> Result<String> {
         if let Some(parsed) = parse_gemma_channel_response(text) {
             return Ok(parsed);
         }
 
-        let _ = template;
+        if template.parse_tool_calls || template.generation_prompt.len() > 0 {
+            let text_c = std::ffi::CString::new(text)?;
+            let generation_c = std::ffi::CString::new(template.generation_prompt.as_str())?;
+            let parser_c = optional_cstring(template.parser.as_deref())?;
+            let reasoning_c = std::ffi::CString::new("deepseek")?;
+            let mut output = std::ptr::null_mut();
+            let status = unsafe {
+                mlx_rs_parse_chat_response(
+                    text_c.as_ptr(),
+                    is_partial,
+                    template.chat_format,
+                    template.parse_tool_calls,
+                    generation_c.as_ptr(),
+                    parser_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                    reasoning_c.as_ptr(),
+                    &mut output,
+                )
+            };
+            if status != 0 || output.is_null() {
+                return Err(anyhow::anyhow!(
+                    "llama.cpp chat response parser failed with status {status}"
+                ));
+            }
+            let parsed = unsafe { std::ffi::CStr::from_ptr(output) }
+                .to_str()?
+                .to_string();
+            unsafe { llama_cpp_sys_2::llama_rs_string_free(output) };
+            return Ok(parsed);
+        }
+
         Ok(text.to_string())
     }
 
@@ -345,6 +610,60 @@ impl Runtime {
         self.generate_inner(prompt, options, on_token)
     }
 
+    pub fn generate_chat_with_callback_output(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+        template: &AppliedChatTemplate,
+        mut on_delta: Box<dyn FnMut(&str) -> bool + Send>,
+    ) -> Result<GenerateOutput> {
+        let mut parser = if template.generation_prompt.len() > 0 || template.parse_tool_calls {
+            Some(CompatStreamParser::new(template)?)
+        } else {
+            None
+        };
+        let mut parser_error = None;
+
+        let output = self.generate_inner(prompt, options, |piece| {
+            if let Some(parser) = parser.as_mut() {
+                match parser.update(piece, true) {
+                    Ok(deltas) => {
+                        for delta in deltas {
+                            if !on_delta(&delta) {
+                                return false;
+                            }
+                        }
+                        true
+                    }
+                    Err(error) => {
+                        parser_error = Some(anyhow::anyhow!(
+                            "Failed to parse streamed chat response: {error}"
+                        ));
+                        false
+                    }
+                }
+            } else {
+                let delta = serde_json::json!({"content": piece}).to_string();
+                on_delta(&delta)
+            }
+        });
+
+        if let Some(error) = parser_error {
+            return Err(error);
+        }
+        let output = output?;
+
+        if let Some(parser) = parser.as_mut() {
+            for delta in parser.update("", false)? {
+                if !on_delta(&delta) {
+                    break;
+                }
+            }
+        }
+
+        Ok(output)
+    }
+
     fn generate_inner<F>(
         &mut self,
         prompt: &str,
@@ -363,16 +682,35 @@ impl Runtime {
         if n_prompt == 0 {
             anyhow::bail!("prompt tokenized to zero tokens");
         }
+        if n_prompt >= self.context.n_ctx() as usize {
+            anyhow::bail!(
+                "prompt has {n_prompt} tokens but the configured context is {}",
+                self.context.n_ctx()
+            );
+        }
 
         self.context.clear_kv_cache();
 
-        // Prefill: process all prompt tokens
-        let mut batch = LlamaBatch::new(n_prompt, 1);
-        for (i, &token_id) in prompt_tokens.iter().enumerate() {
-            let is_last = i == n_prompt - 1;
-            batch.add(LlamaToken(token_id), i as i32, &[0], is_last)?;
+        // Prefill in batches no larger than llama.cpp's configured logical
+        // batch size. OhMyPi's system prompt can exceed the default batch
+        // size even when the overall context still fits.
+        let prefill_batch_size = self.context.n_batch().max(1) as usize;
+        let final_prefill_batch_len = n_prompt % prefill_batch_size;
+        let final_output_index = if final_prefill_batch_len == 0 {
+            prefill_batch_size - 1
+        } else {
+            final_prefill_batch_len - 1
+        };
+        for (offset, tokens) in prompt_tokens.chunks(prefill_batch_size).enumerate() {
+            let offset = offset * prefill_batch_size;
+            let mut batch = LlamaBatch::new(tokens.len(), 1);
+            for (index, &token_id) in tokens.iter().enumerate() {
+                let position = offset + index;
+                let is_last = position == n_prompt - 1;
+                batch.add(LlamaToken(token_id), position as i32, &[0], is_last)?;
+            }
+            self.context.decode(&mut batch)?;
         }
-        self.context.decode(&mut batch)?;
 
         let ttft = start.elapsed().as_secs_f64();
 
@@ -395,7 +733,7 @@ impl Runtime {
         let mut token_decoder = encoding_rs::UTF_8.new_decoder();
 
         // Sample first token from prefill logits
-        let mut current_token = sampler.sample(self.context(), n_prompt as i32 - 1);
+        let mut current_token = sampler.sample(self.context(), final_output_index as i32);
         sampler.accept(current_token);
 
         if self.is_eog(current_token.0) {
@@ -715,6 +1053,10 @@ mod tests {
                 ChatMessage {
                     role: "tool".to_string(),
                     content: "ignored".to_string(),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                    tool_call_id: None,
+                    name: None,
                 },
             ],
         );
@@ -829,6 +1171,52 @@ mod tests {
 
         assert!(prompt.contains("Hello"));
         assert!(!prompt.trim().is_empty());
+    }
+
+    #[test]
+    fn test_apply_openai_chat_template_with_tools_and_thinking() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping OpenAI chat template test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let runtime = match Runtime::new(
+            &model_path,
+            LlamaCppConfig {
+                n_ctx: Some(2048),
+                n_gpu_layers: Some(0),
+                ..Default::default()
+            },
+        ) {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("Skipping OpenAI chat template test: {error}");
+                return;
+            }
+        };
+        let messages = vec![ChatMessage::user("Use the lookup tool")];
+        let options = ChatTemplateOptions {
+            enable_thinking: true,
+            reasoning_format: Some("deepseek".to_string()),
+            tools_json: Some(
+                r#"[{"type":"function","function":{"name":"lookup","description":"Look up a value","parameters":{"type":"object","properties":{"key":{"type":"string"}}}}}]"#
+                    .to_string(),
+            ),
+            tool_choice: Some("required".to_string()),
+            parallel_tool_calls: false,
+            chat_template_kwargs: None,
+            parse_tool_calls: true,
+        };
+
+        let template = runtime
+            .apply_chat_template_with_options(&messages, &options)
+            .expect("OpenAI-compatible template should render");
+        assert!(template.prompt.contains("lookup"));
+        assert!(template.generation_prompt.len() > 0);
+        assert!(template.parse_tool_calls);
     }
 
     #[test]

@@ -7,3 +7,4 @@ description = "Backend trait for model inference backends"
 [dependencies]
 anyhow.workspace = true
 serde = { workspace = true }
+serde_json.workspace = true

@@ -196,7 +196,14 @@ mod tests {
     fn test_gemma_template_with_system() {
         let tmpl = ChatTemplate::default_for_architecture(Some("Gemma3ForCausalLM"));
         let messages = vec![
-            ChatMessage { role: "system".to_string(), content: "You are helpful.".to_string() },
+            ChatMessage {
+                role: "system".to_string(),
+                content: "You are helpful.".to_string(),
+                reasoning_content: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                name: None,
+            },
             ChatMessage::user("Hello"),
         ];
         let rendered = tmpl.render(&messages).unwrap();

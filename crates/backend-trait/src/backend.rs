@@ -66,6 +66,23 @@ pub trait Backend: Send {
         on_token: Box<dyn FnMut(&str) -> bool + Send>,
     ) -> Result<GenerateOutput>;
 
+    fn generate_chat_stream_output(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+        _template: &AppliedChatTemplate,
+        mut on_delta: Box<dyn FnMut(&str) -> bool + Send>,
+    ) -> Result<GenerateOutput> {
+        self.generate_stream_output(
+            prompt,
+            options,
+            Box::new(move |piece| {
+                let delta = serde_json::json!({"content": piece}).to_string();
+                on_delta(&delta)
+            }),
+        )
+    }
+
     fn embed(&mut self, text: &str) -> Result<EmbeddingOutput>;
 
     fn memory_info(&self) -> Option<String> {

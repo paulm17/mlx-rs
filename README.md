@@ -90,9 +90,18 @@ curl http://localhost:8080/v1/embeddings \
 
 Requires `embedding = true` in config.
 
+Chat completions accept OpenAI text content arrays as well as string content.
+For llama.cpp/GGUF models, reasoning requests use `reasoning_effort` values
+`low`, `medium`, or `xhigh`; the server returns `reasoning_content` and
+supports OpenAI `tools`, `tool_choice`, tool-result messages, and streaming
+tool/reasoning deltas. The supported `tool_choice` modes are `auto`, `none`,
+and `required`; function-specific choice objects are not supported. The
+current MLX backend remains text-only for tools.
+
 Model discovery returns the configured or dynamically loaded model. Start the
 server with `--model <path>` or set `model_path` in `config.toml`; otherwise
-both model-list endpoints return an empty `data` array.
+both `/models` and `/v1/models` return an empty `data` array. These are
+single-model discovery endpoints; the server does not scan a model directory.
 
 ## Configuration
 
@@ -107,7 +116,7 @@ model_path = "/path/to/model.gguf"
 # rate_limit_rpm = 120
 
 # llama.cpp engine options
-n_ctx = 4096
+n_ctx = 32768
 n_batch = 512
 n_ubatch = 512
 n_gpu_layers = 99       # Metal/GPU offloading

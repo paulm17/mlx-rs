@@ -85,6 +85,7 @@ fn main() -> Result<()> {
                 &messages,
                 &ChatTemplateOptions {
                     enable_thinking: args.think,
+                    ..Default::default()
                 },
             )
             .ok()

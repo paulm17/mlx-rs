@@ -106,6 +106,17 @@ impl Backend for LlamaCppBackend {
             .generate_with_callback_output(prompt, options, move |piece| on_token(piece))
     }
 
+    fn generate_chat_stream_output(
+        &mut self,
+        prompt: &str,
+        options: &GenerationOptions,
+        template: &AppliedChatTemplate,
+        on_delta: Box<dyn FnMut(&str) -> bool + Send>,
+    ) -> Result<GenerateOutput> {
+        self.runtime
+            .generate_chat_with_callback_output(prompt, options, template, on_delta)
+    }
+
     fn embed(&mut self, text: &str) -> Result<EmbeddingOutput> {
         let embedding = self.runtime.embed(text)?;
 

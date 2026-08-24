@@ -9,6 +9,7 @@ use axum::response::{IntoResponse, Response, Sse};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_stream::StreamExt;
@@ -16,7 +17,9 @@ use tokio_stream::StreamExt;
 use crate::backend::Backend;
 use crate::config::{LlamaCppConfig, MlxConfig};
 use crate::registry;
-use crate::types::{ChatMessage, GenerationOptions, StopReason};
+use crate::types::{
+    ChatMessage, ChatTemplateOptions, ChatToolCall, GenerationOptions, StopReason,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
@@ -220,6 +223,30 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(default)]
     stop: Option<Vec<String>>,
+    #[serde(default)]
+    tools: Option<Vec<Value>>,
+    #[serde(default)]
+    tool_choice: Option<Value>,
+    #[serde(default = "default_parallel_tool_calls")]
+    parallel_tool_calls: bool,
+    #[serde(default)]
+    reasoning_effort: Option<String>,
+    #[serde(default)]
+    enable_thinking: Option<bool>,
+    #[serde(default)]
+    chat_template_kwargs: Option<Value>,
+    #[serde(default)]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct StreamOptions {
+    #[serde(default)]
+    include_usage: bool,
+}
+
+fn default_parallel_tool_calls() -> bool {
+    true
 }
 
 fn default_temperature() -> f32 {
@@ -228,6 +255,170 @@ fn default_temperature() -> f32 {
 
 fn default_top_p() -> f32 {
     0.9
+}
+
+fn build_chat_template_options(
+    req: &ChatCompletionRequest,
+    config: &ServerConfig,
+) -> std::result::Result<ChatTemplateOptions, String> {
+    if let Some(effort) = &req.reasoning_effort {
+        if !matches!(effort.as_str(), "low" | "medium" | "xhigh") {
+            return Err(format!(
+                "unsupported reasoning_effort {effort:?}; supported efforts are low, medium, xhigh"
+            ));
+        }
+    }
+
+    let tools_json = req
+        .tools
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| format!("invalid tools: {e}"))?;
+    let tool_choice = req
+        .tool_choice
+        .as_ref()
+        .map(|choice| match choice {
+            Value::String(value) => Ok(value.clone()),
+            Value::Object(_) => Err(
+                "function-specific tool_choice objects are unsupported; use auto, none, or required"
+                    .to_string(),
+            ),
+            _ => Err("tool_choice must be auto, none, or required".to_string()),
+        })
+        .transpose()?;
+    let chat_template_kwargs = req
+        .chat_template_kwargs
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()
+        .map_err(|e| format!("invalid chat_template_kwargs: {e}"))?;
+
+    Ok(ChatTemplateOptions {
+        enable_thinking: req
+            .enable_thinking
+            .unwrap_or_else(|| req.reasoning_effort.is_some() || config.thinking.unwrap_or(false)),
+        reasoning_format: Some("deepseek".to_string()),
+        tools_json,
+        tool_choice,
+        parallel_tool_calls: req.parallel_tool_calls,
+        chat_template_kwargs,
+        // The llama.cpp OpenAI parser also removes model-specific assistant
+        // prefixes and extracts reasoning; it is needed for ordinary chat,
+        // not only requests that include tools.
+        parse_tool_calls: true,
+    })
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ParsedAssistantMessage {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Vec<Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ParsedStreamDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    #[serde(alias = "reasoning")]
+    reasoning_content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<Value>>,
+}
+
+fn parse_assistant_message(
+    rt: &dyn Backend,
+    template: &crate::types::AppliedChatTemplate,
+    generated: &str,
+) -> std::result::Result<ParsedAssistantMessage, String> {
+    let parsed = rt
+        .parse_chat_response(template, generated, false)
+        .map_err(|e| e.to_string())?;
+    let mut message = match serde_json::from_str::<ParsedAssistantMessage>(&parsed) {
+        Ok(message) => message,
+        Err(_) => ParsedAssistantMessage {
+            content: Some(parsed),
+            ..Default::default()
+        },
+    };
+
+    // Some Qwen templates emit an OpenAI-shaped assistant object as the
+    // generated text. Unwrap that object so the HTTP response does not
+    // expose the model's transport envelope as ordinary assistant content.
+    if message.tool_calls.is_empty() {
+        if let Some(content) = message.content.as_deref() {
+            if let Ok(nested) = serde_json::from_str::<ParsedAssistantMessage>(content) {
+                if !nested.tool_calls.is_empty() || nested.reasoning_content.is_some() {
+                    message = nested;
+                }
+            }
+        }
+    }
+
+    Ok(message)
+}
+
+fn normalized_tool_calls(values: Vec<Value>) -> Vec<ChatToolCall> {
+    values
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, value)| {
+            let object = value.as_object()?;
+            let function = object.get("function").and_then(Value::as_object)?;
+            let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
+            let arguments = function
+                .get("arguments")
+                .map(|arguments| match arguments {
+                    Value::String(value) => value.clone(),
+                    value => value.to_string(),
+                })
+                .unwrap_or_default();
+            Some(ChatToolCall {
+                id: object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("call_{index}")),
+                kind: object
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or("function")
+                    .to_string(),
+                function: crate::types::ChatToolFunction {
+                    name: name.to_string(),
+                    arguments,
+                },
+            })
+        })
+        .collect()
+}
+
+fn normalized_stream_tool_calls(values: Vec<Value>) -> Vec<Value> {
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, mut value)| {
+            if let Some(object) = value.as_object_mut() {
+                if object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .is_none_or(str::is_empty)
+                {
+                    object.insert("id".to_string(), Value::String(format!("call_{index}")));
+                }
+                object
+                    .entry("type".to_string())
+                    .or_insert_with(|| Value::String("function".to_string()));
+            }
+            value
+        })
+        .collect()
 }
 
 #[derive(Serialize)]
@@ -243,8 +434,18 @@ struct ChatCompletionResponse {
 #[derive(Serialize)]
 struct ChatChoice {
     index: usize,
-    message: ChatMessage,
+    message: AssistantMessage,
     finish_reason: Option<String>,
+}
+
+#[derive(Serialize)]
+struct AssistantMessage {
+    role: String,
+    content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    tool_calls: Vec<ChatToolCall>,
 }
 
 #[derive(Serialize)]
@@ -276,6 +477,10 @@ struct ChatChunkChoice {
 struct ChatDelta {
     role: Option<String>,
     content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<Value>>,
 }
 
 #[derive(Serialize)]
@@ -448,6 +653,12 @@ async fn chat_completions_handler(
         }
     }
 
+    let template_options = build_chat_template_options(&req, &state.config).map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error }),
+        )
+    })?;
     let options = GenerationOptions {
         max_tokens: req.max_tokens,
         temperature: req.temperature,
@@ -462,6 +673,12 @@ async fn chat_completions_handler(
         let model = req.model.clone();
         let messages = req.messages.clone();
         let options = options.clone();
+        let template_options = template_options.clone();
+        let include_usage = req
+            .stream_options
+            .as_ref()
+            .map(|options| options.include_usage)
+            .unwrap_or(true);
 
         tokio::task::spawn_blocking(move || {
             let mut runtime = state.runtime.lock().unwrap();
@@ -473,13 +690,14 @@ async fn chat_completions_handler(
                 }
             };
 
-            let prompt = match rt.apply_chat_template(&messages) {
+            let template = match rt.apply_chat_template_with_options(&messages, &template_options) {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.blocking_send(Err(format!("Template error: {}", e)));
                     return;
                 }
             };
+            let prompt = template.prompt.clone();
 
             let chunk_id = format!("chatcmpl-{}", uuid_simple());
             let created = now_secs();
@@ -495,6 +713,8 @@ async fn chat_completions_handler(
                     delta: ChatDelta {
                         role: Some("assistant".to_string()),
                         content: None,
+                        reasoning_content: None,
+                        tool_calls: None,
                     },
                     finish_reason: None,
                 }],
@@ -507,30 +727,57 @@ async fn chat_completions_handler(
             let stream_chunk_id = chunk_id.clone();
             let stream_model = model.clone();
             let stream_tx = tx.clone();
-            let result = rt.generate_stream_output(&prompt, &options, Box::new(move |piece| {
-                let chunk = ChatCompletionChunk {
-                    id: stream_chunk_id.clone(),
-                    object: "chat.completion.chunk".to_string(),
-                    created,
-                    model: stream_model.clone(),
-                    choices: vec![ChatChunkChoice {
-                        index: 0,
-                        delta: ChatDelta {
-                            role: None,
-                            content: Some(piece.to_string()),
-                        },
-                        finish_reason: None,
-                    }],
-                    usage: None,
-                };
-                send_sse_data(&stream_tx, &chunk).is_ok()
-            }));
+            let saw_tool_calls = Arc::new(Mutex::new(false));
+            let saw_tool_calls_for_stream = saw_tool_calls.clone();
+            let result = rt.generate_chat_stream_output(
+                &prompt,
+                &options,
+                &template,
+                Box::new(move |delta_json| {
+                    let delta = match serde_json::from_str::<ParsedStreamDelta>(delta_json) {
+                        Ok(delta) => delta,
+                        Err(error) => {
+                            let _ = stream_tx.blocking_send(Err(format!(
+                                "Failed to decode streamed chat delta: {error}"
+                            )));
+                            return false;
+                        }
+                    };
+                    if delta.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+                        *saw_tool_calls_for_stream.lock().unwrap() = true;
+                    }
+                    let tool_calls = delta.tool_calls.map(normalized_stream_tool_calls);
+                    let chunk = ChatCompletionChunk {
+                        id: stream_chunk_id.clone(),
+                        object: "chat.completion.chunk".to_string(),
+                        created,
+                        model: stream_model.clone(),
+                        choices: vec![ChatChunkChoice {
+                            index: 0,
+                            delta: ChatDelta {
+                                role: None,
+                                content: delta.content,
+                                reasoning_content: delta.reasoning_content,
+                                tool_calls,
+                            },
+                            finish_reason: None,
+                        }],
+                        usage: None,
+                    };
+                    send_sse_data(&stream_tx, &chunk).is_ok()
+                }),
+            );
 
             // Drop the runtime lock before sending final messages
             drop(runtime);
 
             match result {
                 Ok(output) => {
+                    let finish_reason = if *saw_tool_calls.lock().unwrap() {
+                        "tool_calls"
+                    } else {
+                        finish_reason_for_stop(&output.stop_reason)
+                    };
                     let final_chunk = ChatCompletionChunk {
                         id: chunk_id.clone(),
                         object: "chat.completion.chunk".to_string(),
@@ -541,12 +788,12 @@ async fn chat_completions_handler(
                             delta: ChatDelta {
                                 role: None,
                                 content: None,
+                                reasoning_content: None,
+                                tool_calls: None,
                             },
-                            finish_reason: Some(
-                                finish_reason_for_stop(&output.stop_reason).to_string(),
-                            ),
+                            finish_reason: Some(finish_reason.to_string()),
                         }],
-                        usage: Some(ChatUsage {
+                        usage: include_usage.then_some(ChatUsage {
                             prompt_tokens: output.metrics.prompt_tokens,
                             completion_tokens: output.metrics.generated_tokens,
                             total_tokens: output.metrics.total_tokens,
@@ -563,8 +810,16 @@ async fn chat_completions_handler(
 
         let stream = ReceiverStream::new(rx);
         Ok(Sse::new(stream.map(|item| match item {
-            Ok(data) => Ok(axum::response::sse::Event::default().data(data)),
-            Err(e) => Err(axum::Error::new(e)),
+            Ok(data) => Ok::<_, axum::Error>(axum::response::sse::Event::default().data(data)),
+            Err(e) => Ok::<_, axum::Error>(axum::response::sse::Event::default().data(
+                serde_json::json!({
+                    "error": {
+                        "message": e,
+                        "type": "server_error"
+                    }
+                })
+                .to_string(),
+            )),
         }))
         .into_response())
     } else {
@@ -581,7 +836,9 @@ async fn chat_completions_handler(
             }
         };
 
-        let prompt = rt.apply_chat_template(&req.messages).map_err(|e| {
+        let template = rt
+            .apply_chat_template_with_options(&req.messages, &template_options)
+            .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -590,7 +847,7 @@ async fn chat_completions_handler(
             )
         })?;
 
-        let output = rt.generate(&prompt, &options).map_err(|e| {
+        let output = rt.generate(&template.prompt, &options).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -598,6 +855,18 @@ async fn chat_completions_handler(
                 }),
             )
         })?;
+        let parsed = parse_assistant_message(&**rt, &template, &output.text).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error }),
+            )
+        })?;
+        let tool_calls = normalized_tool_calls(parsed.tool_calls);
+        let finish_reason = if tool_calls.is_empty() {
+            finish_reason_for_stop(&output.stop_reason)
+        } else {
+            "tool_calls"
+        };
 
         let response = ChatCompletionResponse {
             id: format!("chatcmpl-{}", uuid_simple()),
@@ -606,11 +875,13 @@ async fn chat_completions_handler(
             model: req.model,
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage {
+                message: AssistantMessage {
                     role: "assistant".to_string(),
-                    content: output.text,
+                    content: parsed.content,
+                    reasoning_content: parsed.reasoning_content,
+                    tool_calls,
                 },
-                finish_reason: Some(finish_reason_for_stop(&output.stop_reason).to_string()),
+                finish_reason: Some(finish_reason.to_string()),
             }],
             usage: ChatUsage {
                 prompt_tokens: output.metrics.prompt_tokens,
@@ -1190,6 +1461,13 @@ n_gpu_layers = 99
                 top_p: 1.0,
                 stream: false,
                 stop: None,
+                tools: None,
+                tool_choice: None,
+                parallel_tool_calls: true,
+                reasoning_effort: None,
+                enable_thinking: None,
+                chat_template_kwargs: None,
+                stream_options: None,
             }),
         )
         .await
@@ -1319,7 +1597,12 @@ n_gpu_layers = 99
             model: "local".to_string(),
             choices: vec![ChatChoice {
                 index: 0,
-                message: ChatMessage::assistant("hello"),
+                message: AssistantMessage {
+                    role: "assistant".to_string(),
+                    content: Some("hello".to_string()),
+                    reasoning_content: None,
+                    tool_calls: Vec::new(),
+                },
                 finish_reason: Some(finish_reason_for_stop(&StopReason::MaxTokens).to_string()),
             }],
             usage: ChatUsage {
@@ -1351,6 +1634,8 @@ n_gpu_layers = 99
                 delta: ChatDelta {
                     role: Some("assistant".to_string()),
                     content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -1366,6 +1651,8 @@ n_gpu_layers = 99
                 delta: ChatDelta {
                     role: None,
                     content: Some("hello".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -1381,6 +1668,8 @@ n_gpu_layers = 99
                 delta: ChatDelta {
                     role: None,
                     content: None,
+                    reasoning_content: None,
+                    tool_calls: None,
                 },
                 finish_reason: Some("length".to_string()),
             }],
@@ -1420,6 +1709,8 @@ n_gpu_layers = 99
                 delta: ChatDelta {
                     role: None,
                     content: Some("hello".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -1442,6 +1733,8 @@ n_gpu_layers = 99
                 delta: ChatDelta {
                     role: None,
                     content: Some("hello".to_string()),
+                    reasoning_content: None,
+                    tool_calls: None,
                 },
                 finish_reason: None,
             }],
@@ -1473,6 +1766,93 @@ n_gpu_layers = 99
             EmbeddingInput::Multiple(v) => assert_eq!(v, vec!["hello", "world"]),
             _ => panic!("Expected Multiple"),
         }
+    }
+
+    #[test]
+    fn test_chat_message_accepts_openai_text_parts() {
+        let message: ChatMessage = serde_json::from_str(
+            r#"{"role":"user","content":[{"type":"text","text":"hello"},{"type":"text","text":" world"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(message.role, "user");
+        assert_eq!(message.content, "hello world");
+    }
+
+    #[test]
+    fn test_chat_message_rejects_non_text_parts() {
+        let error = serde_json::from_str::<ChatMessage>(
+            r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"x"}}]}"#,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("only text parts are supported"));
+    }
+
+    #[test]
+    fn test_ohmypi_shaped_message_history_deserializes() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "model":"local",
+                "messages":[
+                    {"role":"user","content":[{"type":"text","text":"Find the weather"}]},
+                    {"role":"assistant","content":null,"reasoning_content":"I should use lookup.","tool_calls":[{"id":"call_0","type":"function","function":{"name":"lookup","arguments":"{\"key\":\"weather\"}"}}]},
+                    {"role":"tool","tool_call_id":"call_0","name":"lookup","content":"Sunny"}
+                ],
+                "reasoning_effort":"xhigh",
+                "enable_thinking":true,
+                "chat_template_kwargs":{"enable_thinking":true},
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                "tool_choice":"auto",
+                "parallel_tool_calls":false,
+                "stream_options":{"include_usage":true}
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(request.messages.len(), 3);
+        assert_eq!(request.messages[0].content, "Find the weather");
+        assert_eq!(request.messages[1].content, "");
+        assert_eq!(request.messages[1].reasoning_content.as_deref(), Some("I should use lookup."));
+        assert_eq!(request.messages[1].tool_calls[0].id, "call_0");
+        assert_eq!(request.messages[2].tool_call_id.as_deref(), Some("call_0"));
+        assert_eq!(request.messages[2].name.as_deref(), Some("lookup"));
+
+        let options = build_chat_template_options(&request, &ServerConfig::default()).unwrap();
+        assert!(options.enable_thinking);
+        assert!(!options.parallel_tool_calls);
+        assert!(options.chat_template_kwargs.is_some());
+    }
+
+    #[test]
+    fn test_chat_template_options_match_ohmypi_reasoning_levels() {
+        let request: ChatCompletionRequest = serde_json::from_str(
+            r#"{
+                "model":"local",
+                "messages":[{"role":"user","content":"hello"}],
+                "reasoning_effort":"medium",
+                "tools":[{"type":"function","function":{"name":"lookup","parameters":{"type":"object"}}}],
+                "tool_choice":"required",
+                "stream_options":{"include_usage":true}
+            }"#,
+        )
+        .unwrap();
+        let options = build_chat_template_options(&request, &ServerConfig::default()).unwrap();
+        assert!(options.enable_thinking);
+        assert!(options.parse_tool_calls);
+        assert_eq!(options.tool_choice.as_deref(), Some("required"));
+
+        let invalid: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"local","messages":[],"reasoning_effort":"high"}"#,
+        )
+        .unwrap();
+        let error = build_chat_template_options(&invalid, &ServerConfig::default()).unwrap_err();
+        assert!(error.contains("supported efforts are low, medium, xhigh"));
+
+        let function_choice: ChatCompletionRequest = serde_json::from_str(
+            r#"{"model":"local","messages":[],"tool_choice":{"type":"function","function":{"name":"lookup"}}}"#,
+        )
+        .unwrap();
+        let error = build_chat_template_options(&function_choice, &ServerConfig::default()).unwrap_err();
+        assert!(error.contains("function-specific tool_choice objects are unsupported"));
     }
 
     #[test]
