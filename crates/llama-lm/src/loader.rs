@@ -149,7 +149,7 @@ fn cached_default_hf_gguf(repo_id: &str) -> Result<Option<PathBuf>> {
         .filter(|path| {
             path.file_name()
                 .and_then(|name| name.to_str())
-                .map(|name| name.contains(DEFAULT_GGUF_QUANT))
+                .map(filename_contains_default_quant)
                 .unwrap_or(false)
         })
         .collect::<Vec<_>>();
@@ -186,19 +186,52 @@ fn resolve_default_hf_gguf_filename(repo_id: &str) -> Result<String> {
     let repo = api.model(repo_id.to_string());
 
     match default_hf_gguf_filename_from_repo(&repo) {
-        Ok(filename) => Ok(filename),
-        Err(repo_error) => infer_default_hf_gguf_filename(repo_id).ok_or(repo_error),
+        HfGgufFilenameResolution::Selected(filename) => Ok(filename),
+        HfGgufFilenameResolution::NoDefaultQuant { gguf_files } => {
+            let available = if gguf_files.is_empty() {
+                "no .gguf files".to_string()
+            } else {
+                gguf_files.join(", ")
+            };
+            bail!(
+                "no *{DEFAULT_GGUF_QUANT}*.gguf file found in Hugging Face repo {repo_id}; available GGUF files: {available}"
+            )
+        }
+        HfGgufFilenameResolution::RepoQueryFailed(error) => {
+            infer_default_hf_gguf_filename(repo_id).ok_or(error)
+        }
     }
 }
 
-fn default_hf_gguf_filename_from_repo(repo: &ApiRepo) -> Result<String> {
-    let info = repo
-        .info()
-        .map_err(|e| anyhow::anyhow!("failed to query Hugging Face repo: {e}"))?;
+enum HfGgufFilenameResolution {
+    Selected(String),
+    NoDefaultQuant { gguf_files: Vec<String> },
+    RepoQueryFailed(anyhow::Error),
+}
 
-    select_default_hf_gguf_filename(info.siblings.iter().map(|s| s.rfilename.as_str())).ok_or_else(
-        || anyhow::anyhow!("no *{DEFAULT_GGUF_QUANT}*.gguf file found in Hugging Face repo"),
-    )
+fn default_hf_gguf_filename_from_repo(repo: &ApiRepo) -> HfGgufFilenameResolution {
+    let info = match repo.info() {
+        Ok(info) => info,
+        Err(e) => {
+            return HfGgufFilenameResolution::RepoQueryFailed(anyhow::anyhow!(
+                "failed to query Hugging Face repo: {e}"
+            ));
+        }
+    };
+
+    let filenames = info
+        .siblings
+        .iter()
+        .map(|s| s.rfilename.as_str())
+        .collect::<Vec<_>>();
+
+    if let Some(filename) = select_default_hf_gguf_filename(filenames.iter().copied()) {
+        return HfGgufFilenameResolution::Selected(filename);
+    }
+
+    HfGgufFilenameResolution::NoDefaultQuant {
+        gguf_files: gguf_filenames(filenames),
+    }
 }
 
 fn select_default_hf_gguf_filename<'a>(
@@ -206,17 +239,36 @@ fn select_default_hf_gguf_filename<'a>(
 ) -> Option<String> {
     let mut matches = filenames
         .into_iter()
-        .filter(|filename| filename.ends_with(".gguf") && filename.contains(DEFAULT_GGUF_QUANT))
+        .filter(|filename| filename.ends_with(".gguf") && filename_contains_default_quant(filename))
         .map(ToOwned::to_owned)
         .collect::<Vec<_>>();
     matches.sort();
     matches.into_iter().next()
 }
 
+fn filename_contains_default_quant(filename: &str) -> bool {
+    filename
+        .to_ascii_lowercase()
+        .contains(&DEFAULT_GGUF_QUANT.to_ascii_lowercase())
+}
+
+fn gguf_filenames<'a>(filenames: impl IntoIterator<Item = &'a str>) -> Vec<String> {
+    let mut gguf_files = filenames
+        .into_iter()
+        .filter(|filename| filename.ends_with(".gguf"))
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    gguf_files.sort();
+    gguf_files
+}
+
 fn infer_default_hf_gguf_filename(repo_id: &str) -> Option<String> {
     let repo_name = repo_id.rsplit('/').next()?;
     let model_name = repo_name.strip_suffix("-GGUF").unwrap_or(repo_name);
-    Some(format!("{model_name}-{DEFAULT_GGUF_QUANT}.gguf"))
+    Some(format!(
+        "{model_name}-{}.gguf",
+        DEFAULT_GGUF_QUANT.to_ascii_lowercase()
+    ))
 }
 
 fn hf_cache_root() -> Result<PathBuf> {
@@ -645,10 +697,29 @@ mod tests {
     }
 
     #[test]
+    fn test_select_default_hf_gguf_filename_matches_lowercase_quant() {
+        let filename = select_default_hf_gguf_filename([
+            "model-q8_0.gguf",
+            "gemma-4-31B-it-q4_k_m.gguf",
+            "model-q4_0.gguf",
+        ])
+        .unwrap();
+
+        assert_eq!(filename, "gemma-4-31B-it-q4_k_m.gguf");
+    }
+
+    #[test]
+    fn test_gguf_filenames_returns_sorted_choices() {
+        let filenames = gguf_filenames(["README.md", "z.gguf", "nested/a.gguf", "model.bin"]);
+
+        assert_eq!(filenames, ["nested/a.gguf", "z.gguf"]);
+    }
+
+    #[test]
     fn test_infer_default_hf_gguf_filename() {
         assert_eq!(
             infer_default_hf_gguf_filename("unsloth/gemma-4-E4B-it-GGUF"),
-            Some("gemma-4-E4B-it-Q4_K_M.gguf".to_string())
+            Some("gemma-4-E4B-it-q4_k_m.gguf".to_string())
         );
     }
 
