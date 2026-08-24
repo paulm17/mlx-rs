@@ -630,6 +630,28 @@ fn parse_gemma_channel_response(text: &str) -> Option<String> {
 }
 
 #[cfg(test)]
+fn extract_chat_content(text: &str) -> Option<String> {
+    let value: serde_json::Value = serde_json::from_str(text).ok()?;
+    let content = value.get("content")?;
+
+    if let Some(content) = content.as_str() {
+        return Some(content.to_string());
+    }
+
+    let parts = content.as_array()?;
+    let mut result = String::new();
+    let mut found_text = false;
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+            result.push_str(text);
+            found_text = true;
+        }
+    }
+
+    found_text.then_some(result)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::types::ChatMessage;

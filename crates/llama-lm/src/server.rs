@@ -346,7 +346,7 @@ struct EmbeddingUsageResponse {
     total_tokens: usize,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 struct ErrorResponse {
     error: String,
 }
@@ -378,6 +378,17 @@ async fn models_handler(State(state): State<Arc<ServerState>>) -> Json<ModelList
         object: "list".to_string(),
         data,
     })
+}
+
+fn build_app(state: Arc<ServerState>) -> Router {
+    Router::new()
+        .route("/health", get(health_handler))
+        .route("/models", get(models_handler))
+        .route("/v1/models", get(models_handler))
+        .route("/llm/load", post(load_handler))
+        .route("/v1/chat/completions", post(chat_completions_handler))
+        .route("/v1/embeddings", post(embeddings_handler))
+        .with_state(state)
 }
 
 async fn load_handler(
@@ -836,13 +847,7 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         }
     }
 
-    let app = Router::new()
-        .route("/health", get(health_handler))
-        .route("/v1/models", get(models_handler))
-        .route("/llm/load", post(load_handler))
-        .route("/v1/chat/completions", post(chat_completions_handler))
-        .route("/v1/embeddings", post(embeddings_handler))
-        .with_state(state);
+    let app = build_app(state);
 
     let bind = config.bind.as_deref().unwrap_or("127.0.0.1");
     let port = config.port.unwrap_or(8080);
@@ -1108,6 +1113,39 @@ n_gpu_layers = 99
     }
 
     #[tokio::test]
+    async fn test_models_routes_return_empty_list_before_load() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(None),
+            config: ServerConfig::default(),
+            api_key: None,
+            rate_limiter: None,
+        });
+
+        let response = build_app(state.clone())
+            .oneshot(Request::get("/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let models_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let response = build_app(state)
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let v1_models_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        assert_eq!(models_body, v1_models_body);
+        let payload: serde_json::Value = serde_json::from_slice(&models_body).unwrap();
+        assert_eq!(payload["object"], "list");
+        assert!(payload["data"].as_array().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn test_load_invalid_model_path() {
         let state = Arc::new(ServerState {
             runtime: Mutex::new(None),
@@ -1200,6 +1238,57 @@ n_gpu_layers = 99
         assert_eq!(resp.object, "list");
         assert_eq!(resp.data.len(), 1);
         assert_eq!(resp.data[0].object, "model");
+    }
+
+    #[tokio::test]
+    async fn test_models_routes_match_after_env_gated_load() {
+        use axum::body::{to_bytes, Body};
+        use axum::http::Request;
+        use tower::ServiceExt;
+
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("Skipping model route test: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(None),
+            config: ServerConfig {
+                n_ctx: Some(512),
+                n_gpu_layers: Some(0),
+                ..Default::default()
+            },
+            api_key: None,
+            rate_limiter: None,
+        });
+
+        if let Err((status, Json(error))) =
+            load_handler(State(state.clone()), Json(LoadRequest { model_path })).await
+        {
+            panic!("env-gated model should load, got {}: {}", status, error.error);
+        }
+
+        let response = build_app(state.clone())
+            .oneshot(Request::get("/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let models_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        let response = build_app(state)
+            .oneshot(Request::get("/v1/models").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let v1_models_body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+        assert_eq!(models_body, v1_models_body);
+        let payload: serde_json::Value = serde_json::from_slice(&models_body).unwrap();
+        assert_eq!(payload["object"], "list");
+        assert_eq!(payload["data"].as_array().unwrap().len(), 1);
     }
 
     #[test]

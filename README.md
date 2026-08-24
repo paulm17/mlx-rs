@@ -51,7 +51,8 @@ Hugging Face references are downloaded automatically when missing locally. Downl
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Health check |
-| `GET` | `/v1/models` | List loaded model |
+| `GET` | `/models` | List loaded model (llama.cpp discovery) |
+| `GET` | `/v1/models` | List loaded model (OpenAI-compatible) |
 | `POST` | `/llm/load` | Load a model |
 | `POST` | `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
 | `POST` | `/v1/embeddings` | Text embeddings |
@@ -88,6 +89,10 @@ curl http://localhost:8080/v1/embeddings \
 ```
 
 Requires `embedding = true` in config.
+
+Model discovery returns the configured or dynamically loaded model. Start the
+server with `--model <path>` or set `model_path` in `config.toml`; otherwise
+both model-list endpoints return an empty `data` array.
 
 ## Configuration
 

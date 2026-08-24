@@ -69,7 +69,8 @@ Any model that llama.cpp supports in GGUF format. The server does not restrict a
 | Method | Path | GGUF | safetensors | Notes |
 |--------|------|:----:|:-----------:|-------|
 | `GET` | `/health` | Yes | Yes | Returns status and model_loaded |
-| `GET` | `/v1/models` | Yes | Yes | Lists loaded model |
+| `GET` | `/models` | Yes | Yes | llama.cpp-compatible model discovery; lists the loaded model |
+| `GET` | `/v1/models` | Yes | Yes | OpenAI-compatible model list; lists the loaded model |
 | `POST` | `/llm/load` | Yes | Yes | Auto-detects format |
 | `POST` | `/v1/chat/completions` | Yes | Yes | Streaming and non-streaming |
 | `POST` | `/v1/embeddings` | Yes | No | Requires `embedding = true` |
@@ -82,3 +83,4 @@ Any model that llama.cpp supports in GGUF format. The server does not restrict a
 - **Tool / function calling** is not supported by either backend.
 - **MoE models** are not yet supported by the MLX backend.
 - **Subprocess runner** (`llama-rs-runner`) uses default MLX config; per-request MLX performance knobs are not forwarded through the runner protocol yet.
+- **Model discovery** lists only the configured or dynamically loaded model. This server does not scan a directory or implement llama.cpp router-mode model management.
