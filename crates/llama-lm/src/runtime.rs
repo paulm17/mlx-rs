@@ -10,7 +10,6 @@ use llama_cpp_2::llama_backend::LlamaBackend;
 use llama_cpp_2::llama_batch::LlamaBatch;
 use llama_cpp_2::model::params::LlamaModelParams;
 use llama_cpp_2::model::{AddBos, LlamaModel};
-use llama_cpp_2::openai::OpenAIChatTemplateParams;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::TokenToStringError;
 use llama_cpp_sys_2::llama_flash_attn_type;
@@ -288,93 +287,30 @@ impl Runtime {
     pub fn apply_chat_template_with_options(
         &self,
         messages: &[crate::types::ChatMessage],
-        options: &ChatTemplateOptions,
+        _options: &ChatTemplateOptions,
     ) -> Result<AppliedChatTemplate> {
-        let Some(template) = self.model.chat_template(None).ok() else {
-            return Ok(AppliedChatTemplate {
-                prompt: render_fallback_chat_template(None, messages),
-                additional_stops: Vec::new(),
-                parser: None,
-                generation_prompt: String::new(),
-                chat_format: 0,
-                parse_tool_calls: false,
-            });
-        };
-
-        let messages_json = serde_json::to_string(messages)?;
-        let params = OpenAIChatTemplateParams {
-            messages_json: &messages_json,
-            tools_json: None,
-            tool_choice: None,
-            json_schema: None,
-            grammar: None,
-            reasoning_format: None,
-            chat_template_kwargs: None,
-            add_generation_prompt: true,
-            use_jinja: true,
-            parallel_tool_calls: false,
-            enable_thinking: options.enable_thinking,
-            add_bos: true,
-            add_eos: false,
+        Ok(AppliedChatTemplate {
+            prompt: self.apply_chat_template(messages)?,
+            additional_stops: Vec::new(),
+            parser: None,
+            generation_prompt: String::new(),
+            chat_format: 0,
             parse_tool_calls: false,
-        };
-
-        match self.model.apply_chat_template_oaicompat(&template, &params) {
-            Ok(result) => Ok(AppliedChatTemplate {
-                prompt: result.prompt,
-                additional_stops: result.additional_stops,
-                parser: result.parser,
-                generation_prompt: result.generation_prompt,
-                chat_format: result.chat_format,
-                parse_tool_calls: result.parse_tool_calls,
-            }),
-            Err(_) => Ok(AppliedChatTemplate {
-                prompt: self.apply_chat_template(messages)?,
-                additional_stops: Vec::new(),
-                parser: None,
-                generation_prompt: String::new(),
-                chat_format: 0,
-                parse_tool_calls: false,
-            }),
-        }
+        })
     }
 
     pub fn parse_chat_response(
         &self,
         template: &AppliedChatTemplate,
         text: &str,
-        is_partial: bool,
+        _is_partial: bool,
     ) -> Result<String> {
         if let Some(parsed) = parse_gemma_channel_response(text) {
             return Ok(parsed);
         }
 
-        if template.chat_format == 0
-            && template.parser.is_none()
-            && template.generation_prompt.is_empty()
-        {
-            return Ok(text.to_string());
-        }
-
-        let parser_template = llama_cpp_2::model::ChatTemplateResult {
-            prompt: template.prompt.clone(),
-            grammar: None,
-            grammar_lazy: false,
-            grammar_triggers: Vec::new(),
-            preserved_tokens: Vec::new(),
-            additional_stops: template.additional_stops.clone(),
-            chat_format: template.chat_format,
-            parser: template.parser.clone(),
-            generation_prompt: template.generation_prompt.clone(),
-            parse_tool_calls: template.parse_tool_calls,
-        };
-
-        let parsed = parser_template
-            .parse_response_oaicompat(text, is_partial)
-            .map_err(|e| anyhow::anyhow!("Failed to parse chat response: {}", e))?;
-        extract_chat_content(&parsed)
-            .or_else(|| parse_gemma_channel_response(text))
-            .map_or_else(|| Ok(text.to_string()), Ok)
+        let _ = template;
+        Ok(text.to_string())
     }
 
     pub fn generate(
@@ -671,27 +607,6 @@ fn render_llama_chat_template(messages: &[crate::types::ChatMessage]) -> String 
     } else {
         prompt
     }
-}
-
-fn extract_chat_content(parsed_json: &str) -> Option<String> {
-    let value: serde_json::Value = serde_json::from_str(parsed_json).ok()?;
-    let content = value.get("content")?;
-
-    if let Some(text) = content.as_str() {
-        return Some(text.to_string());
-    }
-
-    content.as_array().map(|parts| {
-        parts
-            .iter()
-            .filter_map(|part| {
-                part.get("text")
-                    .and_then(|text| text.as_str())
-                    .or_else(|| part.as_str())
-            })
-            .collect::<Vec<_>>()
-            .join("")
-    })
 }
 
 fn parse_gemma_channel_response(text: &str) -> Option<String> {
