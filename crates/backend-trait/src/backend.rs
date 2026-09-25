@@ -20,6 +20,26 @@ pub trait Backend: Send {
 
     fn embeddings_enabled(&self) -> bool;
 
+    /// Maximum number of tokens the embedding implementation will submit to
+    /// its native runtime. `None` means the backend has no separately exposed
+    /// limit.
+    fn embedding_token_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Maximum total number of tokens accepted by one native embedding
+    /// microbatch. This is distinct from the per-sequence token limit.
+    fn embedding_batch_token_limit(&self) -> Option<usize> {
+        None
+    }
+
+    /// Maximum number of sequences accepted by one native embedding call.
+    /// `None` means the backend does not expose a separate sequence limit.
+    /// This is independent from the HTTP microbatch size.
+    fn embedding_sequence_limit(&self) -> Option<usize> {
+        None
+    }
+
     fn supports_chat_template(&self) -> bool {
         true
     }
@@ -84,6 +104,30 @@ pub trait Backend: Send {
     }
 
     fn embed(&mut self, text: &str) -> Result<EmbeddingOutput>;
+
+    /// Embed an ordered array of texts in one backend operation when the
+    /// implementation supports it. Backends without native microbatching use
+    /// the safe singleton fallback.
+    fn embed_batch(&mut self, texts: &[String]) -> Result<EmbeddingOutput> {
+        let mut data = Vec::with_capacity(texts.len());
+        let mut total_tokens = 0;
+        for (index, text) in texts.iter().enumerate() {
+            let output = self.embed(text)?;
+            total_tokens += output.usage.total_tokens;
+            data.extend(output.data.into_iter().map(|mut item| {
+                item.index = index;
+                item
+            }));
+        }
+        Ok(EmbeddingOutput {
+            object: "list".to_string(),
+            data,
+            usage: crate::types::EmbeddingUsage {
+                prompt_tokens: total_tokens,
+                total_tokens,
+            },
+        })
+    }
 
     fn memory_info(&self) -> Option<String> {
         None

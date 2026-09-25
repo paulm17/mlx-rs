@@ -4,16 +4,23 @@ port = 8080
 # model_path = "/path/to/model.gguf"
 # rate_limit_rpm = 120
 # api_key is loaded from .env file (HF_API_KEY)
+logging = ""
 
 # llama.cpp engine options
-# n_ctx = 32768           # context window size
-# n_batch = 512           # prompt batch size
-# n_ubatch = 512          # micro batch size
+n_ctx = 4096
+# Maximum concurrent generation sequences. Keep at 1 unless the context is
+# deliberately sized for parallel sequences (each sequence gets less context).
+n_seq_max = 1
+n_batch = 512
+n_ubatch = 512
 # n_gpu_layers = 99       # layers offloaded to GPU/Metal
 # n_threads = 4           # CPU threads for generation
 # n_threads_batch = 4     # CPU threads for batch processing
-# embedding = true        # enable embedding endpoint
-# pooling = "mean"        # pooling type: mean, cls, last, none
+embedding = true
+pooling = "cls"
+# Maximum number of input texts accepted per HTTP embedding request. This is
+# independent of n_seq_max and does not reduce generation context capacity.
+embeddings_batch_size = 32
 # use_mmap = true         # memory-map model file
 # use_mlock = false       # lock model in RAM
 # flash_attn = false      # flash attention

@@ -1,6 +1,9 @@
 use std::num::NonZeroU32;
+use std::ffi::CStr;
+use std::fs::{File, OpenOptions};
+use std::io::Write;
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
 
 use anyhow::Result;
@@ -24,6 +27,72 @@ use crate::types::{
 fn ensure_backend() -> &'static LlamaBackend {
     static BACKEND: OnceLock<LlamaBackend> = OnceLock::new();
     BACKEND.get_or_init(|| LlamaBackend::init().expect("Failed to initialize llama.cpp backend"))
+}
+
+enum NativeLogDestination {
+    Discard,
+    File(File),
+}
+
+struct NativeLogState {
+    destination: Mutex<NativeLogDestination>,
+}
+
+static NATIVE_LOG_STATE: OnceLock<NativeLogState> = OnceLock::new();
+
+unsafe extern "C" fn native_log_callback(
+    _level: llama_cpp_sys_2::ggml_log_level,
+    text: *const std::os::raw::c_char,
+    user_data: *mut std::os::raw::c_void,
+) {
+    if text.is_null() || user_data.is_null() {
+        return;
+    }
+    let state = &*(user_data as *const NativeLogState);
+    let bytes = CStr::from_ptr(text).to_bytes();
+    let Ok(mut destination) = state.destination.lock() else {
+        return;
+    };
+    if let NativeLogDestination::File(file) = &mut *destination {
+        let _ = file.write_all(bytes);
+        let _ = file.flush();
+    }
+}
+
+/// Install the process-wide native llama.cpp/GGML callback. The file is
+/// opened before the callback is installed, so an invalid destination is
+/// reported to the caller and native logs never fall back to stderr.
+pub(crate) fn configure_native_logging(filename: Option<&str>) -> Result<()> {
+    let destination = match filename.filter(|value| !value.is_empty()) {
+        Some(path) => NativeLogDestination::File(
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(path)
+                .map_err(|error| {
+                    anyhow::anyhow!("Failed to open native llama.cpp log file {path:?}: {error}")
+                })?,
+        ),
+        None => NativeLogDestination::Discard,
+    };
+
+    let state = NATIVE_LOG_STATE.get_or_init(|| NativeLogState {
+        destination: Mutex::new(NativeLogDestination::Discard),
+    });
+    *state
+        .destination
+        .lock()
+        .map_err(|_| anyhow::anyhow!("native llama.cpp log sink is poisoned"))? = destination;
+
+    let user_data = state as *const NativeLogState as *mut std::os::raw::c_void;
+    unsafe {
+        // llama_log_set also changes GGML's callback, but set both explicitly
+        // to keep this behavior stable across llama.cpp versions.
+        llama_cpp_sys_2::llama_log_set(Some(native_log_callback), user_data);
+        llama_cpp_sys_2::ggml_log_set(Some(native_log_callback), user_data);
+    }
+    Ok(())
 }
 
 #[repr(C)]
@@ -182,6 +251,13 @@ pub struct Runtime {
     model: Box<LlamaModel>,
     model_path: String,
     embeddings_enabled: bool,
+    embedding_token_limit: usize,
+    embedding_batch_token_limit: usize,
+    embedding_sequence_limit: usize,
+}
+
+fn truncate_embedding_tokens(tokens: &mut Vec<i32>, limit: usize) {
+    tokens.truncate(limit.max(1));
 }
 
 // Safety: Runtime is only used within a Mutex on a single-threaded tokio runtime.
@@ -191,6 +267,7 @@ unsafe impl Send for Runtime {}
 impl Runtime {
     pub fn new(model_path: &str, config: LlamaCppConfig) -> Result<Self> {
         let path = Path::new(model_path);
+        configure_native_logging(config.logging.as_deref())?;
         let backend = ensure_backend();
 
         // Model params
@@ -219,12 +296,15 @@ impl Runtime {
         // the no-config path large enough for a normal tool-enabled session.
         let n_ctx = config.n_ctx.unwrap_or(32768);
         ctx_params = ctx_params.with_n_ctx(NonZeroU32::new(n_ctx));
+        let n_seq_max = config.n_seq_max.unwrap_or(1).max(1);
+        ctx_params = ctx_params.with_n_seq_max(n_seq_max);
         if let Some(n_batch) = config.n_batch {
             ctx_params = ctx_params.with_n_batch(n_batch);
         }
-        if let Some(n_ubatch) = config.n_ubatch {
-            ctx_params = ctx_params.with_n_ubatch(n_ubatch);
-        }
+        let n_ubatch = config.n_ubatch.unwrap_or(512);
+        // Make the limit explicit even when the caller omitted it; the
+        // embedding path relies on this value to prevent native assertions.
+        ctx_params = ctx_params.with_n_ubatch(n_ubatch);
         if let Some(n_threads) = config.n_threads {
             ctx_params = ctx_params.with_n_threads(n_threads as i32);
         }
@@ -262,6 +342,15 @@ impl Runtime {
             model,
             model_path: model_path.to_string(),
             embeddings_enabled,
+            // llama.cpp divides n_ctx across n_seq_max sequences. Keep the
+            // per-sequence truncation limit within that capacity as well as
+            // n_ubatch; the server packer enforces the aggregate budget.
+            embedding_token_limit: (n_ctx as usize)
+                .min(n_ubatch as usize)
+                .min((n_ctx as usize) / n_seq_max as usize)
+                .max(1),
+            embedding_batch_token_limit: (n_ubatch as usize).max(1),
+            embedding_sequence_limit: n_seq_max as usize,
         })
     }
 
@@ -283,6 +372,23 @@ impl Runtime {
 
     pub fn embeddings_enabled(&self) -> bool {
         self.embeddings_enabled
+    }
+
+    /// Effective safe token limit for each sequence in an embedding decode.
+    /// llama.cpp divides context capacity across `n_seq_max`; inputs longer
+    /// than this are deterministically truncated from the right before decode.
+    pub fn embedding_token_limit(&self) -> usize {
+        self.embedding_token_limit
+    }
+
+    /// Effective aggregate token budget for one native embedding decode.
+    pub fn embedding_batch_token_limit(&self) -> usize {
+        self.embedding_batch_token_limit
+    }
+
+    /// Effective number of native sequences available to one embedding call.
+    pub fn embedding_sequence_limit(&self) -> usize {
+        self.embedding_sequence_limit
     }
 
     pub fn n_ctx_train(&self) -> u32 {
@@ -386,7 +492,8 @@ impl Runtime {
             anyhow::bail!("Embeddings not enabled for this model");
         }
 
-        let tokens = self.tokenize(text, true)?;
+        let mut tokens = self.tokenize(text, true)?;
+        truncate_embedding_tokens(&mut tokens, self.embedding_token_limit);
         let n_tokens = tokens.len();
 
         self.context.clear_kv_cache();
@@ -410,6 +517,72 @@ impl Runtime {
         } else {
             Ok(embedding.to_vec())
         }
+    }
+
+    /// Embed several independent sequences in one llama.cpp decode. The
+    /// caller must pack requests so their truncated token total fits the
+    /// effective n_ubatch limit; this method validates that invariant before
+    /// constructing the native batch and preserves input order in its result.
+    pub fn embed_batch(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        if !self.embeddings_enabled {
+            anyhow::bail!("Embeddings not enabled for this model");
+        }
+        if texts.is_empty() {
+            return Ok(Vec::new());
+        }
+        if texts.len() > self.embedding_sequence_limit {
+            anyhow::bail!(
+                "embedding microbatch has {} sequences, exceeding safe limit {}",
+                texts.len(),
+                self.embedding_sequence_limit
+            );
+        }
+
+        let mut sequences = Vec::with_capacity(texts.len());
+        let mut total_tokens = 0usize;
+        for text in texts {
+            let mut tokens = self.tokenize(text, true)?;
+            truncate_embedding_tokens(&mut tokens, self.embedding_token_limit);
+            total_tokens = total_tokens.saturating_add(tokens.len());
+            sequences.push(tokens);
+        }
+        if total_tokens > self.embedding_batch_token_limit {
+            anyhow::bail!(
+                "embedding microbatch has {} tokens, exceeding safe limit {}",
+                total_tokens,
+                self.embedding_batch_token_limit
+            );
+        }
+
+        self.context.clear_kv_cache();
+        let mut batch = LlamaBatch::new(total_tokens, texts.len() as i32);
+        for (sequence_id, tokens) in sequences.iter().enumerate() {
+            for (position, &token_id) in tokens.iter().enumerate() {
+                let is_last = position + 1 == tokens.len();
+                batch.add(
+                    LlamaToken(token_id),
+                    position as i32,
+                    &[sequence_id as i32],
+                    is_last,
+                )?;
+            }
+        }
+        self.context.decode(&mut batch)?;
+
+        let mut embeddings = Vec::with_capacity(sequences.len());
+        for sequence_id in 0..sequences.len() {
+            let embedding = self
+                .context
+                .embeddings_seq_ith(sequence_id as i32)
+                .map_err(|e| anyhow::anyhow!("Failed to get embedding {}: {}", sequence_id, e))?;
+            let norm: f32 = embedding.iter().map(|x| x * x).sum::<f32>().sqrt();
+            if norm > 0.0 {
+                embeddings.push(embedding.iter().map(|x| x / norm).collect());
+            } else {
+                embeddings.push(embedding.to_vec());
+            }
+        }
+        Ok(embeddings)
     }
 
     pub fn apply_chat_template(&self, messages: &[crate::types::ChatMessage]) -> Result<String> {
@@ -992,6 +1165,63 @@ fn extract_chat_content(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_log_callback_writes_to_file_and_discards_without_one() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        let path = temp.path().to_owned();
+        let state = NativeLogState {
+            destination: Mutex::new(NativeLogDestination::File(
+                OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap(),
+            )),
+        };
+        let text = std::ffi::CString::new("native message\\n").unwrap();
+        unsafe {
+            native_log_callback(
+                0,
+                text.as_ptr(),
+                &state as *const NativeLogState as *mut std::os::raw::c_void,
+            );
+        }
+        drop(state);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "native message\\n");
+
+        let discard = NativeLogState {
+            destination: Mutex::new(NativeLogDestination::Discard),
+        };
+        unsafe {
+            native_log_callback(
+                0,
+                text.as_ptr(),
+                &discard as *const NativeLogState as *mut std::os::raw::c_void,
+            );
+        }
+        drop(discard);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "native message\\n");
+    }
+
+    #[test]
+    fn native_log_configuration_reports_open_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("missing").join("native.log");
+        let error = configure_native_logging(path.to_str()).unwrap_err();
+        assert!(error.to_string().contains("Failed to open native llama.cpp log file"));
+    }
+
+    #[test]
+    fn embedding_token_boundary_never_exceeds_limit() {
+        let mut tokens = (0..9).collect::<Vec<i32>>();
+        truncate_embedding_tokens(&mut tokens, 4);
+        assert_eq!(tokens, vec![0, 1, 2, 3]);
+
+        let mut empty = Vec::new();
+        truncate_embedding_tokens(&mut empty, 0);
+        assert!(empty.is_empty());
+    }
     use crate::types::ChatMessage;
 
     #[test]
@@ -1271,6 +1501,42 @@ mod tests {
     }
 
     #[test]
+    fn test_embed_batch_preserves_sequence_order_with_real_model() {
+        let model_path = match std::env::var("MLX_RS_TEST_EMBED_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping real batch embedding test: MLX_RS_TEST_EMBED_GGUF not set");
+                return;
+            }
+        };
+        let mut runtime = Runtime::new(
+            &model_path,
+            LlamaCppConfig {
+                n_ctx: Some(512),
+                n_seq_max: Some(4),
+                n_ubatch: Some(512),
+                embedding: Some(true),
+                pooling: Some("cls".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("Failed to load embedding model");
+        let texts = vec!["first distinct sequence".to_string(), "second distinct sequence".to_string()];
+        let batched = runtime.embed_batch(&texts).expect("Batched embedding failed");
+        assert_eq!(batched.len(), texts.len());
+        let first = runtime.embed(&texts[0]).expect("First singleton failed");
+        let second = runtime.embed(&texts[1]).expect("Second singleton failed");
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norm_a = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (norm_a * norm_b)
+        };
+        assert!(cosine(&batched[0], &first) > 0.99, "sequence 0 output order changed");
+        assert!(cosine(&batched[1], &second) > 0.99, "sequence 1 output order changed");
+    }
+
+    #[test]
     fn test_tokenize_detokenize_roundtrip() {
         let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
             Ok(p) => p,
@@ -1380,6 +1646,54 @@ mod tests {
             StopReason::Eos | StopReason::MaxTokens => {}
             StopReason::Cancelled => panic!("Unexpected cancelled"),
         }
+    }
+
+    /// Regression for the configuration failure where embeddings_batch_size
+    /// was accidentally used as llama.cpp n_seq_max. With n_seq_max=1 the
+    /// full context remains available, so a prompt well over the old 128-token
+    /// per-sequence capacity and a subsequent request both decode normally.
+    #[test]
+    fn test_generate_prompt_over_128_tokens_then_follow_up() {
+        let model_path = match std::env::var("MLX_RS_TEST_GGUF") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("Skipping GGUF capacity regression: MLX_RS_TEST_GGUF not set");
+                return;
+            }
+        };
+
+        let config = LlamaCppConfig {
+            n_ctx: Some(512),
+            n_batch: Some(512),
+            n_ubatch: Some(512),
+            // Intentionally omit n_seq_max: the generation-safe default must
+            // be one, regardless of the HTTP embedding batch setting.
+            ..Default::default()
+        };
+        let mut runtime = Runtime::new(&model_path, config).expect("Failed to load GGUF");
+        let prompt = std::iter::repeat("capacity")
+            .take(180)
+            .collect::<Vec<_>>()
+            .join(" ");
+        let options = GenerationOptions {
+            max_tokens: Some(4),
+            temperature: 0.0,
+            ..Default::default()
+        };
+
+        let first = runtime
+            .generate(&prompt, &options)
+            .expect("long prompt generation failed");
+        assert!(
+            first.metrics.prompt_tokens > 128,
+            "regression prompt unexpectedly tokenized to {} tokens",
+            first.metrics.prompt_tokens
+        );
+
+        let second = runtime
+            .generate("follow-up capacity check", &options)
+            .expect("follow-up generation failed after long prompt");
+        assert!(second.metrics.prompt_tokens > 0);
     }
 
     #[test]

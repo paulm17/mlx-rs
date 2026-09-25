@@ -32,6 +32,14 @@ struct Args {
     /// Optional rate limit (requests per minute)
     #[arg(long)]
     rate_limit_rpm: Option<u32>,
+
+    /// Maximum concurrent llama.cpp generation sequences
+    #[arg(long)]
+    n_seq_max: Option<u32>,
+
+    /// Maximum texts per server-side embedding microbatch
+    #[arg(long)]
+    embeddings_batch_size: Option<usize>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -54,6 +62,12 @@ async fn main() -> Result<()> {
     }
     if let Some(rpm) = args.rate_limit_rpm {
         config.rate_limit_rpm = Some(rpm);
+    }
+    if let Some(n_seq_max) = args.n_seq_max {
+        config.n_seq_max = Some(n_seq_max);
+    }
+    if let Some(batch_size) = args.embeddings_batch_size {
+        config.embeddings_batch_size = Some(batch_size);
     }
 
     llama_lm::run_server(config).await

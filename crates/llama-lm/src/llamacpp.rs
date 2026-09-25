@@ -56,6 +56,18 @@ impl Backend for LlamaCppBackend {
         self.runtime.embeddings_enabled()
     }
 
+    fn embedding_token_limit(&self) -> Option<usize> {
+        Some(self.runtime.embedding_token_limit())
+    }
+
+    fn embedding_batch_token_limit(&self) -> Option<usize> {
+        Some(self.runtime.embedding_batch_token_limit())
+    }
+
+    fn embedding_sequence_limit(&self) -> Option<usize> {
+        Some(self.runtime.embedding_sequence_limit())
+    }
+
     fn supports_chat_template(&self) -> bool {
         true
     }
@@ -119,6 +131,11 @@ impl Backend for LlamaCppBackend {
 
     fn embed(&mut self, text: &str) -> Result<EmbeddingOutput> {
         let embedding = self.runtime.embed(text)?;
+        let token_count = self
+            .runtime
+            .tokenize(text, true)?
+            .len()
+            .min(self.runtime.embedding_token_limit());
 
         Ok(EmbeddingOutput {
             object: "list".to_string(),
@@ -128,8 +145,39 @@ impl Backend for LlamaCppBackend {
                 embedding,
             }],
             usage: EmbeddingUsage {
-                prompt_tokens: self.runtime.tokenize(text, true)?.len(),
-                total_tokens: self.runtime.tokenize(text, true)?.len(),
+                prompt_tokens: token_count,
+                total_tokens: token_count,
+            },
+        })
+    }
+
+    fn embed_batch(&mut self, texts: &[String]) -> Result<EmbeddingOutput> {
+        let embeddings = self.runtime.embed_batch(texts)?;
+        let token_limit = self.runtime.embedding_token_limit();
+        let total_tokens = texts
+            .iter()
+            .map(|text| {
+                self.runtime
+                    .tokenize(text, true)
+                    .map(|tokens| tokens.len().min(token_limit))
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .sum();
+        Ok(EmbeddingOutput {
+            object: "list".to_string(),
+            data: embeddings
+                .into_iter()
+                .enumerate()
+                .map(|(index, embedding)| EmbeddingData {
+                    object: "embedding".to_string(),
+                    index,
+                    embedding,
+                })
+                .collect(),
+            usage: EmbeddingUsage {
+                prompt_tokens: total_tokens,
+                total_tokens,
             },
         })
     }
@@ -254,6 +302,62 @@ mod tests {
             )
             .unwrap();
         assert!(metrics.prompt_tokens > 0);
+    }
+
+    #[test]
+    fn test_real_embedding_32_sequence_boundary_and_usage() {
+        let model_path = match std::env::var("MLX_RS_TEST_EMBED_GGUF") {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("Skipping 32-sequence boundary test: MLX_RS_TEST_EMBED_GGUF not set");
+                return;
+            }
+        };
+        let mut backend = LlamaCppBackend::new(
+            &model_path,
+            LlamaCppConfig {
+                n_ctx: Some(4096),
+                n_ubatch: Some(512),
+                n_seq_max: Some(32),
+                n_gpu_layers: Some(0),
+                embedding: Some(true),
+                pooling: Some("cls".to_string()),
+                ..Default::default()
+            },
+        )
+        .expect("Failed to load real embedding model");
+
+        // BERT WordPiece encodes this as [CLS] plus one `word` token per
+        // repetition: 510 repetitions make an exact 512-token request,
+        // including the BOS token.
+        let long = "word ".repeat(510);
+        let long_tokens = backend
+            .tokenize(&long, true)
+            .expect("long input tokenization failed")
+            .len();
+        assert!(
+            long_tokens == 512,
+            "boundary input encoded to {long_tokens} tokens, expected exactly 512"
+        );
+        assert_eq!(backend.runtime().embedding_token_limit(), 128);
+
+        let texts = vec![long, "short mixed sequence".to_string()];
+        let output = backend
+            .embed_batch(&texts)
+            .expect("512-token mixed embedding batch must remain safe");
+        assert_eq!(output.data.len(), 2);
+        assert_eq!(output.data[0].index, 0);
+        assert_eq!(output.data[1].index, 1);
+        assert_eq!(output.data[0].embedding.len(), 1024);
+        assert_eq!(output.data[1].embedding.len(), 1024);
+        let short_tokens = backend
+            .tokenize(&texts[1], true)
+            .expect("short input tokenization failed")
+            .len();
+        assert_eq!(
+            output.usage.total_tokens,
+            128 + short_tokens.min(backend.runtime().embedding_token_limit())
+        );
     }
 
     #[test]

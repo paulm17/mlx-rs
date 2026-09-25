@@ -30,7 +30,14 @@ pub struct ServerConfig {
     pub api_key: Option<String>,
     pub rate_limit_rpm: Option<u32>,
     pub thinking: Option<bool>,
+    /// Maximum concurrent llama.cpp sequence slots. This is deliberately
+    /// separate from `embeddings_batch_size`, which only bounds HTTP
+    /// embedding request packing. The generation-safe default is one.
+    pub n_seq_max: Option<u32>,
     pub embeddings_batch_size: Option<usize>,
+    /// Native llama.cpp/GGML callback destination. Empty or omitted disables
+    /// native output rather than inheriting stdout/stderr.
+    pub logging: Option<String>,
     // llama.cpp runtime config
     pub n_ctx: Option<u32>,
     pub n_batch: Option<u32>,
@@ -92,6 +99,8 @@ impl ServerConfig {
     pub fn to_llamacpp_config(&self) -> LlamaCppConfig {
         LlamaCppConfig {
             n_ctx: self.n_ctx,
+            n_seq_max: Some(self.n_seq_max.unwrap_or(1).max(1)),
+            logging: self.logging.clone(),
             n_batch: self.n_batch,
             n_ubatch: self.n_ubatch,
             n_gpu_layers: self.n_gpu_layers,
@@ -556,6 +565,42 @@ struct ErrorResponse {
     error: String,
 }
 
+const DEFAULT_EMBEDDINGS_BATCH_SIZE: usize = 32;
+
+/// Pack input indexes in request order while respecting both the configured
+/// sequence cap and the runtime's actual token budget. A single over-limit
+/// input is allowed through as its own group because Runtime truncates it to
+/// the same effective limit before constructing the native batch.
+fn pack_embedding_indices(
+    token_counts: &[usize],
+    max_sequences: usize,
+    sequence_token_limit: usize,
+    batch_token_limit: usize,
+) -> Vec<Vec<usize>> {
+    let max_sequences = max_sequences.max(1);
+    let sequence_token_limit = sequence_token_limit.max(1);
+    let batch_token_limit = batch_token_limit.max(1);
+    let mut groups = Vec::new();
+    let mut current = Vec::new();
+    let mut current_tokens = 0usize;
+    for (index, &count) in token_counts.iter().enumerate() {
+        let count = count.min(sequence_token_limit);
+        if !current.is_empty()
+            && (current.len() >= max_sequences
+                || current_tokens.saturating_add(count) > batch_token_limit)
+        {
+            groups.push(std::mem::take(&mut current));
+            current_tokens = 0;
+        }
+        current.push(index);
+        current_tokens = current_tokens.saturating_add(count);
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
 // --- Handlers ---
 
 async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<HealthResponse> {
@@ -962,11 +1007,20 @@ async fn embeddings_handler(
         ));
     }
 
-    let mut all_embeddings = Vec::new();
-    let mut total_tokens = 0usize;
-
-    for (i, input) in inputs.iter().enumerate() {
-        let tokens = rt.tokenize(input, true).map_err(|e| {
+    let sequence_token_limit = rt.embedding_token_limit().unwrap_or(usize::MAX).max(1);
+    let batch_token_limit = rt
+        .embedding_batch_token_limit()
+        .unwrap_or(sequence_token_limit)
+        .max(1);
+    let sequence_limit = rt.embedding_sequence_limit().unwrap_or(usize::MAX).max(1);
+    let token_counts = inputs
+        .iter()
+        .map(|input| {
+            rt.tokenize(input, true)
+                .map(|tokens| tokens.len().min(sequence_token_limit))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -974,19 +1028,38 @@ async fn embeddings_handler(
                 }),
             )
         })?;
-        total_tokens += tokens.len();
+    let groups = pack_embedding_indices(
+        &token_counts,
+        state
+            .config
+            .embeddings_batch_size
+            .unwrap_or(DEFAULT_EMBEDDINGS_BATCH_SIZE)
+            .min(sequence_limit),
+        sequence_token_limit,
+        batch_token_limit,
+    );
+    let mut all_embeddings = Vec::with_capacity(inputs.len());
+    let total_tokens = token_counts.iter().sum();
 
-        let embed_result = rt.embed(input).map_err(|e| {
+    for group in groups {
+        let batch_texts = group.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+        let embed_result = rt.embed_batch(&batch_texts).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
-                    error: format!("Embedding failed: {}", e),
+                    error: format!("Embedding batch failed: {}", e),
                 }),
             )
         })?;
-
         for mut item in embed_result.data {
-            item.index = i;
+            let local_index = item.index;
+            let Some(&original_index) = group.get(local_index) else {
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse { error: "Embedding batch returned invalid index".to_string() }),
+                ));
+            };
+            item.index = original_index;
             all_embeddings.push(EmbeddingObject {
                 object: item.object,
                 index: item.index,
@@ -1084,6 +1157,7 @@ fn check_auth(headers: &HeaderMap, api_key: &Option<String>) -> bool {
 // --- Run server ---
 
 pub async fn run_server(config: ServerConfig) -> Result<()> {
+    crate::runtime::configure_native_logging(config.logging.as_deref())?;
     let state = Arc::new(ServerState {
         runtime: Mutex::new(None),
         api_key: config.api_key.clone(),
@@ -1154,6 +1228,27 @@ mod tests {
         assert!(cfg.bind.is_none());
         assert!(cfg.port.is_none());
         assert!(cfg.model_path.is_none());
+        assert!(cfg.logging.is_none());
+    }
+
+    #[test]
+    fn test_parse_logging_path_and_propagate_to_llamacpp() {
+        let toml = r#"
+[server]
+model_path = "/models/llama.gguf"
+logging = "/tmp/llama-native.log"
+"#;
+        let f = write_temp_toml(toml);
+        let cfg = ServerConfig::from_toml_path(f.path()).unwrap();
+        assert_eq!(cfg.logging.as_deref(), Some("/tmp/llama-native.log"));
+        assert_eq!(cfg.to_llamacpp_config().logging.as_deref(), Some("/tmp/llama-native.log"));
+    }
+
+    #[test]
+    fn test_parse_empty_logging_path() {
+        let cfg = ServerConfig::from_toml_str("[server]\nlogging = \"\"\n").unwrap();
+        assert_eq!(cfg.logging.as_deref(), Some(""));
+        assert_eq!(cfg.to_llamacpp_config().logging.as_deref(), Some(""));
     }
 
     #[test]
@@ -1166,6 +1261,7 @@ model_path = "/models/llama.gguf"
 api_key = "secret"
 rate_limit_rpm = 120
 thinking = true
+n_seq_max = 4
 embeddings_batch_size = 32
 "#;
         let f = write_temp_toml(toml);
@@ -1176,6 +1272,7 @@ embeddings_batch_size = 32
         assert_eq!(cfg.api_key.as_deref(), Some("secret"));
         assert_eq!(cfg.rate_limit_rpm, Some(120));
         assert_eq!(cfg.thinking, Some(true));
+        assert_eq!(cfg.n_seq_max, Some(4));
         assert_eq!(cfg.embeddings_batch_size, Some(32));
     }
 
@@ -1268,8 +1365,30 @@ n_gpu_layers = 99
         let llamacpp = cfg.to_llamacpp_config();
         assert_eq!(llamacpp.n_ctx, Some(2048));
         assert_eq!(llamacpp.n_gpu_layers, Some(32));
+        assert_eq!(llamacpp.n_seq_max, Some(1));
         assert_eq!(llamacpp.flash_attn, Some(true));
         assert!(llamacpp.n_batch.is_none());
+    }
+
+    #[test]
+    fn embeddings_batch_size_does_not_change_generation_sequence_capacity() {
+        let cfg = ServerConfig {
+            embeddings_batch_size: Some(256),
+            ..Default::default()
+        };
+        let llamacpp = cfg.to_llamacpp_config();
+        assert_eq!(llamacpp.n_seq_max, Some(1));
+    }
+
+    #[test]
+    fn explicit_generation_sequence_capacity_is_forwarded() {
+        let cfg = ServerConfig {
+            n_seq_max: Some(8),
+            embeddings_batch_size: Some(256),
+            ..Default::default()
+        };
+        let llamacpp = cfg.to_llamacpp_config();
+        assert_eq!(llamacpp.n_seq_max, Some(8));
     }
 
     #[test]
@@ -1506,10 +1625,7 @@ n_gpu_layers = 99
         )
         .await;
         if let Err((status, Json(error))) = result {
-            panic!(
-                "env-gated model should load, got {}: {}",
-                status, error.error
-            );
+            panic!("env-gated model should load, got {}: {}", status, error.error);
         }
 
         let Json(resp) = models_handler(State(state)).await;
@@ -1546,7 +1662,10 @@ n_gpu_layers = 99
         if let Err((status, Json(error))) =
             load_handler(State(state.clone()), Json(LoadRequest { model_path })).await
         {
-            panic!("env-gated model should load, got {}: {}", status, error.error);
+            panic!(
+                "env-gated model should load, got {}: {}",
+                status, error.error
+            );
         }
 
         let response = build_app(state.clone())
@@ -1929,5 +2048,32 @@ n_gpu_layers = 99
         assert!(json.contains("\"object\":\"list\""));
         assert!(json.contains("\"embedding\":[0.1,0.2,0.3]"));
         assert!(json.contains("\"prompt_tokens\":5"));
+    }
+
+    #[test]
+    fn test_embedding_batches_preserve_order_and_stay_within_token_boundary() {
+        let token_counts = [3, 2, 4, 1, 9];
+        let groups = pack_embedding_indices(&token_counts, 3, 3, 5);
+        assert_eq!(groups, vec![vec![0, 1], vec![2, 3], vec![4]]);
+        for group in &groups {
+            assert!(group.len() <= 3);
+            let total: usize = group.iter().map(|&index| token_counts[index].min(5)).sum();
+            assert!(total <= 5, "packed batch exceeded n_ubatch boundary: {total}");
+        }
+        let flattened = groups.into_iter().flatten().collect::<Vec<_>>();
+        assert_eq!(flattened, (0..token_counts.len()).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn test_embedding_batches_respect_native_sequence_limit() {
+        let token_counts = [2, 2, 2];
+        // The HTTP microbatch allows three inputs, but the native runtime's
+        // effective n_seq_max=1 requires singleton invocations.
+        let groups = pack_embedding_indices(&token_counts, 1, 8, 32);
+        assert_eq!(groups, vec![vec![0], vec![1], vec![2]]);
+        assert_eq!(
+            groups.into_iter().flatten().collect::<Vec<_>>(),
+            (0..token_counts.len()).collect::<Vec<_>>()
+        );
     }
 }

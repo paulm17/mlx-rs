@@ -3,6 +3,10 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct LlamaCppConfig {
     pub n_ctx: Option<u32>,
+    pub n_seq_max: Option<u32>,
+    /// Destination for native llama.cpp/GGML logs. `None` and an empty
+    /// string both suppress the native callback output.
+    pub logging: Option<String>,
     pub n_batch: Option<u32>,
     pub n_ubatch: Option<u32>,
     pub n_gpu_layers: Option<u32>,
