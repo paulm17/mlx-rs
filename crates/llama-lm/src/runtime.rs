@@ -610,6 +610,23 @@ impl Runtime {
         Ok(render_fallback_chat_template(tmpl.as_deref(), messages))
     }
 
+    /// Renders a fallback prompt when the native OpenAI-compatible template
+    /// cannot be applied (missing/undecodable template, jinja failure, etc.).
+    /// Plain content only: no tool parsing, no reasoning extraction.
+    fn fallback_chat_template(
+        &self,
+        messages: &[crate::types::ChatMessage],
+    ) -> AppliedChatTemplate {
+        AppliedChatTemplate {
+            prompt: render_fallback_chat_template(None, messages),
+            additional_stops: Vec::new(),
+            parser: None,
+            generation_prompt: String::new(),
+            chat_format: 0,
+            parse_tool_calls: false,
+        }
+    }
+
     pub fn apply_chat_template_with_options(
         &self,
         messages: &[crate::types::ChatMessage],
@@ -617,14 +634,7 @@ impl Runtime {
     ) -> Result<AppliedChatTemplate> {
         let template = self.model.chat_template(None).ok();
         let Some(template) = template else {
-            return Ok(AppliedChatTemplate {
-                prompt: render_fallback_chat_template(None, messages),
-                additional_stops: Vec::new(),
-                parser: None,
-                generation_prompt: String::new(),
-                chat_format: 0,
-                parse_tool_calls: false,
-            });
+            return Ok(self.fallback_chat_template(messages));
         };
 
         let template_text = template.to_str()?;
@@ -663,10 +673,15 @@ impl Runtime {
             )
         };
         if status != 0 {
+            // The native jinja/autoparser path can fail on templates llama.cpp
+            // cannot handle (status -3 is a catch-all from llama_compat.cpp).
+            // Degrade to the Rust fallback renderer instead of failing the
+            // whole chat request.
             unsafe { mlx_rs_free_chat_template_result(&mut result) };
-            return Err(anyhow::anyhow!(
-                "llama.cpp OpenAI chat template failed with status {status}"
-            ));
+            eprintln!(
+                "llama.cpp OpenAI chat template failed with status {status}; using fallback chat renderer"
+            );
+            return Ok(self.fallback_chat_template(messages));
         }
 
         let prompt = unsafe { std::ffi::CStr::from_ptr(result.prompt) }
