@@ -26,6 +26,12 @@ Last updated: 2026-06-17
 
 Any model that llama.cpp supports in GGUF format. The server does not restrict architectures at this level.
 
+The vendored backend includes a text-inference backport for EmbeddingGemma 2
+(`gemma-embedding2`). Enable `embedding = true` and omit `pooling` to use the
+GGUF's mean pooling, or set `pooling = "mean"` explicitly. Its output vectors
+and reported embedding dimension are 768, distinct from its 512-wide hidden state.
+This backport does not expose image or audio embeddings.
+
 ### MLX / safetensors
 
 | Architecture | Model Family | Text Generation | Notes |

@@ -401,7 +401,7 @@ impl Runtime {
     }
 
     pub fn embedding_dimension(&self) -> i32 {
-        self.model.n_embd()
+        self.model.n_embd_out()
     }
 
     pub fn vocab_size(&self) -> i32 {
@@ -439,7 +439,7 @@ impl Runtime {
             decision_family: self.decision_family.clone(),
             model_path: self.model_path.clone(),
             context_length: Some(self.context.n_ctx() as usize),
-            embedding_dimension: Some(self.model.n_embd() as usize),
+            embedding_dimension: Some(self.model.n_embd_out() as usize),
             vocab_size: Some(self.model.n_vocab() as usize),
         }
     }

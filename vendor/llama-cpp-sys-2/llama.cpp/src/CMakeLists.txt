@@ -6,7 +6,7 @@ llama_add_compile_flags()
 
 # llama
 
-file(GLOB LLAMA_MODELS_SOURCES "models/*.cpp")
+file(GLOB LLAMA_MODELS_SOURCES CONFIGURE_DEPENDS "models/*.cpp")
 
 set(LLAMA_CORE_SOURCES
     llama.cpp
