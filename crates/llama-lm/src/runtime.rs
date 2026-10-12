@@ -1,7 +1,7 @@
-use std::num::NonZeroU32;
 use std::ffi::CStr;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::{Mutex, OnceLock};
 use std::time::Instant;
@@ -171,13 +171,7 @@ fn optional_cstring(value: Option<&str>) -> Result<Option<std::ffi::CString>> {
 }
 
 fn model_ptr(model: &LlamaModel) -> *const llama_cpp_sys_2::llama_model {
-    // LlamaModel is repr(transparent) over NonNull<llama_model>; the public crate
-    // intentionally keeps that field private, so this is the narrow FFI bridge.
-    unsafe {
-        let field = model as *const LlamaModel
-            as *const std::ptr::NonNull<llama_cpp_sys_2::llama_model>;
-        (*field).as_ptr()
-    }
+    model.as_ptr()
 }
 
 struct CompatStreamParser {
@@ -232,7 +226,11 @@ impl CompatStreamParser {
             let values = unsafe { std::slice::from_raw_parts(outputs, count) };
             values
                 .iter()
-                .map(|value| unsafe { std::ffi::CStr::from_ptr(*value) }.to_str().map(str::to_string))
+                .map(|value| {
+                    unsafe { std::ffi::CStr::from_ptr(*value) }
+                        .to_str()
+                        .map(str::to_string)
+                })
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         unsafe { mlx_rs_free_chat_parse_outputs(outputs, count) };
@@ -251,6 +249,8 @@ pub struct Runtime {
     model: Box<LlamaModel>,
     model_path: String,
     embeddings_enabled: bool,
+    supports_decisions: bool,
+    decision_family: Option<String>,
     embedding_token_limit: usize,
     embedding_batch_token_limit: usize,
     embedding_sequence_limit: usize,
@@ -288,7 +288,24 @@ impl Runtime {
         );
 
         // Context params
-        let embeddings_enabled = config.embedding.unwrap_or(false);
+        let family = unsafe { mlx_rs_decision_family(model.as_ptr()) };
+        let decision_family = if family.is_null() {
+            None
+        } else {
+            Some(
+                unsafe { CStr::from_ptr(family) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        };
+        if decision_family.as_deref() == Some("unknown") {
+            return Err(crate::types::DecisionError::Unsupported(
+                "unsupported decision model family in GGUF metadata".into(),
+            )
+            .into());
+        }
+        let supports_decisions = decision_family.is_some();
+        let embeddings_enabled = config.embedding.unwrap_or(false) && !supports_decisions;
         let mut ctx_params = LlamaContextParams::default().with_embeddings(embeddings_enabled);
 
         // OhMyPi's default built-in tools and coding prompt are already about
@@ -296,12 +313,21 @@ impl Runtime {
         // the no-config path large enough for a normal tool-enabled session.
         let n_ctx = config.n_ctx.unwrap_or(32768);
         ctx_params = ctx_params.with_n_ctx(NonZeroU32::new(n_ctx));
-        let n_seq_max = config.n_seq_max.unwrap_or(1).max(1);
+        let n_seq_max = if supports_decisions {
+            1
+        } else {
+            config.n_seq_max.unwrap_or(1).max(1)
+        };
         ctx_params = ctx_params.with_n_seq_max(n_seq_max);
         if let Some(n_batch) = config.n_batch {
             ctx_params = ctx_params.with_n_batch(n_batch);
         }
-        let n_ubatch = config.n_ubatch.unwrap_or(512);
+        let n_ubatch = config
+            .n_ubatch
+            .unwrap_or(if supports_decisions { n_ctx } else { 512 });
+        if supports_decisions {
+            ctx_params = ctx_params.with_n_batch(config.n_batch.unwrap_or(n_ubatch));
+        }
         // Make the limit explicit even when the caller omitted it; the
         // embedding path relies on this value to prevent native assertions.
         ctx_params = ctx_params.with_n_ubatch(n_ubatch);
@@ -330,6 +356,16 @@ impl Runtime {
             ctx_params = ctx_params.with_flash_attention_policy(policy);
         }
 
+        if supports_decisions {
+            ctx_params = ctx_params
+                .with_embeddings(matches!(
+                    decision_family.as_deref(),
+                    Some("kev" | "laya" | "clef")
+                ))
+                .with_pooling_type(LlamaPoolingType::None)
+                .with_decision_outputs();
+        }
+
         // Safety: the model allocation is stable behind Box, and Runtime declares
         // context before model so the context is dropped first.
         let model_ref: &'static LlamaModel = unsafe { std::mem::transmute(&*model) };
@@ -342,6 +378,8 @@ impl Runtime {
             model,
             model_path: model_path.to_string(),
             embeddings_enabled,
+            supports_decisions,
+            decision_family,
             // llama.cpp divides n_ctx across n_seq_max sequences. Keep the
             // per-sequence truncation limit within that capacity as well as
             // n_ubatch; the server packer enforces the aggregate budget.
@@ -397,11 +435,85 @@ impl Runtime {
 
     pub fn model_info(&self) -> LoadedModelInfo {
         LoadedModelInfo {
+            supports_decisions: self.supports_decisions,
+            decision_family: self.decision_family.clone(),
             model_path: self.model_path.clone(),
             context_length: Some(self.context.n_ctx() as usize),
             embedding_dimension: Some(self.model.n_embd() as usize),
             vocab_size: Some(self.model.n_vocab() as usize),
         }
+    }
+
+    pub fn supports_decisions(&self) -> bool {
+        self.supports_decisions
+    }
+
+    pub fn decide(
+        &mut self,
+        request: &crate::types::DecisionRequest,
+    ) -> Result<crate::types::DecisionResponse> {
+        use crate::types::{DecisionError, DecisionResponse};
+        request.validate_text()?;
+        if !self.supports_decisions {
+            return Err(
+                DecisionError::Unsupported("model does not support decisions".into()).into(),
+            );
+        }
+        if request
+            .model
+            .as_deref()
+            .is_some_and(|id| id != self.model_path)
+        {
+            return Err(DecisionError::InvalidRequest("request model does not match the loaded model; use named decision profiles to select models".into()).into());
+        }
+        let request_json = std::ffi::CString::new(serde_json::to_string(request)?)?;
+        let mut output = std::ptr::null_mut();
+        let mut error = std::ptr::null_mut();
+        let status = unsafe {
+            mlx_rs_decide(
+                self.model.as_ptr(),
+                self.context.as_mut_ptr(),
+                request_json.as_ptr(),
+                &mut output,
+                &mut error,
+            )
+        };
+        struct NativeString(*mut std::ffi::c_char);
+        impl Drop for NativeString {
+            fn drop(&mut self) {
+                unsafe { mlx_rs_decision_free(self.0) };
+            }
+        }
+        let output = NativeString(output);
+        let error = NativeString(error);
+        if status != 0 {
+            let message = if error.0.is_null() {
+                "decision inference failed".to_string()
+            } else {
+                unsafe { std::ffi::CStr::from_ptr(error.0) }
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            return Err(match status {
+                1 => DecisionError::InvalidRequest(message),
+                2 => DecisionError::Unsupported(message),
+                _ => DecisionError::Inference(message),
+            }
+            .into());
+        }
+        if output.0.is_null() {
+            return Err(DecisionError::Inference("missing decision response".into()).into());
+        }
+        let mut json: serde_json::Value =
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(output.0) }.to_bytes())?;
+        json["model"] = serde_json::Value::String(
+            request
+                .model
+                .clone()
+                .unwrap_or_else(|| self.model_path.clone()),
+        );
+        let response: DecisionResponse = serde_json::from_value(json)?;
+        Ok(response)
     }
 
     pub fn model(&self) -> &LlamaModel {
@@ -661,7 +773,9 @@ impl Runtime {
                 messages_c.as_ptr(),
                 tools_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
                 choice_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
-                reasoning_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
+                reasoning_c
+                    .as_ref()
+                    .map_or(std::ptr::null(), |v| v.as_ptr()),
                 kwargs_c.as_ref().map_or(std::ptr::null(), |v| v.as_ptr()),
                 true,
                 options.parallel_tool_calls,
@@ -707,7 +821,11 @@ impl Runtime {
             };
             stops
                 .iter()
-                .map(|stop| unsafe { std::ffi::CStr::from_ptr(*stop) }.to_str().map(str::to_string))
+                .map(|stop| {
+                    unsafe { std::ffi::CStr::from_ptr(*stop) }
+                        .to_str()
+                        .map(str::to_string)
+                })
                 .collect::<std::result::Result<Vec<_>, _>>()?
         };
         let applied = AppliedChatTemplate {
@@ -861,6 +979,9 @@ impl Runtime {
     where
         F: FnMut(&str) -> bool,
     {
+        if self.supports_decisions {
+            anyhow::bail!("Decision models do not generate text; use decide or /v1/systemone");
+        }
         let start = Instant::now();
 
         let prompt_tokens = self.tokenize(prompt, true)?;
@@ -1224,7 +1345,9 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().join("missing").join("native.log");
         let error = configure_native_logging(path.to_str()).unwrap_err();
-        assert!(error.to_string().contains("Failed to open native llama.cpp log file"));
+        assert!(error
+            .to_string()
+            .contains("Failed to open native llama.cpp log file"));
     }
 
     #[test]
@@ -1536,8 +1659,13 @@ mod tests {
             },
         )
         .expect("Failed to load embedding model");
-        let texts = vec!["first distinct sequence".to_string(), "second distinct sequence".to_string()];
-        let batched = runtime.embed_batch(&texts).expect("Batched embedding failed");
+        let texts = vec![
+            "first distinct sequence".to_string(),
+            "second distinct sequence".to_string(),
+        ];
+        let batched = runtime
+            .embed_batch(&texts)
+            .expect("Batched embedding failed");
         assert_eq!(batched.len(), texts.len());
         let first = runtime.embed(&texts[0]).expect("First singleton failed");
         let second = runtime.embed(&texts[1]).expect("Second singleton failed");
@@ -1547,8 +1675,14 @@ mod tests {
             let norm_b = b.iter().map(|x| x * x).sum::<f32>().sqrt();
             dot / (norm_a * norm_b)
         };
-        assert!(cosine(&batched[0], &first) > 0.99, "sequence 0 output order changed");
-        assert!(cosine(&batched[1], &second) > 0.99, "sequence 1 output order changed");
+        assert!(
+            cosine(&batched[0], &first) > 0.99,
+            "sequence 0 output order changed"
+        );
+        assert!(
+            cosine(&batched[1], &second) > 0.99,
+            "sequence 1 output order changed"
+        );
     }
 
     #[test]
@@ -1815,5 +1949,166 @@ mod tests {
         // Should have stopped early
         assert!(count <= 4); // at most 3 accepted + 1 that triggered cancel
         assert!(metrics.generated_tokens <= 4);
+    }
+}
+
+extern "C" {
+    fn mlx_rs_decision_family(
+        model: *const llama_cpp_sys_2::llama_model,
+    ) -> *const std::ffi::c_char;
+    fn mlx_rs_decide(
+        model: *const llama_cpp_sys_2::llama_model,
+        ctx: *mut llama_cpp_sys_2::llama_context,
+        request: *const std::ffi::c_char,
+        output: *mut *mut std::ffi::c_char,
+        error: *mut *mut std::ffi::c_char,
+    ) -> i32;
+    fn mlx_rs_decision_free(value: *mut std::ffi::c_char);
+}
+
+#[cfg(test)]
+mod clef_format_tests {
+    use super::*;
+    extern "C" {
+        fn mlx_rs_clef_format_fixture(
+            request: *const std::ffi::c_char,
+            scores: *const std::ffi::c_char,
+            temperatures: *const std::ffi::c_char,
+            output: *mut *mut std::ffi::c_char,
+        ) -> i32;
+    }
+    #[test]
+    fn clef_native_calibration_and_option_mapping() {
+        use serde_json::json;
+        let request = json!({"state":{"ticket":"x"},"questions": {
+            "choice":{"type":"choice","instructions":"pick","criteria":{"z":null,"a":null}},
+            "score":{"type":"score","instructions":"rate","criteria":["low","high"]},
+            "bool":{"type":"noul","instructions":"true?"}
+        }});
+        let request = std::ffi::CString::new(request.to_string()).unwrap();
+        // choice keys sort to a,z; noul is true,false. A bucket override must win.
+        let scores = std::ffi::CString::new(
+            json!({"choice":[0.0,2.0],"score":[0.0,0.0],"bool":[2.0,0.0]}).to_string(),
+        )
+        .unwrap();
+        let temperatures =
+            std::ffi::CString::new(json!({"choice":100.0,"choice.2":2.0}).to_string()).unwrap();
+        let mut output = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                mlx_rs_clef_format_fixture(
+                    request.as_ptr(),
+                    scores.as_ptr(),
+                    temperatures.as_ptr(),
+                    &mut output,
+                )
+            },
+            0
+        );
+        let result: serde_json::Value =
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(output) }.to_bytes()).unwrap();
+        unsafe { mlx_rs_decision_free(output) };
+        assert_eq!(result["choice"]["choice"], "z");
+        let p = 1.0 / (1.0 + (-1.0_f64).exp());
+        assert!((result["choice"]["probabilities"]["z"].as_f64().unwrap() - p).abs() < 1e-7);
+        assert!((result["choice"]["confidence"].as_f64().unwrap() - (2.0 * p - 1.0)).abs() < 1e-7);
+        assert_eq!(result["score"]["score"], 0.5);
+        assert_eq!(result["score"]["confidence"], 0.0);
+        assert_eq!(result["score"]["legend"]["1"], "high");
+        assert!(
+            (result["bool"]["noul"].as_f64().unwrap() - 1.0 / (1.0 + (-2.0_f64).exp())).abs()
+                < 1e-7
+        );
+    }
+}
+
+#[cfg(test)]
+mod decision_adapter_tests {
+    use serde_json::{json, Value};
+    extern "C" {
+        fn mlx_rs_decision_format_fixture(
+            kind: i32,
+            request: *const std::ffi::c_char,
+            scores: *const std::ffi::c_char,
+            temps: *const std::ffi::c_char,
+            output: *mut *mut std::ffi::c_char,
+        ) -> i32;
+        fn mlx_rs_decision_free(value: *mut std::ffi::c_char);
+    }
+    fn fixture(kind: i32, request: &str, scores: Value, temps: Value) -> Value {
+        let request = std::ffi::CString::new(request).unwrap();
+        let scores = std::ffi::CString::new(scores.to_string()).unwrap();
+        let temps = std::ffi::CString::new(temps.to_string()).unwrap();
+        let mut out = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                mlx_rs_decision_format_fixture(
+                    kind,
+                    request.as_ptr(),
+                    scores.as_ptr(),
+                    temps.as_ptr(),
+                    &mut out,
+                )
+            },
+            0
+        );
+        let result =
+            serde_json::from_slice(unsafe { std::ffi::CStr::from_ptr(out) }.to_bytes()).unwrap();
+        unsafe {
+            mlx_rs_decision_free(out);
+        }
+        result
+    }
+    #[test]
+    fn kev_choice_order_structured_text_and_special_tokens() {
+        let result = fixture(
+            3,
+            r#"{"state":{"message":"<|box_end|>","ok":true},"questions":{"route":{"type":"choice","instructions":"pick","criteria":{"z":null,"a":null}},"yes":{"type":"noul","instructions":"true?"}}}"#,
+            json!({"route":[[2.0,0.0]],"yes":[[0.0,2.0]]}),
+            json!({"choice.2":2.0}),
+        );
+        assert_eq!(result["answers"]["route"]["choice"], "z");
+        assert!(
+            (result["answers"]["route"]["probabilities"]["z"]
+                .as_f64()
+                .unwrap()
+                - 1.0 / (1.0 + (-1.0_f64).exp()))
+            .abs()
+                < 1e-7
+        );
+        assert!(result["kev_state"].as_str().unwrap().contains("ok: True"));
+        assert!(!result["kev_state"]
+            .as_str()
+            .unwrap()
+            .contains("<|box_end|>"));
+        assert!(result["answers"]["yes"]["noul"].as_f64().unwrap() > 0.8);
+    }
+    #[test]
+    fn lev_reverse_variants_and_rating_noul() {
+        let result = fixture(
+            2,
+            r#"{"state":"x","questions":{"pick":{"type":"choice","instructions":"pick","criteria":{"z":null,"a":null}},"yes":{"type":"noul","instructions":"true?"}}}"#,
+            json!({"pick":[[2.0,0.0],[0.0,2.0]],"yes":[[0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0,0.0]]}),
+            json!({}),
+        );
+        assert_eq!(result["answers"]["pick"]["choice"], "z");
+        assert!((result["answers"]["yes"]["noul"].as_f64().unwrap() - 0.5).abs() < 1e-7);
+    }
+    #[test]
+    fn text_families_map_noul_outputs_correctly() {
+        for kind in [1, 4, 5] {
+            let scores = if kind == 1 {
+                json!({"yes":[[2.0,0.0]]})
+            } else {
+                json!({"yes":[[0.0,2.0]]})
+            };
+            let result = fixture(
+                kind,
+                r#"{"state":"x","questions":{"yes":{"type":"noul","instructions":"true?"}}}"#,
+                scores,
+                json!({}),
+            );
+            assert!(result["answers"]["yes"]["noul"].as_f64().unwrap() > 0.8);
+        }
     }
 }

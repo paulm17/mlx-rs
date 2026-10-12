@@ -17,9 +17,7 @@ use tokio_stream::StreamExt;
 use crate::backend::Backend;
 use crate::config::{LlamaCppConfig, MlxConfig};
 use crate::registry;
-use crate::types::{
-    ChatMessage, ChatTemplateOptions, ChatToolCall, GenerationOptions, StopReason,
-};
+use crate::types::{ChatMessage, ChatTemplateOptions, ChatToolCall, GenerationOptions, StopReason};
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct ServerConfig {
@@ -27,6 +25,8 @@ pub struct ServerConfig {
     pub port: Option<u16>,
     pub model_path: Option<String>,
     pub model: Option<String>,
+    #[serde(default)]
+    pub models: std::collections::BTreeMap<String, crate::DecisionModelProfile>,
     pub api_key: Option<String>,
     pub rate_limit_rpm: Option<u32>,
     pub thinking: Option<bool>,
@@ -87,10 +87,24 @@ impl ServerConfig {
     pub fn from_toml_str(content: &str) -> Result<Self> {
         let parsed: serde_json::Value = basic_toml_to_json(content)
             .map_err(|e| anyhow::anyhow!("Failed to parse config: {e}"))?;
-        let server = parsed
+        let mut server = parsed
             .get("server")
             .cloned()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
+        let mut profiles = serde_json::Map::new();
+        if let Some(sections) = parsed.as_object() {
+            for (name, value) in sections {
+                if let Some(id) = name.strip_prefix("models.") {
+                    if id.is_empty() {
+                        anyhow::bail!("model profile name must not be empty");
+                    }
+                    profiles.insert(id.to_owned(), value.clone());
+                }
+            }
+        }
+        if !profiles.is_empty() {
+            server["models"] = Value::Object(profiles);
+        }
         let cfg: Self = serde_json::from_value(server)
             .map_err(|e| anyhow::anyhow!("Failed to parse server config: {e}"))?;
         Ok(cfg)
@@ -287,13 +301,15 @@ fn build_chat_template_options(
     let tool_choice = req
         .tool_choice
         .as_ref()
-        .map(|choice| match choice {
+        .map(|choice| {
+            match choice {
             Value::String(value) => Ok(value.clone()),
             Value::Object(_) => Err(
                 "function-specific tool_choice objects are unsupported; use auto, none, or required"
                     .to_string(),
             ),
             _ => Err("tool_choice must be auto, none, or required".to_string()),
+        }
         })
         .transpose()?;
     let chat_template_kwargs = req
@@ -379,7 +395,10 @@ fn normalized_tool_calls(values: Vec<Value>) -> Vec<ChatToolCall> {
         .filter_map(|(index, value)| {
             let object = value.as_object()?;
             let function = object.get("function").and_then(Value::as_object)?;
-            let name = function.get("name").and_then(Value::as_str).unwrap_or_default();
+            let name = function
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let arguments = function
                 .get("arguments")
                 .map(|arguments| match arguments {
@@ -504,6 +523,7 @@ struct ModelObject {
     object: String,
     created: i64,
     owned_by: String,
+    architecture: Value,
 }
 
 #[derive(Serialize)]
@@ -607,20 +627,20 @@ async fn health_handler(State(state): State<Arc<ServerState>>) -> Json<HealthRes
     let runtime = state.runtime.lock().unwrap();
     Json(HealthResponse {
         status: "ok".to_string(),
-        model_loaded: runtime.is_some(),
+        model_loaded: runtime
+            .as_ref()
+            .is_some_and(|b| b.model_info().context_length.is_some()),
     })
 }
 
 async fn models_handler(State(state): State<Arc<ServerState>>) -> Json<ModelListResponse> {
     let runtime = state.runtime.lock().unwrap();
     let data = if let Some(ref rt) = *runtime {
-        let info = rt.model_info();
-        vec![ModelObject {
-            id: info.model_path.clone(),
-            object: "model".to_string(),
-            created: 0,
-            owned_by: "local".to_string(),
-        }]
+        rt.available_models().into_iter().map(|info| ModelObject {
+            id: info.model_path,
+            object: "model".into(), created: 0, owned_by: "local".into(),
+            architecture: serde_json::json!({"input_modalities":["text"], "output_modalities":[if info.supports_decisions {"decisions"} else {"text"}], "decision_family":info.decision_family}),
+        }).collect()
     } else {
         vec![]
     };
@@ -638,6 +658,7 @@ fn build_app(state: Arc<ServerState>) -> Router {
         .route("/llm/load", post(load_handler))
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/embeddings", post(embeddings_handler))
+        .route("/v1/systemone", post(decisions_handler))
         .with_state(state)
 }
 
@@ -645,10 +666,51 @@ async fn load_handler(
     State(state): State<Arc<ServerState>>,
     Json(req): Json<LoadRequest>,
 ) -> Result<Json<LoadResponse>, (StatusCode, Json<ErrorResponse>)> {
+    if !state.config.models.is_empty() {
+        return tokio::task::spawn_blocking(move || {
+            let mut guard = state.runtime.lock().map_err(|_| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "Backend lock poisoned".into(),
+                    }),
+                )
+            })?;
+            let backend = guard.as_mut().ok_or_else(|| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    Json(ErrorResponse {
+                        error: "No model manager loaded".into(),
+                    }),
+                )
+            })?;
+            backend
+                .select_model(&req.model_path)
+                .map_err(decision_http_error)?;
+            let info = backend.model_info();
+            Ok(Json(LoadResponse {
+                status: "ok".into(),
+                model_path: info.model_path,
+                context_length: info.context_length,
+                embedding_dimension: info.embedding_dimension,
+                vocab_size: info.vocab_size,
+            }))
+        })
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: e.to_string(),
+                }),
+            )
+        })?;
+    }
     let llamacpp_config = state.config.to_llamacpp_config();
     let mlx_config = state.config.to_mlx_config();
 
-    let backend = registry::create_backend_with_mlx(&req.model_path, llamacpp_config, mlx_config).map_err(|e| {
+    let backend = registry::create_backend_with_mlx(&req.model_path, llamacpp_config, mlx_config)
+        .map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -698,12 +760,20 @@ async fn chat_completions_handler(
         }
     }
 
-    let template_options = build_chat_template_options(&req, &state.config).map_err(|error| {
-        (
-            StatusCode::BAD_REQUEST,
-            Json(ErrorResponse { error }),
-        )
-    })?;
+    {
+        let runtime = state.runtime.lock().unwrap();
+        if runtime.as_ref().is_some_and(|rt| rt.supports_decisions()) {
+            return Err((
+                StatusCode::NOT_IMPLEMENTED,
+                Json(ErrorResponse {
+                    error: "Decision models do not generate text; use /v1/systemone".into(),
+                }),
+            ));
+        }
+    }
+
+    let template_options = build_chat_template_options(&req, &state.config)
+        .map_err(|error| (StatusCode::BAD_REQUEST, Json(ErrorResponse { error })))?;
     let options = GenerationOptions {
         max_tokens: req.max_tokens,
         temperature: req.temperature,
@@ -788,7 +858,11 @@ async fn chat_completions_handler(
                             return false;
                         }
                     };
-                    if delta.tool_calls.as_ref().is_some_and(|calls| !calls.is_empty()) {
+                    if delta
+                        .tool_calls
+                        .as_ref()
+                        .is_some_and(|calls| !calls.is_empty())
+                    {
                         *saw_tool_calls_for_stream.lock().unwrap() = true;
                     }
                     let tool_calls = delta.tool_calls.map(normalized_stream_tool_calls);
@@ -854,17 +928,21 @@ async fn chat_completions_handler(
         });
 
         let stream = ReceiverStream::new(rx);
-        Ok(Sse::new(stream.map(|item| match item {
-            Ok(data) => Ok::<_, axum::Error>(axum::response::sse::Event::default().data(data)),
-            Err(e) => Ok::<_, axum::Error>(axum::response::sse::Event::default().data(
-                serde_json::json!({
-                    "error": {
-                        "message": e,
-                        "type": "server_error"
-                    }
-                })
-                .to_string(),
-            )),
+        Ok(Sse::new(stream.map(|item| {
+            match item {
+                Ok(data) => Ok::<_, axum::Error>(axum::response::sse::Event::default().data(data)),
+                Err(e) => Ok::<_, axum::Error>(
+                    axum::response::sse::Event::default().data(
+                        serde_json::json!({
+                            "error": {
+                                "message": e,
+                                "type": "server_error"
+                            }
+                        })
+                        .to_string(),
+                    ),
+                ),
+            }
         }))
         .into_response())
     } else {
@@ -884,13 +962,13 @@ async fn chat_completions_handler(
         let template = rt
             .apply_chat_template_with_options(&req.messages, &template_options)
             .map_err(|e| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("Template error: {}", e),
-                }),
-            )
-        })?;
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: format!("Template error: {}", e),
+                    }),
+                )
+            })?;
 
         let output = rt.generate(&template.prompt, &options).map_err(|e| {
             (
@@ -951,6 +1029,67 @@ fn finish_reason_for_stop(stop_reason: &StopReason) -> &'static str {
         StopReason::Eos | StopReason::Cancelled => "stop",
         StopReason::MaxTokens => "length",
     }
+}
+
+fn decision_http_error(error: anyhow::Error) -> (StatusCode, Json<ErrorResponse>) {
+    use crate::types::DecisionError;
+    let status = match error.downcast_ref::<DecisionError>() {
+        Some(DecisionError::InvalidRequest(_)) => StatusCode::BAD_REQUEST,
+        Some(DecisionError::Unsupported(_)) => StatusCode::NOT_IMPLEMENTED,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    };
+    (
+        status,
+        Json(ErrorResponse {
+            error: format!("{error:#}"),
+        }),
+    )
+}
+
+async fn decisions_handler(
+    State(state): State<Arc<ServerState>>,
+    headers: HeaderMap,
+    payload: Result<Json<crate::types::DecisionRequest>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<crate::types::DecisionResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let fail = |status, message: &str| {
+        (
+            status,
+            Json(ErrorResponse {
+                error: message.into(),
+            }),
+        )
+    };
+    if !check_auth(&headers, &state.api_key) {
+        return Err(fail(StatusCode::UNAUTHORIZED, "Invalid API key"));
+    }
+    if state.rate_limiter.as_ref().is_some_and(|rl| !rl.check()) {
+        return Err(fail(StatusCode::TOO_MANY_REQUESTS, "Rate limit exceeded"));
+    }
+    let Json(request) = payload.map_err(|e| fail(StatusCode::BAD_REQUEST, &e.body_text()))?;
+    request
+        .validate_text()
+        .map_err(|e| decision_http_error(e.into()))?;
+    tokio::task::spawn_blocking(move || {
+        let mut guard = state
+            .runtime
+            .lock()
+            .map_err(|_| fail(StatusCode::INTERNAL_SERVER_ERROR, "Backend lock poisoned"))?;
+        let backend = guard
+            .as_mut()
+            .ok_or_else(|| fail(StatusCode::SERVICE_UNAVAILABLE, "No model loaded"))?;
+        if !backend.supports_decisions() {
+            return Err(fail(
+                StatusCode::NOT_IMPLEMENTED,
+                "Model does not support decisions",
+            ));
+        }
+        backend
+            .decide(&request)
+            .map(Json)
+            .map_err(decision_http_error)
+    })
+    .await
+    .map_err(|e| fail(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()))?
 }
 
 async fn embeddings_handler(
@@ -1042,7 +1181,10 @@ async fn embeddings_handler(
     let total_tokens = token_counts.iter().sum();
 
     for group in groups {
-        let batch_texts = group.iter().map(|&index| inputs[index].clone()).collect::<Vec<_>>();
+        let batch_texts = group
+            .iter()
+            .map(|&index| inputs[index].clone())
+            .collect::<Vec<_>>();
         let embed_result = rt.embed_batch(&batch_texts).map_err(|e| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -1056,7 +1198,9 @@ async fn embeddings_handler(
             let Some(&original_index) = group.get(local_index) else {
                 return Err((
                     StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(ErrorResponse { error: "Embedding batch returned invalid index".to_string() }),
+                    Json(ErrorResponse {
+                        error: "Embedding batch returned invalid index".to_string(),
+                    }),
                 ));
             };
             item.index = original_index;
@@ -1165,8 +1309,25 @@ pub async fn run_server(config: ServerConfig) -> Result<()> {
         config: config.clone(),
     });
 
-    // Preload model if configured
-    if let Some(ref model_path) = config.model_path {
+    // Named profiles share one serialized backend, which releases the old model before switching.
+    if !config.models.is_empty() {
+        let default = config.model.clone().ok_or_else(|| {
+            anyhow::anyhow!("server.model must name a configured decision profile")
+        })?;
+        let mut profiles = config.models.clone();
+        for profile in profiles.values_mut() {
+            if profile.runtime.logging.is_none() {
+                profile.runtime.logging = config.logging.clone();
+            }
+        }
+        let mut models = crate::DecisionModels::new(profiles, &default)?;
+        let models = tokio::task::spawn_blocking(move || {
+            models.select(&default)?;
+            Ok::<_, anyhow::Error>(models)
+        })
+        .await??;
+        *state.runtime.lock().unwrap() = Some(Box::new(models));
+    } else if let Some(ref model_path) = config.model_path {
         let llamacpp_config = config.to_llamacpp_config();
         let mlx_config = config.to_mlx_config();
         match registry::create_backend_with_mlx(model_path, llamacpp_config, mlx_config) {
@@ -1241,7 +1402,10 @@ logging = "/tmp/llama-native.log"
         let f = write_temp_toml(toml);
         let cfg = ServerConfig::from_toml_path(f.path()).unwrap();
         assert_eq!(cfg.logging.as_deref(), Some("/tmp/llama-native.log"));
-        assert_eq!(cfg.to_llamacpp_config().logging.as_deref(), Some("/tmp/llama-native.log"));
+        assert_eq!(
+            cfg.to_llamacpp_config().logging.as_deref(),
+            Some("/tmp/llama-native.log")
+        );
     }
 
     #[test]
@@ -1625,7 +1789,10 @@ n_gpu_layers = 99
         )
         .await;
         if let Err((status, Json(error))) = result {
-            panic!("env-gated model should load, got {}: {}", status, error.error);
+            panic!(
+                "env-gated model should load, got {}: {}",
+                status, error.error
+            );
         }
 
         let Json(resp) = models_handler(State(state)).await;
@@ -1930,7 +2097,10 @@ n_gpu_layers = 99
         assert_eq!(request.messages.len(), 3);
         assert_eq!(request.messages[0].content, "Find the weather");
         assert_eq!(request.messages[1].content, "");
-        assert_eq!(request.messages[1].reasoning_content.as_deref(), Some("I should use lookup."));
+        assert_eq!(
+            request.messages[1].reasoning_content.as_deref(),
+            Some("I should use lookup.")
+        );
         assert_eq!(request.messages[1].tool_calls[0].id, "call_0");
         assert_eq!(request.messages[2].tool_call_id.as_deref(), Some("call_0"));
         assert_eq!(request.messages[2].name.as_deref(), Some("lookup"));
@@ -1959,10 +2129,9 @@ n_gpu_layers = 99
         assert!(options.parse_tool_calls);
         assert_eq!(options.tool_choice.as_deref(), Some("required"));
 
-        let invalid: ChatCompletionRequest = serde_json::from_str(
-            r#"{"model":"local","messages":[],"reasoning_effort":"high"}"#,
-        )
-        .unwrap();
+        let invalid: ChatCompletionRequest =
+            serde_json::from_str(r#"{"model":"local","messages":[],"reasoning_effort":"high"}"#)
+                .unwrap();
         let error = build_chat_template_options(&invalid, &ServerConfig::default()).unwrap_err();
         assert!(error.contains("supported efforts are low, medium, xhigh"));
 
@@ -1970,7 +2139,8 @@ n_gpu_layers = 99
             r#"{"model":"local","messages":[],"tool_choice":{"type":"function","function":{"name":"lookup"}}}"#,
         )
         .unwrap();
-        let error = build_chat_template_options(&function_choice, &ServerConfig::default()).unwrap_err();
+        let error =
+            build_chat_template_options(&function_choice, &ServerConfig::default()).unwrap_err();
         assert!(error.contains("function-specific tool_choice objects are unsupported"));
     }
 
@@ -2058,7 +2228,10 @@ n_gpu_layers = 99
         for group in &groups {
             assert!(group.len() <= 3);
             let total: usize = group.iter().map(|&index| token_counts[index].min(5)).sum();
-            assert!(total <= 5, "packed batch exceeded n_ubatch boundary: {total}");
+            assert!(
+                total <= 5,
+                "packed batch exceeded n_ubatch boundary: {total}"
+            );
         }
         let flattened = groups.into_iter().flatten().collect::<Vec<_>>();
         assert_eq!(flattened, (0..token_counts.len()).collect::<Vec<_>>());
@@ -2074,6 +2247,454 @@ n_gpu_layers = 99
         assert_eq!(
             groups.into_iter().flatten().collect::<Vec<_>>(),
             (0..token_counts.len()).collect::<Vec<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod decision_route_tests {
+    use super::*;
+    use crate::types::*;
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    struct DecisionBackend {
+        supported: bool,
+    }
+    impl Backend for DecisionBackend {
+        fn supports_decisions(&self) -> bool {
+            self.supported
+        }
+        fn model_info(&self) -> LoadedModelInfo {
+            LoadedModelInfo {
+                supports_decisions: self.supported,
+                decision_family: None,
+                model_path: "fixture".into(),
+                context_length: Some(512),
+                embedding_dimension: None,
+                vocab_size: None,
+            }
+        }
+        fn decide(&mut self, request: &DecisionRequest) -> Result<DecisionResponse> {
+            request.validate_text()?;
+            if request.state == "oversized" {
+                return Err(DecisionError::InvalidRequest("prompt too large".into()).into());
+            }
+            Ok(DecisionResponse {
+                model: "fixture".into(),
+                answers: request
+                    .questions
+                    .keys()
+                    .map(|id| (id.clone(), DecisionAnswer::Noul { noul: 0.75 }))
+                    .collect(),
+                usage: DecisionUsage {
+                    input_tokens: 42,
+                    output_tokens: 0,
+                },
+            })
+        }
+        fn tokenize(&self, _: &str, _: bool) -> Result<Vec<i32>> {
+            unreachable!()
+        }
+        fn detokenize(&self, _: &[i32]) -> Result<String> {
+            unreachable!()
+        }
+        fn detokenize_piece(&self, _: i32) -> Result<String> {
+            unreachable!()
+        }
+        fn is_eog(&self, _: i32) -> bool {
+            false
+        }
+        fn token_eos(&self) -> i32 {
+            0
+        }
+        fn embeddings_enabled(&self) -> bool {
+            false
+        }
+        fn apply_chat_template(&self, _: &[ChatMessage]) -> Result<String> {
+            unreachable!()
+        }
+        fn generate(&mut self, _: &str, _: &GenerationOptions) -> Result<GenerateOutput> {
+            unreachable!()
+        }
+        fn generate_stream(
+            &mut self,
+            _: &str,
+            _: &GenerationOptions,
+            _: Box<dyn FnMut(&str) -> bool + Send>,
+        ) -> Result<GenerationMetrics> {
+            unreachable!()
+        }
+        fn generate_stream_output(
+            &mut self,
+            _: &str,
+            _: &GenerationOptions,
+            _: Box<dyn FnMut(&str) -> bool + Send>,
+        ) -> Result<GenerateOutput> {
+            unreachable!()
+        }
+        fn embed(&mut self, _: &str) -> Result<EmbeddingOutput> {
+            unreachable!()
+        }
+    }
+
+    fn state(supported: Option<bool>, key: Option<&str>) -> Arc<ServerState> {
+        Arc::new(ServerState {
+            runtime: Mutex::new(
+                supported
+                    .map(|supported| Box::new(DecisionBackend { supported }) as Box<dyn Backend>),
+            ),
+            config: ServerConfig::default(),
+            api_key: key.map(str::to_owned),
+            rate_limiter: None,
+        })
+    }
+    fn valid_request() -> Value {
+        json!({"state": {"customer":"charged twice"}, "questions":{"angry":{"type":"noul","instructions":"angry?"}}})
+    }
+    async fn post(state: Arc<ServerState>, body: Value) -> Response {
+        build_app(state)
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn decision_http_success_and_model_capability() {
+        let state = state(Some(true), None);
+        let response = post(state.clone(), valid_request()).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let result: DecisionResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(result.usage.output_tokens, 0);
+        assert_eq!(result.usage.input_tokens, 42);
+        assert!(matches!(
+            result.answers["angry"],
+            DecisionAnswer::Noul { noul: 0.75 }
+        ));
+        let Json(models) = models_handler(State(state)).await;
+        assert_eq!(
+            models.data[0].architecture["output_modalities"],
+            json!(["decisions"])
+        );
+    }
+
+    #[tokio::test]
+    async fn decision_http_error_statuses() {
+        assert_eq!(
+            post(state(None, None), valid_request()).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            post(state(Some(false), None), valid_request())
+                .await
+                .status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            post(state(Some(true), Some("secret")), valid_request())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        let mut request = valid_request();
+        request["images"] = json!(["data:image/png;base64,abc"]);
+        assert_eq!(
+            post(state(Some(true), None), request).await.status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        let mut request = valid_request();
+        request["questions"]["angry"]["type"] = json!("bogus");
+        assert_eq!(
+            post(state(Some(true), None), request).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut request = valid_request();
+        request["state"] = json!("oversized");
+        assert_eq!(
+            post(state(Some(true), None), request).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut request = valid_request();
+        request["questions"] = json!({});
+        assert_eq!(
+            post(state(Some(true), None), request).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+
+    #[tokio::test]
+    async fn clef_chat_rejected_before_streaming() {
+        for stream in [false, true] {
+            let response = build_app(state(Some(true), None)).oneshot(Request::builder().method("POST").uri("/v1/chat/completions").header("content-type", "application/json").body(Body::from(json!({"model":"fixture","messages":[{"role":"user","content":"hello"}],"stream":stream}).to_string())).unwrap()).await.unwrap();
+            assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        }
+    }
+}
+
+#[cfg(test)]
+mod clef_real_http_tests {
+    use super::*;
+    use crate::types::{DecisionRequest, DecisionResponse};
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use serde_json::json;
+    use tower::ServiceExt;
+
+    #[tokio::test]
+    #[ignore = "requires MLX_RS_TEST_CLEF_GGUF local weights"]
+    async fn clef_real_native_and_http_match() {
+        let path = std::env::var("MLX_RS_TEST_CLEF_GGUF").expect("set MLX_RS_TEST_CLEF_GGUF");
+        let mut backend = crate::llamacpp::LlamaCppBackend::new(
+            &path,
+            LlamaCppConfig {
+                n_ctx: Some(4096),
+                n_batch: Some(4096),
+                n_ubatch: Some(4096),
+                n_gpu_layers: Some(99),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let request: DecisionRequest = serde_json::from_value(json!({"state":{"ticket":"I was charged twice and nobody has replied."}, "questions":{
+            "route":{"type":"choice","instructions":"Which team should handle this?","criteria":{"technical":null,"billing":null,"shipping":null}},
+            "angry":{"type":"noul","instructions":"Is the customer angry?"},
+            "urgency":{"type":"score","instructions":"How urgent is this?","criteria":["can wait","this week","today","right now"]}
+        }})).unwrap();
+        let native = backend.decide(&request).unwrap();
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(Some(Box::new(backend))),
+            config: ServerConfig::default(),
+            api_key: None,
+            rate_limiter: None,
+        });
+        let app = build_app(state.clone());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&request).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let http: DecisionResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(native).unwrap(),
+            serde_json::to_value(http).unwrap()
+        );
+        let mut oversized = request.clone();
+        oversized.state = json!("long ticket ".repeat(5000));
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/systemone")
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&oversized).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+}
+
+#[cfg(test)]
+mod decision_profile_config_tests {
+    use super::*;
+    #[test]
+    fn named_profiles_parse_and_keep_native_limits() {
+        let cfg = ServerConfig::from_toml_str(include_str!("../../../kev.toml")).unwrap();
+        assert_eq!(cfg.model.as_deref(), Some("kev-9b"));
+        let p = &cfg.models["kev-9b"];
+        assert_eq!(p.repository.as_deref(), Some("ggml-org/Kev-9B-GGUF"));
+        assert_eq!(p.file.as_deref(), Some("Kev-9B-Q4_K_M.gguf"));
+        assert_eq!(p.config().n_gpu_layers, Some(99));
+        assert_eq!(p.config().n_batch, Some(4096));
+        let cfg = ServerConfig::from_toml_str("[server]\nmodel=\"a\"\n[models.a]\nmodel_path=\"a.gguf\"\n[models.b]\nrepository=\"owner/repo\"\nquantization=\"Q8_0\"\nn_ctx=8192\nn_batch=1024\nn_ubatch=512\n").unwrap();
+        assert_eq!(cfg.models.len(), 2);
+        assert_eq!(cfg.models["b"].config().n_ctx, Some(8192));
+        assert_eq!(cfg.models["b"].config().n_batch, Some(1024));
+        assert_eq!(cfg.models["b"].config().n_ubatch, Some(512));
+    }
+}
+
+#[cfg(test)]
+mod kev_real_http_tests {
+    use super::*;
+    use crate::{DecisionModelProfile, DecisionModels, DecisionRequest, DecisionResponse};
+    use axum::body::{to_bytes, Body};
+    use axum::http::Request;
+    use serde_json::json;
+    use tower::ServiceExt;
+    async fn post(app: &Router, path: &str, value: Value) -> Response {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from(value.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+    #[tokio::test]
+    #[ignore = "requires MLX_RS_TEST_KEV_GGUF local weights and Metal"]
+    async fn kev_profiles_native_http_switch_and_errors() {
+        let path = std::env::var("MLX_RS_TEST_KEV_GGUF").expect("set MLX_RS_TEST_KEV_GGUF");
+        let profiles: std::collections::BTreeMap<_, _> = [("kev", 4096), ("kev-small", 1024)]
+            .into_iter()
+            .map(|(id, ctx)| {
+                (
+                    id.to_owned(),
+                    DecisionModelProfile {
+                        model_path: Some(path.clone()),
+                        runtime: LlamaCppConfig {
+                            n_ctx: Some(ctx),
+                            n_batch: Some(ctx),
+                            n_ubatch: Some(ctx),
+                            n_gpu_layers: Some(99),
+                            n_threads: Some(4),
+                            n_threads_batch: Some(4),
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    },
+                )
+            })
+            .collect();
+        let mut backend = DecisionModels::new(profiles.clone(), "kev").unwrap();
+        let request: DecisionRequest = serde_json::from_str(r#"{"model":"kev","state":{"ticket":"I was charged twice and nobody has replied."},"questions":{"route":{"type":"choice","instructions":"Which team?","criteria":{"technical":null,"billing":null,"shipping":null}},"angry":{"type":"noul","instructions":"Is the customer angry?"},"urgency":{"type":"score","instructions":"How urgent?","criteria":["can wait","today","right now"]}}}"#).unwrap();
+        let native = backend.decide(&request).unwrap();
+        let state = Arc::new(ServerState {
+            runtime: Mutex::new(Some(Box::new(backend))),
+            config: ServerConfig {
+                models: profiles,
+                model: Some("kev".into()),
+                ..Default::default()
+            },
+            api_key: None,
+            rate_limiter: None,
+        });
+        let app = build_app(state.clone());
+        let response = post(
+            &app,
+            "/v1/systemone",
+            serde_json::to_value(&request).unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let http: DecisionResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&native).unwrap(),
+            serde_json::to_value(http).unwrap()
+        );
+        let mut switch = request.clone();
+        switch.model = Some("kev-small".into());
+        let response = post(
+            &app,
+            "/v1/systemone",
+            serde_json::to_value(&switch).unwrap(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let output: DecisionResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(output.model, "kev-small");
+        assert_eq!(
+            state
+                .runtime
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .model_info()
+                .context_length,
+            Some(1024)
+        );
+        let response = post(&app, "/llm/load", json!({"model_path":"kev"})).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let response = post(
+            &app,
+            "/v1/systemone",
+            serde_json::to_value(&request).unwrap(),
+        )
+        .await;
+        let reloaded: DecisionResponse =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(
+            serde_json::to_value(&native).unwrap(),
+            serde_json::to_value(reloaded).unwrap()
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/v1/models")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let info: Value =
+            serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap())
+                .unwrap();
+        assert_eq!(info["data"].as_array().unwrap().len(), 2);
+        assert!(info["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|m| m["id"] == "kev" && m["architecture"]["decision_family"] == "kev"));
+        let mut invalid = serde_json::to_value(&request).unwrap();
+        invalid["model"] = json!("missing");
+        assert_eq!(
+            post(&app, "/v1/systemone", invalid).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut oversized = serde_json::to_value(&request).unwrap();
+        oversized["state"] = json!("long ticket ".repeat(5000));
+        assert_eq!(
+            post(&app, "/v1/systemone", oversized).await.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let mut image = serde_json::to_value(&request).unwrap();
+        image["images"] = json!(["data:image/png;base64,x"]);
+        assert_eq!(
+            post(&app, "/v1/systemone", image).await.status(),
+            StatusCode::NOT_IMPLEMENTED
+        );
+        assert_eq!(
+            post(
+                &app,
+                "/v1/chat/completions",
+                json!({"model":"kev","messages":[{"role":"user","content":"hello"}],"stream":true})
+            )
+            .await
+            .status(),
+            StatusCode::NOT_IMPLEMENTED
         );
     }
 }

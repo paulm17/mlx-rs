@@ -67,9 +67,7 @@ impl<'de> serde::Deserialize<'de> for ChatMessage {
                         )));
                     }
                     let value = object.get("text").and_then(Value::as_str).ok_or_else(|| {
-                        serde::de::Error::custom(format!(
-                            "content[{index}].text must be a string"
-                        ))
+                        serde::de::Error::custom(format!("content[{index}].text must be a string"))
                     })?;
                     text.push_str(value);
                 }
@@ -233,6 +231,11 @@ pub struct EmbeddingOutput {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoadedModelInfo {
+    #[serde(default)]
+    pub supports_decisions: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision_family: Option<String>,
+
     pub model_path: String,
     pub context_length: Option<usize>,
     pub embedding_dimension: Option<usize>,

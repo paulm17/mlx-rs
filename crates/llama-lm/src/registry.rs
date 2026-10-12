@@ -110,6 +110,8 @@ pub fn create_backend_with_mlx(
 
             let subprocess = RunnerSubprocess::spawn(&resolved)?;
             let model_info = LoadedModelInfo {
+                supports_decisions: false,
+                decision_family: None,
                 model_path: resolved.display().to_string(),
                 context_length: None,
                 embedding_dimension: None,

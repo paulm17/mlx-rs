@@ -1,0 +1,14 @@
+[server]
+bind = "127.0.0.1"
+port = 8080
+model = "kev-9b"
+logging = ""
+
+[models.kev-9b]
+repository = "ggml-org/Kev-9B-GGUF"
+file = "Kev-9B-Q4_K_M.gguf"
+quantization = "Q4_K_M"
+n_ctx = 4096
+n_batch = 4096
+n_ubatch = 4096
+n_gpu_layers = 99

@@ -890,3 +890,67 @@ mod tests {
             .contains("Multiple unrelated"));
     }
 }
+
+/// Resolve a named profile using an explicit file or requested quantization.
+pub fn resolve_gguf_profile(
+    repo_id: &str,
+    file: Option<&str>,
+    quantization: &str,
+) -> Result<PathBuf> {
+    if let Some(filename) = file {
+        let relative = Path::new(filename);
+        if relative.is_absolute()
+            || relative
+                .components()
+                .any(|c| !matches!(c, std::path::Component::Normal(_)))
+            || relative.extension().and_then(|x| x.to_str()) != Some("gguf")
+        {
+            bail!("profile file must be a relative GGUF filename");
+        }
+        return resolve_hf_gguf_reference(&HfGgufReference {
+            repo_id: repo_id.into(),
+            filename: filename.into(),
+        });
+    }
+    if quantization.is_empty() {
+        bail!("quantization must not be empty");
+    }
+    let cached = hf_cache_root()?.join(repo_id.replace('/', "--"));
+    let matches_quant = |filename: &str| {
+        filename
+            .to_ascii_uppercase()
+            .contains(&quantization.to_ascii_uppercase())
+            && filename.ends_with(".gguf")
+    };
+    if cached.is_dir() {
+        let mut paths: Vec<_> = find_gguf_files(&cached)?
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|x| x.to_str())
+                    .is_some_and(matches_quant)
+            })
+            .collect();
+        paths.sort();
+        if let Some(path) = paths.into_iter().next() {
+            return Ok(path);
+        }
+    }
+    let api = ApiBuilder::from_env().build()?;
+    let info = api.model(repo_id.to_owned()).info()?;
+    let mut filenames: Vec<_> = info
+        .siblings
+        .into_iter()
+        .map(|s| s.rfilename)
+        .filter(|s| matches_quant(s))
+        .collect();
+    filenames.sort();
+    let filename = filenames
+        .into_iter()
+        .next()
+        .with_context(|| format!("no {quantization} GGUF found in {repo_id}"))?;
+    resolve_hf_gguf_reference(&HfGgufReference {
+        repo_id: repo_id.into(),
+        filename,
+    })
+}

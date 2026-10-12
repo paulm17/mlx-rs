@@ -8,3 +8,4 @@ description = "Backend trait for model inference backends"
 anyhow.workspace = true
 serde = { workspace = true }
 serde_json.workspace = true
+indexmap = { version = "2.14", features = ["serde"] }

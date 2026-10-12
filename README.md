@@ -9,6 +9,8 @@ Local LLM inference server and CLI powered by **llama.cpp** and **GGUF** models.
 - Streaming and non-streaming chat completions
 - Native GGUF chat templates (falls back to Llama2-style)
 - Embeddings endpoint (`/v1/embeddings`)
+- [Kev/OpenJev-family decision models and named model profiles](docs/DECISIONS.md)
+- [Native Clef-GGUF text decisions](docs/CLEF.md) (`/v1/systemone` and Rust `decide`)
 - Auth via API key and rate limiting
 - Metal/GPU layer offloading
 
@@ -56,6 +58,7 @@ Hugging Face references are downloaded automatically when missing locally. Downl
 | `POST` | `/llm/load` | Load a model |
 | `POST` | `/v1/chat/completions` | Chat completions (streaming + non-streaming) |
 | `POST` | `/v1/embeddings` | Text embeddings |
+| `POST` | `/v1/systemone` | Clef text decisions (choice, score, noul) |
 
 ### Chat Completions
 

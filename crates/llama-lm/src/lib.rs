@@ -1,5 +1,7 @@
 pub mod backend;
 pub mod config;
+pub mod decision_models;
+pub use decision_models::{DecisionModelProfile, DecisionModels};
 pub mod llamacpp;
 pub mod loader;
 pub mod registry;
@@ -21,9 +23,10 @@ pub use runner::{CompletionOptions, CompletionRequest, CompletionResponse, Runne
 pub use sampler::Sampler;
 pub use server::{run_server, run_server_from_toml_path, ServerConfig};
 pub use types::{
-    AppliedChatTemplate, ChatMessage, ChatTemplateOptions, EmbeddingData, EmbeddingOutput,
-    EmbeddingUsage, GenerateOutput, GenerationMetrics, GenerationOptions, LoadedModelInfo,
-    StopReason,
+    AppliedChatTemplate, ChatMessage, ChatTemplateOptions, DecisionAnswer, DecisionError,
+    DecisionQuestion, DecisionRequest, DecisionResponse, DecisionUsage, EmbeddingData,
+    EmbeddingOutput, EmbeddingUsage, GenerateOutput, GenerationMetrics, GenerationOptions,
+    LoadedModelInfo, StopReason,
 };
 
 pub use config::{LlamaCppConfig, MlxConfig};
@@ -33,9 +36,21 @@ pub struct GenerationPipeline {
 }
 
 impl GenerationPipeline {
+    pub fn with_decision_models(
+        profiles: std::collections::BTreeMap<String, DecisionModelProfile>,
+        default: &str,
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            backend: Box::new(DecisionModels::new(profiles, default)?),
+        })
+    }
     pub fn new(model_path: &str, config: LlamaCppConfig) -> anyhow::Result<Self> {
         let backend = create_backend(model_path, config)?;
         Ok(Self { backend })
+    }
+
+    pub fn decide(&mut self, request: &DecisionRequest) -> anyhow::Result<DecisionResponse> {
+        self.backend.decide(request)
     }
 
     pub fn generate(

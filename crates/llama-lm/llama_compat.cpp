@@ -8,7 +8,7 @@
 #include <string>
 #include <vector>
 
-using json = nlohmann::ordered_json;
+using json = common_json;
 
 struct mlx_rs_chat_template_result {
     char * prompt;
@@ -234,7 +234,7 @@ extern "C" int mlx_rs_update_chat_parse_state(
                     {"index", diff.tool_call_index},
                     {"id", diff.tool_call_delta.id},
                     {"type", "function"},
-                    {"function", {
+                    {"function", json{
                         {"name", diff.tool_call_delta.name},
                         {"arguments", diff.tool_call_delta.arguments},
                     }},

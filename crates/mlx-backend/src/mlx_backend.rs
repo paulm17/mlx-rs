@@ -204,6 +204,8 @@ fn prefill_chunked(
 impl backend_trait::Backend for MlxBackend {
     fn model_info(&self) -> LoadedModelInfo {
         LoadedModelInfo {
+            supports_decisions: false,
+            decision_family: None,
             model_path: self.model_path.clone(),
             context_length: Some(self.max_position_embeddings as usize),
             embedding_dimension: Some(self.hidden_size as usize),

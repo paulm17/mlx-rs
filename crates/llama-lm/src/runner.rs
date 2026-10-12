@@ -116,6 +116,40 @@ impl RunnerClient {
         }
     }
 
+    pub fn decide(
+        &self,
+        request: &crate::types::DecisionRequest,
+    ) -> Result<crate::types::DecisionResponse> {
+        request.validate_text()?;
+        let body = serde_json::to_string(request)?;
+        let response = reqwest::blocking::Client::new()
+            .post(self.url("/v1/systemone"))
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body)
+            .send()
+            .context("sending System One request")?;
+        let status = response.status();
+        let text = response.text().context("reading System One response")?;
+        if !status.is_success() {
+            let message = serde_json::from_str::<serde_json::Value>(&text)
+                .ok()
+                .and_then(|value| {
+                    value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| format!("System One returned {status}: {text}"));
+            return Err(match status.as_u16() {
+                400 | 422 => crate::types::DecisionError::InvalidRequest(message),
+                501 => crate::types::DecisionError::Unsupported(message),
+                _ => crate::types::DecisionError::Inference(message),
+            }
+            .into());
+        }
+        serde_json::from_str(&text).context("invalid System One response")
+    }
+
     fn url(&self, path: &str) -> String {
         format!("{}{}", self.base_url, path)
     }
@@ -238,6 +272,16 @@ impl RunnerClient {
 }
 
 impl Backend for RunnerClient {
+    fn supports_decisions(&self) -> bool {
+        self.model_info.supports_decisions
+    }
+    fn decide(
+        &mut self,
+        request: &crate::types::DecisionRequest,
+    ) -> Result<crate::types::DecisionResponse> {
+        RunnerClient::decide(self, request)
+    }
+
     fn model_info(&self) -> LoadedModelInfo {
         self.model_info.clone()
     }
@@ -508,38 +552,36 @@ impl MockRunnerServer {
         let (shutdown_tx, shutdown_rx) = std::sync::mpsc::channel();
         self.shutdown = Some(shutdown_tx);
 
-        let handle = std::thread::spawn(move || {
-            loop {
-                if shutdown_rx.try_recv().is_ok() {
+        let handle = std::thread::spawn(move || loop {
+            if shutdown_rx.try_recv().is_ok() {
+                break;
+            }
+
+            let (stream, _addr) = match listener.accept() {
+                Ok(s) => s,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("mock runner accept error: {}", e);
                     break;
                 }
+            };
 
-                let (stream, _addr) = match listener.accept() {
-                    Ok(s) => s,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(std::time::Duration::from_millis(10));
-                        continue;
-                    }
-                    Err(e) => {
-                        eprintln!("mock runner accept error: {}", e);
-                        break;
-                    }
-                };
+            let model_path = model_path.clone();
+            let tokenize_response = tokenize_response.clone();
+            let completion_responses = completion_responses.clone();
 
-                let model_path = model_path.clone();
-                let tokenize_response = tokenize_response.clone();
-                let completion_responses = completion_responses.clone();
-
-                std::thread::spawn(move || {
-                    handle_connection(
-                        stream,
-                        &model_path,
-                        context_length,
-                        &tokenize_response,
-                        &completion_responses,
-                    );
-                });
-            }
+            std::thread::spawn(move || {
+                handle_connection(
+                    stream,
+                    &model_path,
+                    context_length,
+                    &tokenize_response,
+                    &completion_responses,
+                );
+            });
         });
 
         self.handle = Some(handle);
@@ -666,7 +708,8 @@ fn handle_connection(
             let _ = stream.write_all(response.as_bytes());
         }
         _ => {
-            let response = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+            let response =
+                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             let _ = stream.write_all(response.as_bytes());
         }
     }
@@ -751,6 +794,8 @@ mod tests {
         let client = RunnerClient::new(
             &format!("http://127.0.0.1:{}", port),
             LoadedModelInfo {
+                supports_decisions: false,
+                decision_family: None,
                 model_path: "/mock/model.gguf".to_string(),
                 context_length: Some(2048),
                 embedding_dimension: None,
@@ -771,6 +816,8 @@ mod tests {
         let mut client = RunnerClient::new(
             &format!("http://127.0.0.1:{}", port),
             LoadedModelInfo {
+                supports_decisions: false,
+                decision_family: None,
                 model_path: "/mock/model.gguf".to_string(),
                 context_length: Some(2048),
                 embedding_dimension: None,
@@ -778,7 +825,9 @@ mod tests {
             },
         );
 
-        let output = client.generate("test", &GenerationOptions::default()).unwrap();
+        let output = client
+            .generate("test", &GenerationOptions::default())
+            .unwrap();
         assert_eq!(output.text, "Hello world");
         assert_eq!(output.metrics.prompt_tokens, 5);
         assert_eq!(output.metrics.generated_tokens, 3);
@@ -795,6 +844,8 @@ mod tests {
         let mut client = RunnerClient::new(
             &format!("http://127.0.0.1:{}", port),
             LoadedModelInfo {
+                supports_decisions: false,
+                decision_family: None,
                 model_path: "/mock/model.gguf".to_string(),
                 context_length: Some(2048),
                 embedding_dimension: None,
@@ -832,6 +883,8 @@ mod tests {
         let mut client = RunnerClient::new(
             &format!("http://127.0.0.1:{}", port),
             LoadedModelInfo {
+                supports_decisions: false,
+                decision_family: None,
                 model_path: "/mock/model.gguf".to_string(),
                 context_length: Some(2048),
                 embedding_dimension: None,
@@ -867,6 +920,8 @@ mod tests {
         let client = RunnerClient::new(
             &format!("http://127.0.0.1:{}", port),
             LoadedModelInfo {
+                supports_decisions: false,
+                decision_family: None,
                 model_path: "/mock/model.gguf".to_string(),
                 context_length: Some(2048),
                 embedding_dimension: Some(768),
@@ -877,5 +932,80 @@ mod tests {
         let info = client.model_info();
         assert_eq!(info.model_path, "/mock/model.gguf");
         assert_eq!(info.context_length, Some(2048));
+    }
+}
+
+#[cfg(test)]
+mod decision_client_tests {
+    use super::*;
+    use serde_json::json;
+    use std::net::TcpListener;
+
+    #[test]
+    fn runner_decision_transport_and_remote_error_classification() {
+        for status in [200, 400, 501] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let worker = std::thread::spawn(move || {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut reader = BufReader::new(socket.try_clone().unwrap());
+                let mut line = String::new();
+                reader.read_line(&mut line).unwrap();
+                assert_eq!(line.trim(), "POST /v1/systemone HTTP/1.1");
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line.trim().is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.to_lowercase().strip_prefix("content-length:") {
+                        length = value.trim().parse::<usize>().unwrap();
+                    }
+                }
+                let mut input = vec![0; length];
+                reader.read_exact(&mut input).unwrap();
+                let request: crate::types::DecisionRequest =
+                    serde_json::from_slice(&input).unwrap();
+                assert_eq!(request.state, "ticket");
+                let body = if status == 200 {
+                    json!({"model":"fixture","answers":{"q":{"type":"noul","noul":0.7}},"usage":{"input_tokens":12,"output_tokens":0}})
+                } else { json!({"error":"fixture error"}) }.to_string();
+                // Exercise chunked HTTP responses, which the legacy client didn't decode.
+                write!(socket, "HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{}\r\n0\r\n\r\n", body.len(), body).unwrap();
+            });
+            let client = RunnerClient::new(
+                &url,
+                LoadedModelInfo {
+                    model_path: "fixture".into(),
+                    supports_decisions: true,
+                    decision_family: None,
+                    context_length: None,
+                    embedding_dimension: None,
+                    vocab_size: None,
+                },
+            );
+            let request = serde_json::from_value(
+                json!({"state":"ticket","questions":{"q":{"type":"noul","instructions":"q?"}}}),
+            )
+            .unwrap();
+            let result = client.decide(&request);
+            match status {
+                200 => assert_eq!(result.unwrap().usage.input_tokens, 12),
+                400 => assert!(matches!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<crate::types::DecisionError>(),
+                    Some(crate::types::DecisionError::InvalidRequest(_))
+                )),
+                _ => assert!(matches!(
+                    result
+                        .unwrap_err()
+                        .downcast_ref::<crate::types::DecisionError>(),
+                    Some(crate::types::DecisionError::Unsupported(_))
+                )),
+            }
+            worker.join().unwrap();
+        }
     }
 }

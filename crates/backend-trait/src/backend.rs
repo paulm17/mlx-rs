@@ -6,7 +6,32 @@ use crate::types::{
 };
 
 pub trait Backend: Send {
+    fn supports_decisions(&self) -> bool {
+        false
+    }
+
+    fn decide(
+        &mut self,
+        _request: &crate::decision::DecisionRequest,
+    ) -> Result<crate::decision::DecisionResponse> {
+        Err(crate::decision::DecisionError::Unsupported(
+            "backend does not support decisions".into(),
+        )
+        .into())
+    }
+
     fn model_info(&self) -> LoadedModelInfo;
+
+    fn available_models(&self) -> Vec<LoadedModelInfo> {
+        vec![self.model_info()]
+    }
+
+    fn select_model(&mut self, _id: &str) -> Result<()> {
+        Err(crate::decision::DecisionError::Unsupported(
+            "backend does not support model selection".into(),
+        )
+        .into())
+    }
 
     fn tokenize(&self, text: &str, add_bos: bool) -> Result<Vec<i32>>;
 

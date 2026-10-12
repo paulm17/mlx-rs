@@ -28,6 +28,16 @@ impl LlamaCppBackend {
 }
 
 impl Backend for LlamaCppBackend {
+    fn supports_decisions(&self) -> bool {
+        self.runtime.supports_decisions()
+    }
+    fn decide(
+        &mut self,
+        request: &crate::types::DecisionRequest,
+    ) -> Result<crate::types::DecisionResponse> {
+        self.runtime.decide(request)
+    }
+
     fn model_info(&self) -> LoadedModelInfo {
         self.runtime.model_info()
     }
@@ -69,7 +79,7 @@ impl Backend for LlamaCppBackend {
     }
 
     fn supports_chat_template(&self) -> bool {
-        true
+        !self.runtime.supports_decisions()
     }
 
     fn apply_chat_template(&self, messages: &[ChatMessage]) -> Result<String> {
